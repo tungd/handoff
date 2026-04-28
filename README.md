@@ -10,7 +10,7 @@ Codex is the first-class backend. Claude support comes after the Codex loop is s
 ```text
 agentctl
   -> local .agentctl task/event store now
-  -> Postgres task/event/memory store next
+  -> Postgres task/event/memory store
   -> local git/GitHub
   -> Codex exec --json/resume backend now
   -> Codex app-server / exec-server backend next
@@ -47,3 +47,20 @@ swift run agentctl task new "first task" --prompt "Reply briefly."
 swift run agentctl task send first-task "Continue."
 swift run agentctl db schema
 ```
+
+## Postgres Store
+
+Local `.agentctl/` storage is the default. Use Postgres when you want shared task
+state across machines:
+
+```bash
+export AGENTCTL_DATABASE_URL='postgres://agentctl:agentctl@localhost:55432/agentctl?sslmode=disable'
+
+swift run agentctl db migrate
+swift run agentctl task new "postgres task" --store postgres
+swift run agentctl task list --store postgres
+swift run agentctl task send postgres-task "Continue." --store postgres
+```
+
+You can also pass `--database-url` directly instead of using the environment
+variable.

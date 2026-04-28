@@ -4,8 +4,21 @@ import Foundation
 
 extension AgentBackend: ExpressibleByArgument {}
 
+enum StoreKind: String, ExpressibleByArgument {
+    case local
+    case postgres
+}
+
+struct StoreOptions: ParsableArguments {
+    @Option(help: "Task store to use.")
+    var store: StoreKind = .local
+
+    @Option(help: "PostgreSQL URL. Defaults to AGENTCTL_DATABASE_URL.")
+    var databaseURL: String?
+}
+
 @main
-struct Agentctl: ParsableCommand {
+struct Agentctl: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "agentctl",
         abstract: "Task/session manager for Codex-first coding workflows.",
@@ -22,7 +35,7 @@ struct Agentctl: ParsableCommand {
     @Option(name: .shortAndLong, help: "Directory to use as the current workspace.")
     var cwd: String = "."
 
-    mutating func run() throws {
+    mutating func run() async throws {
         var inspect = Repo.Inspect(path: cwd, json: false)
         try inspect.run()
     }
@@ -82,7 +95,7 @@ struct Task: ParsableCommand {
         subcommands: [New.self, List.self, Show.self, Send.self, Resume.self]
     )
 
-    struct New: ParsableCommand {
+    struct New: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "new",
             abstract: "Create a task record, optionally running the first Codex turn."
@@ -97,6 +110,9 @@ struct Task: ParsableCommand {
         @Option(name: .shortAndLong, help: "Repository path.")
         var repo: String = "."
 
+        @OptionGroup
+        var storeOptions: StoreOptions
+
         @Option(help: "Initial prompt to send to the preferred backend.")
         var prompt: String?
 
@@ -109,60 +125,61 @@ struct Task: ParsableCommand {
         @Flag(name: .long, help: "Emit JSON.")
         var json: Bool = false
 
-        mutating func run() throws {
+        mutating func run() async throws {
             let repoURL = URL(fileURLWithPath: repo)
             let snapshot = try RepositoryInspector().inspect(path: repoURL)
-            let store = LocalTaskStore(root: StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot))
             let task = TaskRecord(
                 title: title,
                 slug: Slug.make(title),
                 backendPreference: backend
             )
 
-            try store.saveTask(task)
-            try store.appendEvent(AgentEvent(taskID: task.id, kind: .taskCreated, payload: [
-                "title": .string(task.title),
-                "slug": .string(task.slug),
-                "backend": .string(task.backendPreference.rawValue)
-            ]))
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                try await store.saveTask(task)
+                try await store.appendEvent(AgentEvent(taskID: task.id, kind: .taskCreated, payload: [
+                    "title": .string(task.title),
+                    "slug": .string(task.slug),
+                    "backend": .string(task.backendPreference.rawValue)
+                ]))
 
-            if let prompt {
-                let summary = try runCodexTurn(
-                    task: task,
-                    prompt: prompt,
-                    repoURL: repoURL,
-                    snapshot: snapshot,
-                    store: store,
-                    fullAuto: fullAuto,
-                    sandbox: sandbox
-                )
+                if let prompt {
+                    let summary = try await runCodexTurn(
+                        task: task,
+                        prompt: prompt,
+                        repoURL: repoURL,
+                        snapshot: snapshot,
+                        store: store,
+                        fullAuto: fullAuto,
+                        sandbox: sandbox
+                    )
 
-                if json {
-                    try printJSON(summary)
+                    if json {
+                        try printJSON(summary)
+                        return
+                    }
+
+                    printRunSummary(summary)
                     return
                 }
 
-                printRunSummary(summary)
-                return
-            }
+                let preview = TaskPreview(task: task, repository: snapshot)
+                if json {
+                    try printJSON(preview)
+                    return
+                }
 
-            let preview = TaskPreview(task: task, repository: snapshot)
-            if json {
-                try printJSON(preview)
-                return
+                print("Task created")
+                print("  id:      \(task.id.uuidString)")
+                print("  title:   \(task.title)")
+                print("  slug:    \(task.slug)")
+                print("  backend: \(task.backendPreference.rawValue)")
+                print("  repo:    \(snapshot.rootPath ?? "not detected")")
+                print("  store:   \(storeDescription(options: storeOptions, repoURL: repoURL, snapshot: snapshot))")
             }
-
-            print("Task created")
-            print("  id:      \(task.id.uuidString)")
-            print("  title:   \(task.title)")
-            print("  slug:    \(task.slug)")
-            print("  backend: \(task.backendPreference.rawValue)")
-            print("  repo:    \(snapshot.rootPath ?? "not detected")")
-            print("  store:   \(store.root.path)")
         }
     }
 
-    struct List: ParsableCommand {
+    struct List: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "list",
             abstract: "List local tasks."
@@ -171,39 +188,43 @@ struct Task: ParsableCommand {
         @Option(name: .shortAndLong, help: "Repository path.")
         var repo: String = "."
 
+        @OptionGroup
+        var storeOptions: StoreOptions
+
         @Flag(name: .long, help: "Emit JSON.")
         var json: Bool = false
 
-        mutating func run() throws {
+        mutating func run() async throws {
             let repoURL = URL(fileURLWithPath: repo)
             let snapshot = try RepositoryInspector().inspect(path: repoURL)
-            let store = LocalTaskStore(root: StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot))
-            let tasks = try store.listTasks()
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let tasks = try await store.listTasks()
 
-            if json {
-                try printJSON(tasks)
-                return
-            }
+                if json {
+                    try printJSON(tasks)
+                    return
+                }
 
-            if tasks.isEmpty {
-                print("No local tasks found at \(store.root.path).")
-                return
-            }
+                if tasks.isEmpty {
+                    print("No tasks found in \(storeDescription(options: storeOptions, repoURL: repoURL, snapshot: snapshot)).")
+                    return
+                }
 
-            for task in tasks {
-                let sessions = try store.listSessions(taskID: task.id)
-                let thread = sessions.first?.backendSessionID ?? "-"
-                print("\(task.slug)")
-                print("  id:      \(task.id.uuidString)")
-                print("  title:   \(task.title)")
-                print("  backend: \(task.backendPreference.rawValue)")
-                print("  state:   \(task.state.rawValue)")
-                print("  thread:  \(thread)")
+                for task in tasks {
+                    let sessions = try await store.listSessions(taskID: task.id)
+                    let thread = sessions.first?.backendSessionID ?? "-"
+                    print("\(task.slug)")
+                    print("  id:      \(task.id.uuidString)")
+                    print("  title:   \(task.title)")
+                    print("  backend: \(task.backendPreference.rawValue)")
+                    print("  state:   \(task.state.rawValue)")
+                    print("  thread:  \(thread)")
+                }
             }
         }
     }
 
-    struct Show: ParsableCommand {
+    struct Show: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "show",
             abstract: "Show a local task summary."
@@ -215,26 +236,30 @@ struct Task: ParsableCommand {
         @Option(name: .shortAndLong, help: "Repository path.")
         var repo: String = "."
 
+        @OptionGroup
+        var storeOptions: StoreOptions
+
         @Flag(name: .long, help: "Emit JSON.")
         var json: Bool = false
 
-        mutating func run() throws {
+        mutating func run() async throws {
             let repoURL = URL(fileURLWithPath: repo)
             let snapshot = try RepositoryInspector().inspect(path: repoURL)
-            let store = LocalTaskStore(root: StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot))
-            let task = try store.findTask(task)
-            let summary = try store.summary(for: task)
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let task = try await store.findTask(task)
+                let summary = try await store.summary(for: task)
 
-            if json {
-                try printJSON(summary)
-                return
+                if json {
+                    try printJSON(summary)
+                    return
+                }
+
+                printTaskSummary(summary)
             }
-
-            printTaskSummary(summary)
         }
     }
 
-    struct Send: ParsableCommand {
+    struct Send: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "send",
             abstract: "Send one prompt to a task's backend session."
@@ -249,54 +274,8 @@ struct Task: ParsableCommand {
         @Option(name: .shortAndLong, help: "Repository path.")
         var repo: String = "."
 
-        @Flag(help: "Pass --full-auto to Codex.")
-        var fullAuto: Bool = false
-
-        @Option(help: "Codex sandbox mode.")
-        var sandbox: String?
-
-        @Flag(name: .long, help: "Emit JSON.")
-        var json: Bool = false
-
-        mutating func run() throws {
-            let repoURL = URL(fileURLWithPath: repo)
-            let snapshot = try RepositoryInspector().inspect(path: repoURL)
-            let store = LocalTaskStore(root: StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot))
-            let task = try store.findTask(task)
-
-            let summary = try runCodexTurn(
-                task: task,
-                prompt: prompt,
-                repoURL: repoURL,
-                snapshot: snapshot,
-                store: store,
-                fullAuto: fullAuto,
-                sandbox: sandbox
-            )
-
-            if json {
-                try printJSON(summary)
-                return
-            }
-
-            printRunSummary(summary)
-        }
-    }
-
-    struct Resume: ParsableCommand {
-        static let configuration = CommandConfiguration(
-            commandName: "resume",
-            abstract: "Show a task summary, or send a prompt if one is provided."
-        )
-
-        @Argument(help: "Task id, id prefix, or slug.")
-        var task: String
-
-        @Argument(help: "Optional prompt to send.")
-        var prompt: String?
-
-        @Option(name: .shortAndLong, help: "Repository path.")
-        var repo: String = "."
+        @OptionGroup
+        var storeOptions: StoreOptions
 
         @Flag(help: "Pass --full-auto to Codex.")
         var fullAuto: Bool = false
@@ -307,14 +286,13 @@ struct Task: ParsableCommand {
         @Flag(name: .long, help: "Emit JSON.")
         var json: Bool = false
 
-        mutating func run() throws {
+        mutating func run() async throws {
             let repoURL = URL(fileURLWithPath: repo)
             let snapshot = try RepositoryInspector().inspect(path: repoURL)
-            let store = LocalTaskStore(root: StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot))
-            let task = try store.findTask(task)
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let task = try await store.findTask(task)
 
-            if let prompt {
-                let summary = try runCodexTurn(
+                let summary = try await runCodexTurn(
                     task: task,
                     prompt: prompt,
                     repoURL: repoURL,
@@ -330,8 +308,64 @@ struct Task: ParsableCommand {
                 }
 
                 printRunSummary(summary)
-            } else {
-                let summary = try store.summary(for: task)
+            }
+        }
+    }
+
+    struct Resume: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "resume",
+            abstract: "Show a task summary, or send a prompt if one is provided."
+        )
+
+        @Argument(help: "Task id, id prefix, or slug.")
+        var task: String
+
+        @Argument(help: "Optional prompt to send.")
+        var prompt: String?
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        @Flag(help: "Pass --full-auto to Codex.")
+        var fullAuto: Bool = false
+
+        @Option(help: "Codex sandbox mode.")
+        var sandbox: String?
+
+        @Flag(name: .long, help: "Emit JSON.")
+        var json: Bool = false
+
+        mutating func run() async throws {
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let task = try await store.findTask(task)
+
+                if let prompt {
+                    let summary = try await runCodexTurn(
+                        task: task,
+                        prompt: prompt,
+                        repoURL: repoURL,
+                        snapshot: snapshot,
+                        store: store,
+                        fullAuto: fullAuto,
+                        sandbox: sandbox
+                    )
+
+                    if json {
+                        try printJSON(summary)
+                        return
+                    }
+
+                    printRunSummary(summary)
+                    return
+                }
+
+                let summary = try await store.summary(for: task)
 
                 if json {
                     try printJSON(summary)
@@ -348,7 +382,7 @@ struct DB: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "db",
         abstract: "Database helpers.",
-        subcommands: [Schema.self]
+        subcommands: [Schema.self, Migrate.self]
     )
 
     struct Schema: ParsableCommand {
@@ -359,6 +393,28 @@ struct DB: ParsableCommand {
 
         mutating func run() throws {
             print(try SchemaLoader.initialMigration())
+        }
+    }
+
+    struct Migrate: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "migrate",
+            abstract: "Apply Postgres migrations."
+        )
+
+        @Option(help: "PostgreSQL URL. Defaults to AGENTCTL_DATABASE_URL.")
+        var databaseURL: String?
+
+        mutating func run() async throws {
+            let configuration = try postgresConfiguration(databaseURL)
+            do {
+                try await PostgresTaskStore.withStore(configuration: configuration) { store in
+                    try await store.migrate()
+                }
+            } catch {
+                throw RuntimeError(String(reflecting: error))
+            }
+            print("Migrations applied to \(configuration.host):\(configuration.port)/\(configuration.database).")
         }
     }
 }
@@ -443,16 +499,16 @@ func runCodexTurn(
     prompt: String,
     repoURL: URL,
     snapshot: RepositorySnapshot,
-    store: LocalTaskStore,
+    store: any AgentTaskStore,
     fullAuto: Bool,
     sandbox: String?
-) throws -> TaskRunSummary {
+) async throws -> TaskRunSummary {
     guard task.backendPreference == .codex else {
         throw RuntimeError("only the Codex backend is wired in v1")
     }
 
     let cwd = snapshot.rootPath.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? repoURL
-    let previousSession = try store.latestSession(for: task.id)
+    let previousSession = try await store.latestSession(for: task.id)
     var session = SessionRecord(
         taskID: task.id,
         backend: .codex,
@@ -461,13 +517,13 @@ func runCodexTurn(
         state: .running
     )
 
-    try store.saveSession(session)
-    try store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .sessionStarted, payload: [
+    try await store.saveSession(session)
+    try await store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .sessionStarted, payload: [
         "backend": .string(session.backend.rawValue),
         "cwd": .string(session.cwd),
         "resumeThreadID": session.backendSessionID.map { .string($0) } ?? .null
     ]))
-    try store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .userMessage, payload: [
+    try await store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .userMessage, payload: [
         "text": .string(prompt)
     ]))
 
@@ -491,26 +547,59 @@ func runCodexTurn(
         var stored = event
         stored.taskID = task.id
         stored.sessionID = session.id
-        try store.appendEvent(stored)
+        try await store.appendEvent(stored)
     }
 
     if !result.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        try store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .backendEvent, payload: [
+        try await store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .backendEvent, payload: [
             "stderr": .string(result.stderr)
         ]))
     }
 
-    try store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .sessionEnded, payload: [
+    try await store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .sessionEnded, payload: [
         "exitCode": .int(Int64(result.exitCode)),
         "threadID": session.backendSessionID.map { .string($0) } ?? .null
     ]))
-    try store.saveSession(session)
+    try await store.saveSession(session)
 
     if result.exitCode != 0 {
         throw RuntimeError("Codex exited with \(result.exitCode): \(result.stderr)")
     }
 
-    return try store.summary(for: task)
+    return try await store.summary(for: task)
+}
+
+func withTaskStore<T>(
+    options: StoreOptions,
+    repoURL: URL,
+    snapshot: RepositorySnapshot,
+    operation: (any AgentTaskStore) async throws -> T
+) async throws -> T {
+    switch options.store {
+    case .local:
+        let local = LocalTaskStore(root: StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot))
+        return try await operation(local)
+    case .postgres:
+        let configuration = try postgresConfiguration(options.databaseURL)
+        return try await PostgresTaskStore.withStore(configuration: configuration, operation: operation)
+    }
+}
+
+func postgresConfiguration(_ databaseURL: String?) throws -> AgentPostgresConfiguration {
+    let value = databaseURL ?? ProcessInfo.processInfo.environment["AGENTCTL_DATABASE_URL"]
+    guard let value, !value.isEmpty else {
+        throw PostgresConfigurationError.missingDatabaseURL
+    }
+    return try AgentPostgresConfiguration(databaseURL: value)
+}
+
+func storeDescription(options: StoreOptions, repoURL: URL, snapshot: RepositorySnapshot) -> String {
+    switch options.store {
+    case .local:
+        return StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot).path
+    case .postgres:
+        return options.databaseURL ?? ProcessInfo.processInfo.environment["AGENTCTL_DATABASE_URL"] ?? "postgres"
+    }
 }
 
 func printTaskSummary(_ summary: TaskRunSummary) {

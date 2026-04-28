@@ -131,7 +131,6 @@ CREATE TABLE IF NOT EXISTS memory_items (
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     search_vector tsvector GENERATED ALWAYS AS (
         setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
-        setweight(to_tsvector('english', coalesce(array_to_string(tags, ' '), '')), 'A') ||
         setweight(to_tsvector('english', coalesce(summary, '')), 'B') ||
         setweight(to_tsvector('english', coalesce(body, '')), 'C')
     ) STORED

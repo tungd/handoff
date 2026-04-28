@@ -65,6 +65,18 @@ search_vector @@ websearch_to_tsquery('english', $1)
 
 Hybrid semantic search can be added later with `pgvector`.
 
+## Stores
+
+`agentctl` currently supports two task stores:
+
+```text
+local     .agentctl/ inside the current git repository
+postgres  shared task/session/event store selected with --store postgres
+```
+
+Use `AGENTCTL_DATABASE_URL` or `--database-url` for Postgres. Local storage is
+kept as the offline/cache path.
+
 ## Git Handoff
 
 Code movement between machines is done through Git/GitHub:

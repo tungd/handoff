@@ -274,6 +274,35 @@ func localTaskStorePersistsTasksSessionsAndEvents() throws {
     #expect(try store.events(for: task.id).map(\.kind) == [.userMessage, .assistantDone])
 }
 
+@Test
+func localTaskStoreConformsToAsyncStoreProtocol() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("agentctl-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let store: any AgentTaskStore = LocalTaskStore(root: root)
+    let task = TaskRecord(title: "Async Store", slug: "async-store")
+
+    try await store.saveTask(task)
+    let loaded = try await store.findTask("async-store")
+
+    #expect(loaded.id == task.id)
+}
+
+@Test
+func postgresConfigurationParsesDatabaseURL() throws {
+    let configuration = try AgentPostgresConfiguration(
+        databaseURL: "postgres://agent:secret@localhost:55432/agentctl?sslmode=disable"
+    )
+
+    #expect(configuration.host == "localhost")
+    #expect(configuration.port == 55432)
+    #expect(configuration.username == "agent")
+    #expect(configuration.password == "secret")
+    #expect(configuration.database == "agentctl")
+    #expect(configuration.tlsDisabled)
+}
+
 private struct FakeProcessRunner: ProcessRunning {
     let responses: [String: ProcessResult]
 

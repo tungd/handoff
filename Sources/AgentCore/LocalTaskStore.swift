@@ -62,6 +62,10 @@ public struct LocalTaskStore: Sendable {
         try data.write(to: taskURL(task.id), options: [.atomic])
     }
 
+    public func saveTaskSync(_ task: TaskRecord) throws {
+        try saveTask(task)
+    }
+
     public func listTasks() throws -> [TaskRecord] {
         try prepare()
         let files = try FileManager.default.contentsOfDirectory(
@@ -73,6 +77,10 @@ public struct LocalTaskStore: Sendable {
         return try files
             .map { try decoder.decode(TaskRecord.self, from: Data(contentsOf: $0)) }
             .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    public func listTasksSync() throws -> [TaskRecord] {
+        try listTasks()
     }
 
     public func findTask(_ identifier: String) throws -> TaskRecord {
@@ -94,10 +102,18 @@ public struct LocalTaskStore: Sendable {
         throw LocalTaskStoreError.taskNotFound(identifier)
     }
 
+    public func findTaskSync(_ identifier: String) throws -> TaskRecord {
+        try findTask(identifier)
+    }
+
     public func saveSession(_ session: SessionRecord) throws {
         try prepare()
         let data = try encoder.encode(session)
         try data.write(to: sessionURL(session.id), options: [.atomic])
+    }
+
+    public func saveSessionSync(_ session: SessionRecord) throws {
+        try saveSession(session)
     }
 
     public func listSessions(taskID: UUID? = nil) throws -> [SessionRecord] {
@@ -114,8 +130,16 @@ public struct LocalTaskStore: Sendable {
             .sorted { $0.startedAt > $1.startedAt }
     }
 
+    public func listSessionsSync(taskID: UUID? = nil) throws -> [SessionRecord] {
+        try listSessions(taskID: taskID)
+    }
+
     public func latestSession(for taskID: UUID) throws -> SessionRecord? {
         try listSessions(taskID: taskID).first
+    }
+
+    public func latestSessionSync(for taskID: UUID) throws -> SessionRecord? {
+        try latestSession(for: taskID)
     }
 
     @discardableResult
@@ -152,6 +176,10 @@ public struct LocalTaskStore: Sendable {
         return stored
     }
 
+    public func appendEventSync(_ event: AgentEvent) throws -> AgentEvent {
+        try appendEvent(event)
+    }
+
     public func events(for taskID: UUID) throws -> [AgentEvent] {
         try prepare()
         let url = eventsURL(taskID)
@@ -171,6 +199,10 @@ public struct LocalTaskStore: Sendable {
             .sorted { ($0.sequence ?? 0) < ($1.sequence ?? 0) }
     }
 
+    public func eventsSync(for taskID: UUID) throws -> [AgentEvent] {
+        try events(for: taskID)
+    }
+
     public func summary(for task: TaskRecord, eventLimit: Int = 12) throws -> TaskRunSummary {
         let sessions = try listSessions(taskID: task.id)
         let events = try events(for: task.id)
@@ -179,6 +211,10 @@ public struct LocalTaskStore: Sendable {
             sessions: sessions,
             latestEvents: Array(events.suffix(eventLimit))
         )
+    }
+
+    public func summarySync(for task: TaskRecord, eventLimit: Int = 12) throws -> TaskRunSummary {
+        try summary(for: task, eventLimit: eventLimit)
     }
 
     private func taskURL(_ id: UUID) -> URL {

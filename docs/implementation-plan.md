@@ -8,6 +8,8 @@
 - Task, session, event, checkpoint, repo, and memory models.
 - Initial Postgres migration.
 - CLI commands for repo inspection and schema printing.
+- Local task/event store.
+- Postgres task/event store with `db migrate`.
 
 ## Phase 2: Codex MVP
 
@@ -29,6 +31,7 @@
 
 - List tasks by repo.
 - Resume a task from `task_id`.
+- Share task/session/event state through Postgres.
 - Create checkpoint branch.
 - Commit and push handoff branch.
 - Recreate or switch local worktree on another machine.

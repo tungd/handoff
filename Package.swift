@@ -12,11 +12,15 @@ let package = Package(
         .library(name: "AgentCore", targets: ["AgentCore"])
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0")
+        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
+        .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.29.0")
     ],
     targets: [
         .target(
             name: "AgentCore",
+            dependencies: [
+                .product(name: "PostgresNIO", package: "postgres-nio")
+            ],
             resources: [
                 .process("Resources")
             ]
