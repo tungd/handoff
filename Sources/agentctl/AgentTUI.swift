@@ -23,6 +23,7 @@ private enum AgentTUIRuntimeBox {
 
 func runTUIkitInteractiveLoop(
     task: TaskRecord,
+    taskPersisted: Bool,
     storeOptions: StoreOptions,
     repoURL: URL,
     snapshot: RepositorySnapshot,
@@ -30,7 +31,7 @@ func runTUIkitInteractiveLoop(
     fullAuto: Bool,
     sandbox: String?
 ) async throws {
-    let initialEntries = try await tuiEntries(for: task.id, store: store)
+    let initialEntries = taskPersisted ? try await tuiEntries(for: task.id, store: store) : []
     let modelMetadata = resolvedCodexModelMetadata()
     let runtime = AgentTUIRuntime(
         task: task,
@@ -38,7 +39,7 @@ func runTUIkitInteractiveLoop(
         repoURL: repoURL,
         snapshot: snapshot,
         store: store,
-        model: AgentTUIModel(task: task, entries: initialEntries.isEmpty ? [
+        model: AgentTUIModel(task: task, isTaskPersisted: taskPersisted, entries: initialEntries.isEmpty ? [
             TUITranscriptEntry(role: .system, text: "Ready.")
         ] : initialEntries),
         modelDisplayName: modelMetadata.displayName,
@@ -134,6 +135,7 @@ private struct AgentTUISnapshot: Sendable {
     var scrollOffset: Int
     var showRawEvents: Bool
     var isRunning: Bool
+    var isTaskPersisted: Bool
     var revision: Int
 }
 
@@ -154,7 +156,7 @@ private final class AgentTUIModel: @unchecked Sendable {
     private var state: AgentTUISnapshot
     private var cacheClearedRevision = 0
 
-    init(task: TaskRecord, entries: [TUITranscriptEntry]) {
+    init(task: TaskRecord, isTaskPersisted: Bool = true, entries: [TUITranscriptEntry]) {
         state = AgentTUISnapshot(
             task: task,
             entries: entries,
@@ -163,6 +165,7 @@ private final class AgentTUIModel: @unchecked Sendable {
             scrollOffset: 0,
             showRawEvents: false,
             isRunning: false,
+            isTaskPersisted: isTaskPersisted,
             revision: 0
         )
     }
@@ -190,8 +193,8 @@ private final class AgentTUIModel: @unchecked Sendable {
         }
     }
 
-    func startTurn(prompt: String) -> TaskRecord? {
-        var task: TaskRecord?
+    func startTurn(prompt: String) -> (task: TaskRecord, isTaskPersisted: Bool)? {
+        var turn: (task: TaskRecord, isTaskPersisted: Bool)?
         update { state in
             guard !state.isRunning else {
                 append(.error, "A Codex turn is already running.", to: &state)
@@ -200,9 +203,9 @@ private final class AgentTUIModel: @unchecked Sendable {
             append(.user, prompt, to: &state)
             state.isRunning = true
             state.status = "running Codex turn..."
-            task = state.task
+            turn = (state.task, state.isTaskPersisted)
         }
-        return task
+        return turn
     }
 
     func finishTurn() {
@@ -243,9 +246,17 @@ private final class AgentTUIModel: @unchecked Sendable {
         return enabled
     }
 
-    func setTask(_ task: TaskRecord, entries: [TUITranscriptEntry], message: String) {
+    func markTaskPersisted(_ task: TaskRecord) {
         update { state in
             state.task = task
+            state.isTaskPersisted = true
+        }
+    }
+
+    func setTask(_ task: TaskRecord, isTaskPersisted: Bool = true, entries: [TUITranscriptEntry], message: String) {
+        update { state in
+            state.task = task
+            state.isTaskPersisted = isTaskPersisted
             state.entries = entries
             state.scrollOffset = 0
             append(.system, message, to: &state)
@@ -387,7 +398,8 @@ private struct AgentTUIView: View {
         let snapshot = model.snapshot()
         let _ = model.clearRenderCacheIfNeeded(for: snapshot.revision)
         let size = terminalSize()
-        let transcriptHeight = max(3, size.rows - 9)
+        let composerHeight = 7
+        let transcriptHeight = max(3, size.rows - 2 - composerHeight)
         let lines = transcriptLines(snapshot.entries, width: max(40, size.columns - 4))
         let maxScrollOffset = max(0, lines.count - transcriptHeight)
         let scrollOffset = clampedScrollOffset(snapshot.scrollOffset, maxOffset: maxScrollOffset)
@@ -400,11 +412,11 @@ private struct AgentTUIView: View {
                 ViewArray(visibleLines.map(transcriptLine))
             }
             .frame(height: transcriptHeight, alignment: .topLeading)
-            Spacer(minLength: 0)
             composer(
                 snapshot,
                 terminalWidth: size.columns
             )
+            .frame(height: composerHeight, alignment: .bottomLeading)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .palette(AgentTUIPalette())
@@ -487,83 +499,7 @@ private struct AgentTUIView: View {
     }
 
     private func transcriptLine(_ line: TUITranscriptLine) -> AnyView {
-        if line.isLabel {
-            return AnyView(Text(line.text).foregroundStyle(labelColor(line.role)))
-        }
-
-        if !line.spans.isEmpty {
-            return AnyView(HStack(spacing: 0) {
-                ViewArray(line.spans.map { span in
-                    transcriptSpan(span, role: line.role)
-                })
-            })
-        }
-
-        switch line.role {
-        case .user:
-            return AnyView(Text(line.text).foregroundStyle(.palette.foreground))
-        case .codex:
-            return AnyView(Text(line.text).foregroundStyle(.palette.foreground))
-        case .tool:
-            return AnyView(Text(line.text).foregroundStyle(.palette.foregroundSecondary))
-        case .error:
-            return AnyView(Text(line.text).foregroundStyle(.palette.error).bold())
-        case .system:
-            return AnyView(Text(line.text).foregroundStyle(.palette.foregroundSecondary))
-        }
-    }
-
-    private func transcriptSpan(_ span: AgentTUIStyledTextSpan, role: TUITranscriptRole) -> AnyView {
-        var text = Text(span.text).foregroundStyle(spanColor(span.tone, role: role))
-        if span.isBold {
-            text = text.bold()
-        }
-        if span.isItalic {
-            text = text.italic()
-        }
-        if span.isUnderlined {
-            text = text.underline()
-        }
-        return AnyView(text)
-    }
-
-    private func spanColor(_ tone: AgentTUIStyledTextTone, role: TUITranscriptRole) -> Color {
-        switch tone {
-        case .base:
-            switch role {
-            case .user, .codex:
-                return .palette.foreground
-            case .tool, .system:
-                return .palette.foregroundSecondary
-            case .error:
-                return .palette.error
-            }
-        case .secondary:
-            return .palette.foregroundTertiary
-        case .accent:
-            return .palette.accent
-        case .success:
-            return .palette.success
-        case .failure:
-            return .palette.error
-        case .quote:
-            return .palette.warning
-        }
-    }
-
-    private func labelColor(_ role: TUITranscriptRole) -> Color {
-        switch role {
-        case .user:
-            return .palette.accent
-        case .codex:
-            return .palette.foregroundSecondary
-        case .tool:
-            return .palette.warning
-        case .system:
-            return .palette.foregroundTertiary
-        case .error:
-            return .palette.error
-        }
+        AnyView(AgentTUITranscriptRow(line: line))
     }
 
     private func shouldShowActivity(_ snapshot: AgentTUISnapshot) -> Bool {
@@ -663,7 +599,7 @@ private struct AgentTUIView: View {
             return
         }
 
-        guard let currentTask = model.startTurn(prompt: text) else {
+        guard let turn = model.startTurn(prompt: text) else {
             return
         }
 
@@ -675,6 +611,11 @@ private struct AgentTUIView: View {
         let model = model
         _Concurrency.Task.detached {
             do {
+                let currentTask = turn.task
+                if !turn.isTaskPersisted {
+                    try await persistInteractiveTask(currentTask, store: runtime.store)
+                    model.markTaskPersisted(currentTask)
+                }
                 _ = try await runCodexTurn(
                     task: currentTask,
                     prompt: text,
@@ -708,7 +649,12 @@ private struct AgentTUIView: View {
         case "raw":
             _ = model.toggleRawEvents()
         case "info", "task", "repo":
-            let task = model.snapshot().task
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
             runCommand(status: "loading task info...") {
                 let summary = try await runtime.store.summary(for: task)
                 model.append(.system, tuiInfo(task: task, summary: summary, runtime: runtime))
@@ -721,7 +667,12 @@ private struct AgentTUIView: View {
                 model.setStatus("ready")
             }
         case "events":
-            let task = model.snapshot().task
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
             runCommand(status: "loading events...") {
                 let events = try await runtime.store.events(for: task.id)
                 model.append(.system, tuiEvents(events))
@@ -890,6 +841,160 @@ private struct AgentTUIView: View {
     }
 }
 
+private struct AgentTUITranscriptRow: View, Renderable {
+    let line: TUITranscriptLine
+
+    var body: Never {
+        fatalError("AgentTUITranscriptRow renders via Renderable")
+    }
+
+    func renderToBuffer(context: RenderContext) -> FrameBuffer {
+        let rendered = agentTUIRenderedTranscriptRow(
+            line,
+            width: max(1, context.availableWidth),
+            palette: context.environment.palette
+        )
+        return FrameBuffer(lines: [rendered.isEmpty ? " " : rendered])
+    }
+}
+
+private func agentTUIRenderedTranscriptRow(
+    _ line: TUITranscriptLine,
+    width: Int,
+    palette: any Palette
+) -> String {
+    var output = ""
+    var usedWidth = 0
+
+    func append(
+        _ text: String,
+        color: Color,
+        isBold: Bool = false,
+        isItalic: Bool = false,
+        isUnderlined: Bool = false
+    ) {
+        guard usedWidth < width else {
+            return
+        }
+        let remaining = width - usedWidth
+        let clipped = String(text.prefix(remaining))
+        guard !clipped.isEmpty else {
+            return
+        }
+        output += agentTUIANSIStyled(
+            clipped,
+            color: color,
+            isBold: isBold,
+            isItalic: isItalic,
+            isUnderlined: isUnderlined,
+            palette: palette
+        )
+        usedWidth += clipped.count
+    }
+
+    if line.isLabel {
+        append(line.text, color: agentTUILabelColor(line.role))
+    } else if !line.spans.isEmpty {
+        for span in line.spans {
+            append(
+                span.text,
+                color: agentTUISpanColor(span.tone, role: line.role),
+                isBold: span.isBold,
+                isItalic: span.isItalic,
+                isUnderlined: span.isUnderlined
+            )
+        }
+    } else {
+        append(
+            line.text,
+            color: agentTUIFallbackColor(line.role),
+            isBold: line.role == .error
+        )
+    }
+
+    return output.isEmpty ? " " : output
+}
+
+private func agentTUIANSIStyled(
+    _ text: String,
+    color: Color,
+    isBold: Bool,
+    isItalic: Bool,
+    isUnderlined: Bool,
+    palette: any Palette
+) -> String {
+    var codes: [String] = []
+    if isBold {
+        codes.append("1")
+    }
+    if isItalic {
+        codes.append("3")
+    }
+    if isUnderlined {
+        codes.append("4")
+    }
+    codes.append(contentsOf: agentTUIForegroundCodes(for: color.resolve(with: palette)))
+
+    guard !codes.isEmpty else {
+        return text
+    }
+    return "\u{1B}[\(codes.joined(separator: ";"))m\(text)\u{1B}[0m"
+}
+
+private func agentTUIForegroundCodes(for color: Color) -> [String] {
+    switch color.value {
+    case let .standard(ansi):
+        return [String(ansi.foregroundCode)]
+    case let .bright(ansi):
+        return [String(ansi.brightForegroundCode)]
+    case let .palette256(index):
+        return ["38", "5", String(index)]
+    case let .rgb(red, green, blue):
+        return ["38", "2", String(red), String(green), String(blue)]
+    case .semantic:
+        return []
+    }
+}
+
+private func agentTUISpanColor(_ tone: AgentTUIStyledTextTone, role: TUITranscriptRole) -> Color {
+    switch tone {
+    case .base:
+        return agentTUIFallbackColor(role)
+    case .secondary:
+        return .palette.foregroundTertiary
+    case .accent:
+        return .palette.accent
+    case .success:
+        return .palette.success
+    case .failure:
+        return .palette.error
+    case .quote:
+        return .palette.warning
+    }
+}
+
+private func agentTUIFallbackColor(_ role: TUITranscriptRole) -> Color {
+    switch role {
+    case .user, .codex:
+        return .palette.foreground
+    case .tool, .system:
+        return .palette.foregroundSecondary
+    case .error:
+        return .palette.error
+    }
+}
+
+private func agentTUILabelColor(_ role: TUITranscriptRole) -> Color {
+    switch role {
+    case .user:
+        return .palette.accent
+    case .codex, .system, .tool:
+        return .palette.foregroundTertiary
+    case .error:
+        return .palette.error
+    }
+}
+
 private struct AgentStatusBarConfiguration<Content: View>: View, Renderable {
     let content: Content
 
@@ -1046,22 +1151,34 @@ private func transcriptLines(_ entries: [TUITranscriptEntry], width: Int) -> [TU
         case .message:
             append(role: entry.role, text: entry.role.rawValue, isLabel: true)
             for renderedLine in agentTUIMarkdownStyledLines(entry.text, width: bodyWidth) {
-                append(role: entry.role, spans: [AgentTUIStyledTextSpan("  ")] + renderedLine)
+                append(role: entry.role, spans: agentTUIIndentedTranscriptSpans(renderedLine))
             }
         case .userQuote:
             for renderedLine in agentTUIQuoteStyledLines(entry.text, width: bodyWidth) {
                 append(role: entry.role, spans: renderedLine)
             }
         case let .toolCall(status):
-            append(role: entry.role, spans: agentTUIToolCallStyledLine(entry.text, status: status))
+            append(
+                role: entry.role,
+                spans: agentTUIIndentedTranscriptSpans(agentTUIToolCallStyledLine(entry.text, status: status))
+            )
         case .toolOutput:
             for renderedLine in agentTUIToolOutputStyledLines(entry.text, width: bodyWidth) {
-                append(role: entry.role, spans: renderedLine)
+                append(role: entry.role, spans: agentTUIIndentedTranscriptSpans(renderedLine))
             }
         }
     }
 
     return lines
+}
+
+func agentTUIIndentedTranscriptSpans(_ spans: [AgentTUIStyledTextSpan]) -> [AgentTUIStyledTextSpan] {
+    guard spans.count == 1, var span = spans.first, span.preservesLayout else {
+        return [AgentTUIStyledTextSpan("  ")] + spans
+    }
+
+    span.text = "  " + span.text
+    return [span]
 }
 
 private func wrapText(_ text: String, width: Int) -> [String] {

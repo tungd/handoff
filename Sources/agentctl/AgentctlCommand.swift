@@ -496,6 +496,11 @@ struct TaskPreview: Codable {
     var repository: RepositorySnapshot
 }
 
+struct InteractiveTaskResolution: Sendable {
+    var task: TaskRecord
+    var isPersisted: Bool
+}
+
 func runInteractiveAgent(
     cwd: String,
     storeOptions: StoreOptions,
@@ -508,17 +513,20 @@ func runInteractiveAgent(
     let snapshot = try RepositoryInspector().inspect(path: repoURL)
 
     try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
-        var task = try await resolveInteractiveTask(
+        let taskResolution = try await resolveInitialInteractiveTask(
             identifier: taskIdentifier,
             title: title,
             snapshot: snapshot,
             repoURL: repoURL,
             store: store
         )
+        var task = taskResolution.task
+        var taskPersisted = taskResolution.isPersisted
 
         if TerminalCapability.isInteractive {
             try await runTUIkitInteractiveLoop(
                 task: task,
+                taskPersisted: taskPersisted,
                 storeOptions: storeOptions,
                 repoURL: repoURL,
                 snapshot: snapshot,
@@ -553,11 +561,19 @@ func runInteractiveAgent(
                 case "help":
                     renderer.help()
                 case "info", "task", "repo":
+                    guard taskPersisted else {
+                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                        continue
+                    }
                     let summary = try await store.summary(for: task)
                     renderer.info(task: task, summary: summary, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
                 case "tasks":
                     renderer.tasks(try await store.listTasks())
                 case "events":
+                    guard taskPersisted else {
+                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                        continue
+                    }
                     renderer.events(try await store.events(for: task.id))
                 case "raw":
                     showRawEvents.toggle()
@@ -570,6 +586,7 @@ func runInteractiveAgent(
                         repoURL: repoURL,
                         store: store
                     )
+                    taskPersisted = true
                     renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
                 case "resume":
                     guard let identifier = command.argument, !identifier.isEmpty else {
@@ -577,6 +594,7 @@ func runInteractiveAgent(
                         continue
                     }
                     task = try await store.findTask(identifier)
+                    taskPersisted = true
                     renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
                 default:
                     renderer.error("unknown command: /\(command.name)")
@@ -586,6 +604,11 @@ func runInteractiveAgent(
             }
 
             do {
+                if !taskPersisted {
+                    try await persistInteractiveTask(task, store: store)
+                    taskPersisted = true
+                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
+                }
                 renderer.status("running Codex turn...")
                 let assistantRendered = SendableFlag()
                 let renderRawEvents = showRawEvents
@@ -613,6 +636,26 @@ func runInteractiveAgent(
     }
 }
 
+func resolveInitialInteractiveTask(
+    identifier: String?,
+    title: String?,
+    snapshot: RepositorySnapshot,
+    repoURL: URL,
+    store: any AgentTaskStore
+) async throws -> InteractiveTaskResolution {
+    if let identifier {
+        return InteractiveTaskResolution(
+            task: try await store.findTask(identifier),
+            isPersisted: true
+        )
+    }
+
+    return InteractiveTaskResolution(
+        task: makeInteractiveTask(title: title, snapshot: snapshot, repoURL: repoURL),
+        isPersisted: false
+    )
+}
+
 func resolveInteractiveTask(
     identifier: String?,
     title: String?,
@@ -624,13 +667,28 @@ func resolveInteractiveTask(
         return try await store.findTask(identifier)
     }
 
+    let task = makeInteractiveTask(title: title, snapshot: snapshot, repoURL: repoURL)
+    try await persistInteractiveTask(task, store: store)
+    return task
+}
+
+func makeInteractiveTask(
+    title: String?,
+    snapshot: RepositorySnapshot,
+    repoURL: URL
+) -> TaskRecord {
     let resolvedTitle = title ?? defaultInteractiveTaskTitle(snapshot: snapshot, repoURL: repoURL)
-    let task = TaskRecord(
+    return TaskRecord(
         title: resolvedTitle,
         slug: Slug.make(resolvedTitle),
         backendPreference: .codex
     )
+}
 
+func persistInteractiveTask(
+    _ task: TaskRecord,
+    store: any AgentTaskStore
+) async throws {
     try await store.saveTask(task)
     try await store.appendEvent(AgentEvent(taskID: task.id, kind: .taskCreated, payload: [
         "title": .string(task.title),
@@ -638,8 +696,6 @@ func resolveInteractiveTask(
         "backend": .string(task.backendPreference.rawValue),
         "source": .string("interactive")
     ]))
-
-    return task
 }
 
 func defaultInteractiveTaskTitle(snapshot: RepositorySnapshot, repoURL: URL) -> String {

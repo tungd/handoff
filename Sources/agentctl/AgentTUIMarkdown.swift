@@ -22,19 +22,22 @@ struct AgentTUIStyledTextSpan: Sendable, Equatable {
     var isItalic: Bool
     var isUnderlined: Bool
     var tone: AgentTUIStyledTextTone
+    var preservesLayout: Bool
 
     init(
         _ text: String,
         isBold: Bool = false,
         isItalic: Bool = false,
         isUnderlined: Bool = false,
-        tone: AgentTUIStyledTextTone = .base
+        tone: AgentTUIStyledTextTone = .base,
+        preservesLayout: Bool = false
     ) {
         self.text = text
         self.isBold = isBold
         self.isItalic = isItalic
         self.isUnderlined = isUnderlined
         self.tone = tone
+        self.preservesLayout = preservesLayout
     }
 }
 
@@ -74,14 +77,9 @@ func agentTUIMarkdownStyledLines(_ markdown: String, width: Int) -> [[AgentTUISt
 
 func agentTUIQuoteStyledLines(_ markdown: String, width: Int) -> [[AgentTUIStyledTextSpan]] {
     agentTUIMarkdownStyledLines(markdown, width: max(1, width - 2)).map { line in
-        [AgentTUIStyledTextSpan("│ ", tone: .quote)] + line.map { span in
-            var copy = span
-            copy.isItalic = true
-            if copy.tone == .base {
-                copy.tone = .quote
-            }
-            return copy
-        }
+        let text = agentTUIPlainText(line)
+        let quoted = text.isEmpty ? "│" : "│ \(text)"
+        return [AgentTUIStyledTextSpan(quoted, isItalic: true, tone: .quote, preservesLayout: true)]
     }
 }
 
@@ -114,35 +112,20 @@ func agentTUIToolCallStyledLine(
     status: AgentTUIToolStatus
 ) -> [AgentTUIStyledTextSpan] {
     let symbol: String
-    let symbolTone: AgentTUIStyledTextTone
+    let tone: AgentTUIStyledTextTone
     switch status {
     case .running:
         symbol = "⋯"
-        symbolTone = .secondary
+        tone = .secondary
     case .succeeded:
         symbol = "✓"
-        symbolTone = .success
+        tone = .success
     case .failed:
         symbol = "×"
-        symbolTone = .failure
+        tone = .failure
     }
 
-    let parts = text.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
-    let title = parts.first.map(String.init) ?? text
-    let detail = parts.count > 1 ? String(parts[1]) : ""
-
-    var spans = [
-        AgentTUIStyledTextSpan(symbol, tone: symbolTone),
-        AgentTUIStyledTextSpan(" "),
-        AgentTUIStyledTextSpan(title, isBold: true)
-    ]
-
-    if !detail.isEmpty {
-        appendSpan(AgentTUIStyledTextSpan(" "), to: &spans)
-        appendSpan(AgentTUIStyledTextSpan(detail, tone: .secondary), to: &spans)
-    }
-
-    return spans
+    return [AgentTUIStyledTextSpan("\(symbol) \(text)", isBold: true, tone: tone, preservesLayout: true)]
 }
 
 func agentTUIToolOutputText(
@@ -178,11 +161,7 @@ func agentTUIToolOutputStyledLines(_ text: String, width: Int) -> [[AgentTUIStyl
 
     return lines.enumerated().flatMap { index, line -> [[AgentTUIStyledTextSpan]] in
         if index == 0, line.hasPrefix("$ ") {
-            return wrapStyledSpans([
-                AgentTUIStyledTextSpan("$", tone: .success),
-                AgentTUIStyledTextSpan(" "),
-                AgentTUIStyledTextSpan(String(line.dropFirst(2)), isBold: true)
-            ], width: width)
+            return [[AgentTUIStyledTextSpan(line, isBold: true, preservesLayout: true)]]
         }
 
         return wrapStyledSpans([
@@ -425,15 +404,26 @@ private func parseMarkdownTable(lines: [String], startIndex: Int, width: Int) ->
     let columnWidths = constrainedTableColumnWidths(
         naturalColumnWidths,
         availableWidth: width,
-        separatorWidth: max(0, columnCount - 1) * 3
+        decorationWidth: tableDecorationWidth(columnCount: columnCount)
     )
 
     var rendered: [[AgentTUIStyledTextSpan]] = []
-    rendered.append(contentsOf: renderTableRow(normalizedRows[0], columnWidths: columnWidths, header: true))
-    rendered.append([AgentTUIStyledTextSpan(tableDivider(columnWidths), tone: .secondary)])
+    rendered.append([AgentTUIStyledTextSpan(
+        tableBorder(columnWidths, left: "┌", separator: "┬", right: "┐"),
+        preservesLayout: true
+    )])
+    rendered.append(contentsOf: renderTableRow(normalizedRows[0], columnWidths: columnWidths))
+    rendered.append([AgentTUIStyledTextSpan(
+        tableBorder(columnWidths, left: "├", separator: "┼", right: "┤"),
+        preservesLayout: true
+    )])
     for row in normalizedRows.dropFirst() {
-        rendered.append(contentsOf: renderTableRow(row, columnWidths: columnWidths, header: false))
+        rendered.append(contentsOf: renderTableRow(row, columnWidths: columnWidths))
     }
+    rendered.append([AgentTUIStyledTextSpan(
+        tableBorder(columnWidths, left: "└", separator: "┴", right: "┘"),
+        preservesLayout: true
+    )])
 
     return MarkdownTableParseResult(
         lines: rendered,
@@ -444,7 +434,7 @@ private func parseMarkdownTable(lines: [String], startIndex: Int, width: Int) ->
 private func constrainedTableColumnWidths(
     _ naturalWidths: [Int],
     availableWidth: Int,
-    separatorWidth: Int
+    decorationWidth: Int
 ) -> [Int] {
     guard !naturalWidths.isEmpty else {
         return []
@@ -453,12 +443,14 @@ private func constrainedTableColumnWidths(
     let minimumWidth = 3
     let availableCellWidth = max(
         naturalWidths.count * minimumWidth,
-        availableWidth - separatorWidth
+        availableWidth - decorationWidth
     )
     var widths = naturalWidths.map { max(minimumWidth, $0) }
 
     while widths.reduce(0, +) > availableCellWidth {
-        guard let shrinkIndex = widths.indices.reversed().first(where: { widths[$0] > minimumWidth }) else {
+        guard let shrinkIndex = widths.indices.max(by: { widths[$0] < widths[$1] }),
+              widths[shrinkIndex] > minimumWidth
+        else {
             break
         }
         widths[shrinkIndex] -= 1
@@ -502,53 +494,49 @@ private func isTableSeparator(_ line: String) -> Bool {
 
 private func renderTableRow(
     _ row: [String],
-    columnWidths: [Int],
-    header: Bool
+    columnWidths: [Int]
 ) -> [[AgentTUIStyledTextSpan]] {
     let cells = row.enumerated().map { column, cell in
-        wrapStyledSpans(tableCellSpans(cell, header: header), width: columnWidths[column])
+        wrapStyledSpans(tableCellSpans(cell), width: columnWidths[column])
     }
     let rowHeight = cells.map(\.count).max() ?? 1
 
     return (0..<rowHeight).map { rowIndex in
-        var spans: [AgentTUIStyledTextSpan] = []
+        var text = ""
 
         for column in row.indices {
-            if column > 0 {
-                appendSpan(AgentTUIStyledTextSpan(" │ ", tone: .secondary), to: &spans)
-            }
+            text += "│ "
 
             let cellLine = rowIndex < cells[column].count
                 ? cells[column][rowIndex]
                 : [AgentTUIStyledTextSpan("")]
-            for span in cellLine {
-                appendSpan(span, to: &spans)
-            }
+            text += agentTUIPlainText(cellLine)
 
-            if column < row.count - 1 {
-                let padding = columnWidths[column] - agentTUIPlainText(cellLine).count
-                if padding > 0 {
-                    appendSpan(AgentTUIStyledTextSpan(String(repeating: " ", count: padding)), to: &spans)
-                }
+            let padding = columnWidths[column] - agentTUIPlainText(cellLine).count
+            if padding > 0 {
+                text += String(repeating: " ", count: padding)
             }
+            text += " "
         }
+        text += "│"
 
-        return spans
+        return [AgentTUIStyledTextSpan(text, preservesLayout: true)]
     }
 }
 
-private func tableCellSpans(_ cell: String, header: Bool) -> [AgentTUIStyledTextSpan] {
-    parseInlineMarkdown(cell).map { span in
-        var copy = span
-        copy.isBold = copy.isBold || header
-        return copy
-    }
+private func tableCellSpans(_ cell: String) -> [AgentTUIStyledTextSpan] {
+    parseInlineMarkdown(cell)
 }
 
-private func tableDivider(_ widths: [Int]) -> String {
-    widths
-        .map { String(repeating: "─", count: $0) }
-        .joined(separator: "─┼─")
+private func tableDecorationWidth(columnCount: Int) -> Int {
+    // Left/right borders + per-column padding + inner separators.
+    max(0, (columnCount * 2) + columnCount + 1)
+}
+
+private func tableBorder(_ widths: [Int], left: String, separator: String, right: String) -> String {
+    left + widths
+        .map { String(repeating: "─", count: $0 + 2) }
+        .joined(separator: separator) + right
 }
 
 private func plainInlineText(_ markdown: String) -> String {
@@ -734,7 +722,8 @@ private func appendSpan(_ span: AgentTUIStyledTextSpan, to spans: inout [AgentTU
        last.isBold == span.isBold,
        last.isItalic == span.isItalic,
        last.isUnderlined == span.isUnderlined,
-       last.tone == span.tone {
+       last.tone == span.tone,
+       last.preservesLayout == span.preservesLayout {
         last.text += span.text
         spans[spans.count - 1] = last
     } else {

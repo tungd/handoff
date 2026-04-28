@@ -45,7 +45,7 @@ struct AgentTUIMarkdownTests {
     }
 
     @Test
-    func tablesRenderAlignedRowsAndStyledCells() {
+    func tablesRenderAlignedRowsAsStablePrecomposedLines() {
         let lines = agentTUIMarkdownStyledLines(
             """
             | Name | Status |
@@ -56,13 +56,15 @@ struct AgentTUIMarkdownTests {
         )
 
         #expect(lines.map(agentTUIPlainText) == [
-            "Name │ Status",
-            "─────┼───────",
-            "API  │ done"
+            "┌──────┬────────┐",
+            "│ Name │ Status │",
+            "├──────┼────────┤",
+            "│ API  │ done   │",
+            "└──────┴────────┘"
         ])
-        #expect(span(containing: "Name", in: lines[0])?.isBold == true)
-        #expect(span(containing: "Status", in: lines[0])?.isBold == true)
-        #expect(span(containing: "done", in: lines[2])?.isBold == true)
+        #expect(lines.allSatisfy { $0.count == 1 })
+        #expect(lines.allSatisfy { $0.first?.preservesLayout == true })
+        #expect(lines.allSatisfy { $0.first?.tone == .base })
     }
 
     @Test
@@ -78,14 +80,17 @@ struct AgentTUIMarkdownTests {
         let plain = lines.map(agentTUIPlainText)
 
         #expect(plain == [
-            "Area                      │ Status",
-            "──────────────────────────┼─────────────",
-            "Swift package/build/tests │ Implemented,",
-            "                          │ `swift test`",
-            "                          │ passes 20",
-            "                          │ tests"
+            "┌──────────────────┬───────────────────┐",
+            "│ Area             │ Status            │",
+            "├──────────────────┼───────────────────┤",
+            "│ Swift            │ Implemented,      │",
+            "│ package/build/te │ `swift test`      │",
+            "│ sts              │ passes 20 tests   │",
+            "└──────────────────┴───────────────────┘"
         ])
-        #expect(plain.dropFirst(2).allSatisfy { $0.contains("│") })
+        #expect(plain.dropFirst(3).dropLast().allSatisfy { $0.contains("│") })
+        #expect(lines.allSatisfy { $0.count == 1 })
+        #expect(lines.allSatisfy { $0.first?.preservesLayout == true })
     }
 
     @Test
@@ -107,11 +112,11 @@ struct AgentTUIMarkdownTests {
         #expect(lines.map(agentTUIPlainText) == [
             "│ How far is it?"
         ])
-        #expect(lines[0].first?.text == "│ ")
+        #expect(lines[0].count == 1)
+        #expect(lines[0].first?.text == "│ How far is it?")
         #expect(lines[0].first?.tone == .quote)
-        #expect(span(containing: "How", in: lines[0])?.isItalic == true)
-        #expect(span(containing: "far", in: lines[0])?.isBold == true)
-        #expect(span(containing: "far", in: lines[0])?.isItalic == true)
+        #expect(lines[0].first?.isItalic == true)
+        #expect(lines[0].first?.preservesLayout == true)
     }
 
     @Test
@@ -125,8 +130,23 @@ struct AgentTUIMarkdownTests {
         )
 
         #expect(agentTUIPlainText(line) == "✓ Bash pnpm -C cli test --run --no-color")
+        #expect(line.count == 1)
         #expect(line[0].tone == .success)
-        #expect(span(containing: "Bash", in: line)?.isBold == true)
+        #expect(line[0].isBold == true)
+        #expect(line[0].preservesLayout == true)
+    }
+
+    @Test
+    func transcriptIndentKeepsPreservedToolLinesSingleSpan() {
+        let line = agentTUIIndentedTranscriptSpans([
+            AgentTUIStyledTextSpan("✓ Bash swift test", isBold: true, tone: .success, preservesLayout: true)
+        ])
+
+        #expect(line.count == 1)
+        #expect(agentTUIPlainText(line) == "  ✓ Bash swift test")
+        #expect(line[0].tone == .success)
+        #expect(line[0].isBold == true)
+        #expect(line[0].preservesLayout == true)
     }
 
     @Test
@@ -145,6 +165,10 @@ struct AgentTUIMarkdownTests {
         line 13
         line 14
         """)
+
+        let rendered = agentTUIToolOutputStyledLines(text ?? "", width: 80)
+        #expect(rendered.first?.count == 1)
+        #expect(rendered.first.map(agentTUIPlainText) == "$ pnpm test")
     }
 }
 
