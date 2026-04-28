@@ -398,7 +398,7 @@ private struct AgentTUIView: View {
     }
 
     private func dividerLine(label: String?, width: Int) -> some View {
-        Text(horizontalDivider(label: label, width: width))
+        Text(agentTUIHorizontalDivider(label: label, width: width))
             .foregroundStyle(.palette.foregroundTertiary)
             .frame(width: width)
     }
@@ -532,44 +532,17 @@ private struct AgentTUIView: View {
     }
 
     private func statusLine(_ snapshot: AgentTUISnapshot, width: Int) -> String {
-        let right = tokenStatus(snapshot)
         var leftParts = [repoBranchText]
         if snapshot.showRawEvents {
             leftParts.append("raw")
         }
 
-        let availableWidth = max(0, width)
-        guard availableWidth > 0 else {
-            return ""
-        }
-        guard right.count < availableWidth else {
-            return String(right.suffix(availableWidth))
-        }
-
-        let rightStart = availableWidth - right.count
-        let maxLeftWidth = max(0, rightStart - 1)
-        let left = truncateMiddle(leftParts.joined(separator: " "), maxWidth: maxLeftWidth)
-        let spaces = max(1, rightStart - left.count)
-        return left + String(repeating: " ", count: spaces) + right
-    }
-
-    private func horizontalDivider(label: String?, width: Int) -> String {
-        let width = max(0, width)
-        guard width > 0 else {
-            return ""
-        }
-        guard let label, !label.isEmpty else {
-            return String(repeating: "─", count: width)
-        }
-
-        let title = " \(label) "
-        guard title.count < width else {
-            return String(title.prefix(width))
-        }
-
-        let prefixWidth = min(2, max(0, width - title.count))
-        let suffixWidth = max(0, width - prefixWidth - title.count)
-        return String(repeating: "─", count: prefixWidth) + title + String(repeating: "─", count: suffixWidth)
+        return agentTUIStatusLine(
+            repoBranchText: repoBranchText,
+            badges: Array(leftParts.dropFirst()),
+            tokenStatus: tokenStatus(snapshot),
+            width: width
+        )
     }
 
     private func submitInput() {
@@ -1079,6 +1052,44 @@ private func truncateMiddle(_ value: String, maxWidth: Int) -> String {
     let prefixCount = max(1, remaining / 2)
     let suffixCount = max(1, remaining - prefixCount)
     return String(value.prefix(prefixCount)) + marker + String(value.suffix(suffixCount))
+}
+
+func agentTUIHorizontalDivider(label: String?, width: Int) -> String {
+    let width = max(0, width)
+    guard width > 0 else {
+        return ""
+    }
+    guard let label, !label.isEmpty else {
+        return String(repeating: "─", count: width)
+    }
+
+    let title = " \(label) "
+    guard title.count < width else {
+        return String(title.prefix(width))
+    }
+
+    let prefixWidth = min(2, max(0, width - title.count))
+    let suffixWidth = max(0, width - prefixWidth - title.count)
+    return String(repeating: "─", count: prefixWidth) + title + String(repeating: "─", count: suffixWidth)
+}
+
+func agentTUIStatusLine(repoBranchText: String, badges: [String], tokenStatus: String, width: Int) -> String {
+    var leftParts = [repoBranchText]
+    leftParts.append(contentsOf: badges)
+
+    let availableWidth = max(0, width)
+    guard availableWidth > 0 else {
+        return ""
+    }
+    guard tokenStatus.count < availableWidth else {
+        return String(tokenStatus.suffix(availableWidth))
+    }
+
+    let rightStart = availableWidth - tokenStatus.count
+    let maxLeftWidth = max(0, rightStart - 1)
+    let left = truncateMiddle(leftParts.joined(separator: " "), maxWidth: maxLeftWidth)
+    let spaces = max(1, rightStart - left.count)
+    return left + String(repeating: " ", count: spaces) + tokenStatus
 }
 
 private func resolvedCodexModelMetadata() -> CodexModelMetadata {

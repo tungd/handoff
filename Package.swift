@@ -37,6 +37,13 @@ let package = Package(
         .testTarget(
             name: "AgentCoreTests",
             dependencies: ["AgentCore"]
+        ),
+        .testTarget(
+            name: "AgentctlTests",
+            dependencies: [
+                "agentctl",
+                .product(name: "TUIkit", package: "TUIkit")
+            ]
         )
     ]
 )
