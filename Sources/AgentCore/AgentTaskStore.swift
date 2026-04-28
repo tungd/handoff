@@ -9,6 +9,9 @@ public protocol AgentTaskStore: Sendable {
     func listSessions(taskID: UUID?) async throws -> [SessionRecord]
     func latestSession(for taskID: UUID) async throws -> SessionRecord?
 
+    func saveCheckpoint(_ checkpoint: CheckpointRecord) async throws
+    func listCheckpoints(taskID: UUID?) async throws -> [CheckpointRecord]
+
     @discardableResult
     func appendEvent(_ event: AgentEvent) async throws -> AgentEvent
     func events(for taskID: UUID) async throws -> [AgentEvent]
@@ -44,6 +47,14 @@ extension LocalTaskStore: AgentTaskStore {
 
     public func latestSession(for taskID: UUID) async throws -> SessionRecord? {
         try latestSessionSync(for: taskID)
+    }
+
+    public func saveCheckpoint(_ checkpoint: CheckpointRecord) async throws {
+        try saveCheckpointSync(checkpoint)
+    }
+
+    public func listCheckpoints(taskID: UUID?) async throws -> [CheckpointRecord] {
+        try listCheckpointsSync(taskID: taskID)
     }
 
     public func appendEvent(_ event: AgentEvent) async throws -> AgentEvent {

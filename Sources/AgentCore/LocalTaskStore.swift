@@ -32,6 +32,7 @@ public struct LocalTaskStore: Sendable {
     private var tasksDirectory: URL { root.appendingPathComponent("tasks", isDirectory: true) }
     private var sessionsDirectory: URL { root.appendingPathComponent("sessions", isDirectory: true) }
     private var eventsDirectory: URL { root.appendingPathComponent("events", isDirectory: true) }
+    private var checkpointsDirectory: URL { root.appendingPathComponent("checkpoints", isDirectory: true) }
 
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
@@ -54,6 +55,7 @@ public struct LocalTaskStore: Sendable {
         try fileManager.createDirectory(at: tasksDirectory, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: sessionsDirectory, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: eventsDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: checkpointsDirectory, withIntermediateDirectories: true)
     }
 
     public func saveTask(_ task: TaskRecord) throws {
@@ -142,6 +144,34 @@ public struct LocalTaskStore: Sendable {
         try latestSession(for: taskID)
     }
 
+    public func saveCheckpoint(_ checkpoint: CheckpointRecord) throws {
+        try prepare()
+        let data = try encoder.encode(checkpoint)
+        try data.write(to: checkpointURL(checkpoint.id), options: [.atomic])
+    }
+
+    public func saveCheckpointSync(_ checkpoint: CheckpointRecord) throws {
+        try saveCheckpoint(checkpoint)
+    }
+
+    public func listCheckpoints(taskID: UUID? = nil) throws -> [CheckpointRecord] {
+        try prepare()
+        let files = try FileManager.default.contentsOfDirectory(
+            at: checkpointsDirectory,
+            includingPropertiesForKeys: nil
+        )
+        .filter { $0.pathExtension == "json" }
+
+        let checkpoints = try files.map { try decoder.decode(CheckpointRecord.self, from: Data(contentsOf: $0)) }
+        return checkpoints
+            .filter { taskID == nil || $0.taskID == taskID }
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    public func listCheckpointsSync(taskID: UUID? = nil) throws -> [CheckpointRecord] {
+        try listCheckpoints(taskID: taskID)
+    }
+
     @discardableResult
     public func appendEvent(_ event: AgentEvent) throws -> AgentEvent {
         try prepare()
@@ -227,6 +257,10 @@ public struct LocalTaskStore: Sendable {
 
     private func eventsURL(_ taskID: UUID) -> URL {
         eventsDirectory.appendingPathComponent("\(taskID.uuidString).jsonl")
+    }
+
+    private func checkpointURL(_ id: UUID) -> URL {
+        checkpointsDirectory.appendingPathComponent("\(id.uuidString).json")
     }
 }
 

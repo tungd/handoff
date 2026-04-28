@@ -21,6 +21,15 @@ private enum AgentTUIRuntimeBox {
     static var current: AgentTUIRuntime?
 }
 
+@MainActor
+private func updateAgentTUIRuntimeSnapshot(_ snapshot: RepositorySnapshot) {
+    guard var runtime = AgentTUIRuntimeBox.current else {
+        return
+    }
+    runtime.snapshot = snapshot
+    AgentTUIRuntimeBox.current = runtime
+}
+
 func runTUIkitInteractiveLoop(
     task: TaskRecord,
     taskPersisted: Bool,
@@ -144,6 +153,19 @@ private struct TUITokenUsage: Sendable, Equatable {
     var outputTokens: Int64
     var reasoningTokens: Int64
     var contextWindowTokens: Int64?
+}
+
+struct AgentTUIInputLine: Equatable, Sendable {
+    var start: Int
+    var end: Int
+    var text: String
+}
+
+struct AgentTUIComposerRow: Identifiable, Equatable, Sendable {
+    var id: Int
+    var before: String
+    var after: String
+    var hasCursor: Bool
 }
 
 private struct CodexModelMetadata: Sendable, Equatable {
@@ -386,6 +408,9 @@ private struct AgentTUIView: View {
     private let model: AgentTUIModel
     @State private var input = ""
     @State private var inputCursor = 0
+    @State private var promptHistory: [String] = []
+    @State private var promptHistoryIndex: Int?
+    @State private var promptHistoryDraft = ""
 
     init() {
         guard let runtime = AgentTUIRuntimeBox.current else {
@@ -398,7 +423,14 @@ private struct AgentTUIView: View {
         let snapshot = model.snapshot()
         let _ = model.clearRenderCacheIfNeeded(for: snapshot.revision)
         let size = terminalSize()
-        let composerHeight = 7
+        let maxInputRows = max(1, min(8, size.rows / 3))
+        let inputRows = agentTUIComposerRows(
+            input: input,
+            cursor: inputCursor,
+            width: max(20, size.columns),
+            maxRows: maxInputRows
+        ).count
+        let composerHeight = 6 + inputRows
         let transcriptHeight = max(3, size.rows - 2 - composerHeight)
         let lines = transcriptLines(snapshot.entries, width: max(40, size.columns - 4))
         let maxScrollOffset = max(0, lines.count - transcriptHeight)
@@ -414,7 +446,8 @@ private struct AgentTUIView: View {
             .frame(height: transcriptHeight, alignment: .topLeading)
             composer(
                 snapshot,
-                terminalWidth: size.columns
+                terminalWidth: size.columns,
+                maxInputRows: maxInputRows
             )
             .frame(height: composerHeight, alignment: .bottomLeading)
         }
@@ -438,7 +471,8 @@ private struct AgentTUIView: View {
 
     private func composer(
         _ snapshot: AgentTUISnapshot,
-        terminalWidth: Int
+        terminalWidth: Int,
+        maxInputRows: Int
     ) -> some View {
         let width = max(20, terminalWidth)
 
@@ -447,7 +481,7 @@ private struct AgentTUIView: View {
             activityLine(snapshot, width: width)
             Text("").frame(width: width)
             dividerLine(label: modelDisplayName, width: width)
-            inputLine(width: width)
+            inputBlock(width: width, maxRows: maxInputRows)
             dividerLine(label: nil, width: width)
             composerStatus(snapshot, width: width).frame(width: width)
         }
@@ -474,20 +508,36 @@ private struct AgentTUIView: View {
             .frame(width: width)
     }
 
-    private func inputLine(width: Int) -> some View {
-        let visible = visibleInputParts(width: width)
+    private func inputBlock(width: Int, maxRows: Int) -> some View {
+        let rows = agentTUIComposerRows(
+            input: input,
+            cursor: inputCursor,
+            width: width,
+            maxRows: maxRows
+        )
 
-        return HStack(spacing: 0) {
-            if !visible.before.isEmpty {
-                Text(visible.before).foregroundStyle(.palette.foreground)
-            }
-            Text("█").foregroundStyle(.default)
-            if !visible.after.isEmpty {
-                Text(visible.after).foregroundStyle(.palette.foreground)
-            }
-            Spacer(minLength: 0)
+        return VStack(alignment: .leading, spacing: 0) {
+            ViewArray(rows.map { inputRow($0, width: width) })
         }
-        .frame(width: width)
+        .frame(width: width, height: rows.count, alignment: .topLeading)
+    }
+
+    private func inputRow(_ row: AgentTUIComposerRow, width: Int) -> AnyView {
+        AnyView(
+            HStack(spacing: 0) {
+                if !row.before.isEmpty {
+                    Text(row.before).foregroundStyle(.palette.foreground)
+                }
+                if row.hasCursor {
+                    Text("█").foregroundStyle(.default)
+                }
+                if !row.after.isEmpty {
+                    Text(row.after).foregroundStyle(.palette.foreground)
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(width: width)
+        )
     }
 
     private func composerStatus(
@@ -587,10 +637,12 @@ private struct AgentTUIView: View {
     }
 
     private func submitInput() {
-        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = input.trimmingCharacters(in: .newlines)
         input = ""
         inputCursor = 0
-        guard !text.isEmpty else {
+        promptHistoryIndex = nil
+        promptHistoryDraft = ""
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return
         }
 
@@ -602,6 +654,7 @@ private struct AgentTUIView: View {
         guard let turn = model.startTurn(prompt: text) else {
             return
         }
+        appendPromptHistory(text)
 
         guard let runtime = AgentTUIRuntimeBox.current else {
             model.failTurn(RuntimeError("TUI runtime is not available."))
@@ -645,7 +698,7 @@ private struct AgentTUIView: View {
         case "exit", "quit":
             Darwin.raise(SIGINT)
         case "help":
-            model.append(.system, "/help /info /tasks /new [title] /resume <task> /events /raw /exit")
+            model.append(.system, "/help /info /tasks /new [title] /resume <task> /checkpoint [--push] /events /raw /exit")
         case "raw":
             _ = model.toggleRawEvents()
         case "info", "task", "repo":
@@ -678,6 +731,27 @@ private struct AgentTUIView: View {
                 model.append(.system, tuiEvents(events))
                 model.setStatus("ready")
             }
+        case "checkpoint":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
+            runCommand(status: "creating checkpoint...") {
+                let options = try checkpointSlashOptions(command.argument)
+                let result = try await createAndPersistCheckpoint(
+                    task: task,
+                    store: runtime.store,
+                    snapshot: runtime.snapshot,
+                    repoURL: runtime.repoURL,
+                    options: options
+                )
+                let updatedSnapshot = try RepositoryInspector().inspect(path: runtime.repoURL)
+                await updateAgentTUIRuntimeSnapshot(updatedSnapshot)
+                model.append(.system, checkpointCreatedStatus(result))
+                model.setStatus("ready")
+            }
         case "new":
             runCommand(status: "creating task...") {
                 let newTask = try await resolveInteractiveTask(
@@ -696,8 +770,22 @@ private struct AgentTUIView: View {
             }
             runCommand(status: "resuming task...") {
                 let resumedTask = try await runtime.store.findTask(identifier)
+                let restore = try await restoreLatestCheckpointIfAvailable(
+                    task: resumedTask,
+                    store: runtime.store,
+                    repoURL: runtime.repoURL,
+                    snapshot: runtime.snapshot
+                )
+                if restore != nil {
+                    let updatedSnapshot = try RepositoryInspector().inspect(path: runtime.repoURL)
+                    await updateAgentTUIRuntimeSnapshot(updatedSnapshot)
+                }
                 let loadedEntries = try await tuiEntries(for: resumedTask.id, store: runtime.store)
-                model.setTask(resumedTask, entries: loadedEntries, message: "Resumed task \(resumedTask.slug).")
+                var message = "Resumed task \(resumedTask.slug)."
+                if let restore {
+                    message += " \(checkpointRestoreStatus(restore))"
+                }
+                model.setTask(resumedTask, entries: loadedEntries, message: message)
             }
         default:
             model.append(.error, "unknown command: /\(command.name)")
@@ -718,6 +806,9 @@ private struct AgentTUIView: View {
 
     private func handleKey(_ event: KeyEvent, pageSize: Int, maxScrollOffset: Int) -> Bool {
         switch event.key {
+        case .enter where event.shift || event.alt:
+            insertInput("\n")
+            return true
         case .enter:
             submitInput()
             return true
@@ -726,6 +817,33 @@ private struct AgentTUIView: View {
             return true
         case .character("c") where event.ctrl:
             Darwin.raise(SIGINT)
+            return true
+        case .character("a") where event.ctrl:
+            moveToBeginningOfInputLine()
+            return true
+        case .character("e") where event.ctrl:
+            moveToEndOfInputLine()
+            return true
+        case .character("b") where event.ctrl:
+            moveInputCursorBackward()
+            return true
+        case .character("f") where event.ctrl:
+            moveInputCursorForward()
+            return true
+        case .character("w") where event.ctrl:
+            killInputWordBackward()
+            return true
+        case .character("k") where event.ctrl:
+            killInputLineForward()
+            return true
+        case .character("p") where event.ctrl:
+            moveInputLineOrHistory(delta: -1)
+            return true
+        case .character("n") where event.ctrl:
+            moveInputLineOrHistory(delta: 1)
+            return true
+        case .backspace where event.alt:
+            killInputWordBackward()
             return true
         case .backspace:
             deleteInputBackward()
@@ -749,7 +867,7 @@ private struct AgentTUIView: View {
             insertInput(" ")
             return true
         case .paste(let text):
-            insertInput(text.replacingOccurrences(of: "\n", with: " "))
+            insertInput(text)
             return true
         case .character(let character) where !event.ctrl && !event.alt:
             insertInput(String(character))
@@ -792,6 +910,7 @@ private struct AgentTUIView: View {
         let index = input.index(input.startIndex, offsetBy: cursor)
         input.insert(contentsOf: safeText, at: index)
         inputCursor = cursor + safeText.count
+        resetPromptHistorySelectionForEdit()
     }
 
     private func deleteInputBackward() {
@@ -802,6 +921,7 @@ private struct AgentTUIView: View {
         let index = input.index(input.startIndex, offsetBy: cursor - 1)
         input.remove(at: index)
         inputCursor = cursor - 1
+        resetPromptHistorySelectionForEdit()
     }
 
     private func deleteInputForward() {
@@ -812,18 +932,130 @@ private struct AgentTUIView: View {
         let index = input.index(input.startIndex, offsetBy: cursor)
         input.remove(at: index)
         inputCursor = cursor
+        resetPromptHistorySelectionForEdit()
     }
 
-    private func visibleInputParts(width: Int) -> (before: String, after: String) {
-        let textWidth = max(1, width)
-        let visibleTextCount = max(0, textWidth - 1)
+    private func moveInputCursorBackward() {
+        inputCursor = max(0, inputCursor - 1)
+    }
+
+    private func moveInputCursorForward() {
+        inputCursor = min(input.count, inputCursor + 1)
+    }
+
+    private func moveToBeginningOfInputLine() {
+        let lines = agentTUIInputLines(input)
+        let index = agentTUIInputLineIndex(lines: lines, cursor: inputCursor)
+        inputCursor = lines[index].start
+    }
+
+    private func moveToEndOfInputLine() {
+        let lines = agentTUIInputLines(input)
+        let index = agentTUIInputLineIndex(lines: lines, cursor: inputCursor)
+        inputCursor = lines[index].end
+    }
+
+    private func moveInputLineOrHistory(delta: Int) {
+        let lines = agentTUIInputLines(input)
+        let lineIndex = agentTUIInputLineIndex(lines: lines, cursor: inputCursor)
+        if delta < 0, lineIndex == 0 {
+            recallPreviousPrompt()
+            return
+        }
+        if delta > 0, lineIndex == lines.count - 1 {
+            recallNextPrompt()
+            return
+        }
+
+        let targetIndex = min(max(0, lineIndex + delta), lines.count - 1)
+        let column = max(0, inputCursor - lines[lineIndex].start)
+        let target = lines[targetIndex]
+        inputCursor = target.start + min(column, target.end - target.start)
+    }
+
+    private func killInputWordBackward() {
+        guard inputCursor > 0 else {
+            return
+        }
         let characters = Array(input)
         let cursor = min(inputCursor, characters.count)
-        let start = max(0, min(cursor, characters.count) - visibleTextCount)
-        let end = min(characters.count, start + visibleTextCount)
-        let before = start < cursor ? String(characters[start..<cursor]) : ""
-        let after = cursor < end ? String(characters[cursor..<end]) : ""
-        return (before, after)
+        var start = cursor
+
+        while start > 0, characters[start - 1].isWhitespace {
+            start -= 1
+        }
+        while start > 0, !characters[start - 1].isWhitespace {
+            start -= 1
+        }
+
+        guard start < cursor else {
+            return
+        }
+        var edited = characters
+        edited.removeSubrange(start..<cursor)
+        input = String(edited)
+        inputCursor = start
+        resetPromptHistorySelectionForEdit()
+    }
+
+    private func killInputLineForward() {
+        let result = agentTUIKillToEndOfLine(input: input, cursor: inputCursor)
+        guard result.input != input else {
+            return
+        }
+        input = result.input
+        inputCursor = result.cursor
+        resetPromptHistorySelectionForEdit()
+    }
+
+    private func appendPromptHistory(_ prompt: String) {
+        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+        if promptHistory.last != prompt {
+            promptHistory.append(prompt)
+        }
+    }
+
+    private func recallPreviousPrompt() {
+        guard !promptHistory.isEmpty else {
+            return
+        }
+        if promptHistoryIndex == nil {
+            promptHistoryDraft = input
+            promptHistoryIndex = promptHistory.count - 1
+        } else if let index = promptHistoryIndex, index > 0 {
+            promptHistoryIndex = index - 1
+        }
+        loadPromptHistorySelection()
+    }
+
+    private func recallNextPrompt() {
+        guard let index = promptHistoryIndex else {
+            return
+        }
+        if index < promptHistory.count - 1 {
+            promptHistoryIndex = index + 1
+            loadPromptHistorySelection()
+        } else {
+            promptHistoryIndex = nil
+            input = promptHistoryDraft
+            inputCursor = input.count
+            promptHistoryDraft = ""
+        }
+    }
+
+    private func loadPromptHistorySelection() {
+        guard let index = promptHistoryIndex, promptHistory.indices.contains(index) else {
+            return
+        }
+        input = promptHistory[index]
+        inputCursor = input.count
+    }
+
+    private func resetPromptHistorySelectionForEdit() {
+        promptHistoryIndex = nil
+        promptHistoryDraft = ""
     }
 
     private func visibleLines(_ lines: [TUITranscriptLine], height: Int, scrollOffset: Int) -> [TUITranscriptLine] {
@@ -1318,6 +1550,135 @@ private func defaultContextWindowTokens(modelDisplayName: String) -> Int64 {
         return 128_000
     }
     return 128_000
+}
+
+func agentTUIInputLines(_ input: String) -> [AgentTUIInputLine] {
+    let characters = Array(input)
+    guard !characters.isEmpty else {
+        return [AgentTUIInputLine(start: 0, end: 0, text: "")]
+    }
+
+    var lines: [AgentTUIInputLine] = []
+    var start = 0
+    for (index, character) in characters.enumerated() where character == "\n" {
+        lines.append(AgentTUIInputLine(
+            start: start,
+            end: index,
+            text: start < index ? String(characters[start..<index]) : ""
+        ))
+        start = index + 1
+    }
+
+    lines.append(AgentTUIInputLine(
+        start: start,
+        end: characters.count,
+        text: start < characters.count ? String(characters[start..<characters.count]) : ""
+    ))
+    return lines
+}
+
+func agentTUIInputLineIndex(lines: [AgentTUIInputLine], cursor: Int) -> Int {
+    guard !lines.isEmpty else {
+        return 0
+    }
+
+    let clampedCursor = max(0, cursor)
+    for (index, line) in lines.enumerated()
+        where clampedCursor >= line.start && clampedCursor <= line.end {
+        return index
+    }
+    return clampedCursor < lines[0].start ? 0 : lines.count - 1
+}
+
+func agentTUIKillToEndOfLine(input: String, cursor: Int) -> (input: String, cursor: Int) {
+    var characters = Array(input)
+    guard !characters.isEmpty else {
+        return (input, 0)
+    }
+
+    let clampedCursor = min(max(0, cursor), characters.count)
+    let lines = agentTUIInputLines(input)
+    let line = lines[agentTUIInputLineIndex(lines: lines, cursor: clampedCursor)]
+    let end = clampedCursor < line.end
+        ? line.end
+        : min(characters.count, clampedCursor + 1)
+    guard clampedCursor < end else {
+        return (input, clampedCursor)
+    }
+
+    characters.removeSubrange(clampedCursor..<end)
+    return (String(characters), clampedCursor)
+}
+
+func agentTUIComposerRows(
+    input: String,
+    cursor: Int,
+    width: Int,
+    maxRows: Int
+) -> [AgentTUIComposerRow] {
+    let lines = agentTUIInputLines(input)
+    let inputCount = input.count
+    let clampedCursor = min(max(0, cursor), inputCount)
+    let cursorLineIndex = agentTUIInputLineIndex(lines: lines, cursor: clampedCursor)
+    let wrapWidth = max(1, width - 1)
+    var rows: [AgentTUIComposerRow] = []
+    var cursorRowIndex = 0
+
+    for (lineIndex, line) in lines.enumerated() {
+        let characters = Array(line.text)
+        let cursorColumn = clampedCursor - line.start
+
+        if characters.isEmpty {
+            let hasCursor = lineIndex == cursorLineIndex
+            if hasCursor {
+                cursorRowIndex = rows.count
+            }
+            rows.append(AgentTUIComposerRow(
+                id: rows.count,
+                before: "",
+                after: "",
+                hasCursor: hasCursor
+            ))
+            continue
+        }
+
+        var offset = 0
+        while offset < characters.count {
+            let chunkEnd = min(characters.count, offset + wrapWidth)
+            let hasCursor = lineIndex == cursorLineIndex
+                && cursorColumn >= offset
+                && (cursorColumn < chunkEnd || (cursorColumn == chunkEnd && chunkEnd == characters.count))
+            let split = hasCursor ? min(max(cursorColumn, offset), chunkEnd) : chunkEnd
+
+            if hasCursor {
+                cursorRowIndex = rows.count
+            }
+
+            rows.append(AgentTUIComposerRow(
+                id: rows.count,
+                before: offset < split ? String(characters[offset..<split]) : "",
+                after: hasCursor && split < chunkEnd ? String(characters[split..<chunkEnd]) : "",
+                hasCursor: hasCursor
+            ))
+            offset = chunkEnd
+        }
+    }
+
+    guard rows.count > maxRows else {
+        return rows
+    }
+
+    let visibleCount = max(1, maxRows)
+    let maxStart = max(0, rows.count - visibleCount)
+    let start = min(max(0, cursorRowIndex - visibleCount + 1), maxStart)
+    return rows[start..<(start + visibleCount)].enumerated().map { index, row in
+        AgentTUIComposerRow(
+            id: index,
+            before: row.before,
+            after: row.after,
+            hasCursor: row.hasCursor
+        )
+    }
 }
 
 private func abbreviatedHomePath(_ path: String) -> String {

@@ -203,6 +203,76 @@ public struct PostgresTaskStore: AgentTaskStore {
         try await listSessions(taskID: taskID).first
     }
 
+    public func saveCheckpoint(_ checkpoint: CheckpointRecord) async throws {
+        try await drain(client.query("""
+            INSERT INTO checkpoints (id, task_id, repo_id, machine_id, branch, commit_sha, remote_name, pushed_at, created_at, dirty_summary, metadata)
+            VALUES (
+                \(checkpoint.id),
+                \(checkpoint.taskID),
+                \(checkpoint.repoID),
+                \(checkpoint.machineID),
+                \(checkpoint.branch),
+                \(checkpoint.commitSHA),
+                \(checkpoint.remoteName),
+                \(checkpoint.pushedAt),
+                \(checkpoint.createdAt),
+                '{}'::jsonb,
+                '{}'::jsonb
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                repo_id = EXCLUDED.repo_id,
+                machine_id = EXCLUDED.machine_id,
+                branch = EXCLUDED.branch,
+                commit_sha = EXCLUDED.commit_sha,
+                remote_name = EXCLUDED.remote_name,
+                pushed_at = EXCLUDED.pushed_at
+            """))
+    }
+
+    public func listCheckpoints(taskID: UUID? = nil) async throws -> [CheckpointRecord] {
+        let rows: PostgresRowSequence
+        if let taskID {
+            rows = try await client.query("""
+                SELECT id, task_id, repo_id, machine_id, branch, commit_sha, remote_name, pushed_at, created_at
+                FROM checkpoints
+                WHERE task_id = \(taskID)
+                ORDER BY created_at DESC
+                """)
+        } else {
+            rows = try await client.query("""
+                SELECT id, task_id, repo_id, machine_id, branch, commit_sha, remote_name, pushed_at, created_at
+                FROM checkpoints
+                ORDER BY created_at DESC
+                """)
+        }
+
+        var checkpoints: [CheckpointRecord] = []
+        for try await (id, taskID, repoID, machineID, branch, commitSHA, remoteName, pushedAt, createdAt) in rows.decode((
+            UUID,
+            UUID,
+            UUID?,
+            UUID?,
+            String,
+            String?,
+            String,
+            Date?,
+            Date
+        ).self) {
+            checkpoints.append(CheckpointRecord(
+                id: id,
+                taskID: taskID,
+                repoID: repoID,
+                machineID: machineID,
+                branch: branch,
+                commitSHA: commitSHA,
+                remoteName: remoteName,
+                pushedAt: pushedAt,
+                createdAt: createdAt
+            ))
+        }
+        return checkpoints
+    }
+
     @discardableResult
     public func appendEvent(_ event: AgentEvent) async throws -> AgentEvent {
         guard let taskID = event.taskID else {

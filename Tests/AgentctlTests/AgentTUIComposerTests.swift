@@ -57,4 +57,51 @@ struct AgentTUIComposerTests {
             "~/Projects/...gent (main) ↑5.1k ↓579 2.0%/258.4k"
         ])
     }
+
+    @Test
+    func composerRowsPreservePastedNewlines() {
+        let rows = agentTUIComposerRows(
+            input: "first\nsecond",
+            cursor: 8,
+            width: 20,
+            maxRows: 4
+        )
+
+        #expect(rows == [
+            AgentTUIComposerRow(id: 0, before: "first", after: "", hasCursor: false),
+            AgentTUIComposerRow(id: 1, before: "se", after: "cond", hasCursor: true)
+        ])
+    }
+
+    @Test
+    func composerRowsKeepCursorVisibleWhenInputIsTall() {
+        let rows = agentTUIComposerRows(
+            input: "one\ntwo\nthree\nfour",
+            cursor: "one\ntwo\nthree\nfo".count,
+            width: 20,
+            maxRows: 2
+        )
+
+        #expect(rows == [
+            AgentTUIComposerRow(id: 0, before: "three", after: "", hasCursor: false),
+            AgentTUIComposerRow(id: 1, before: "fo", after: "ur", hasCursor: true)
+        ])
+    }
+
+    @Test
+    func killToEndOfLineRemovesTextOrJoiningNewline() {
+        let lineTail = agentTUIKillToEndOfLine(
+            input: "first line\nsecond line",
+            cursor: "first ".count
+        )
+        #expect(lineTail.input == "first \nsecond line")
+        #expect(lineTail.cursor == "first ".count)
+
+        let newline = agentTUIKillToEndOfLine(
+            input: "first\nsecond",
+            cursor: "first".count
+        )
+        #expect(newline.input == "firstsecond")
+        #expect(newline.cursor == "first".count)
+    }
 }

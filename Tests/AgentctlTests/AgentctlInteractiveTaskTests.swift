@@ -54,4 +54,11 @@ struct AgentctlInteractiveTaskTests {
         #expect(resolution.task.id == existing.id)
         #expect(try await store.listTasks().map(\.id) == [existing.id])
     }
+
+    @Test
+    func checkpointSlashOptionsSupportLocalAndPushModes() throws {
+        #expect(try checkpointSlashOptions(nil).push == false)
+        #expect(try checkpointSlashOptions("").push == false)
+        #expect(try checkpointSlashOptions("--push").push)
+    }
 }

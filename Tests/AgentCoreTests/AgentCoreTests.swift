@@ -302,9 +302,15 @@ func localTaskStorePersistsTasksSessionsAndEvents() throws {
         backendSessionID: "thread-123",
         cwd: "/tmp/repo"
     )
+    let checkpoint = CheckpointRecord(
+        taskID: task.id,
+        branch: "agent/test-task",
+        commitSHA: "abcdef123"
+    )
 
     try store.saveTask(task)
     try store.saveSession(session)
+    try store.saveCheckpoint(checkpoint)
     let first = try store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .userMessage))
     let second = try store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .assistantDone))
 
@@ -313,6 +319,7 @@ func localTaskStorePersistsTasksSessionsAndEvents() throws {
     #expect(try store.findTask("test-task").id == task.id)
     #expect(try store.findTask(String(task.id.uuidString.prefix(8))).id == task.id)
     #expect(try store.listSessions(taskID: task.id).first?.backendSessionID == "thread-123")
+    #expect(try store.listCheckpoints(taskID: task.id).first?.commitSHA == "abcdef123")
     #expect(try store.events(for: task.id).map(\.kind) == [.userMessage, .assistantDone])
 }
 
@@ -376,6 +383,117 @@ func agentSessionControllerPersistsStreamingCodexTurn() async throws {
         }
         return false
     })
+}
+
+@Test
+func gitCheckpointManagerCreatesBranchCommitsChangesAndReturnsCheckpoint() throws {
+    let root = URL(fileURLWithPath: "/tmp/repo", isDirectory: true)
+    let task = TaskRecord(title: "Cashout Race", slug: "cashout-race")
+    let manager = GitCheckpointManager(git: GitRunner(runner: FakeProcessRunner(responses: [
+        gitKey("switch", "agent/cashout-race"): ProcessResult(exitCode: 1, stdout: "", stderr: "missing branch"),
+        gitKey("switch", "-c", "agent/cashout-race"): ok(""),
+        gitKey("status", "--porcelain=v1"): ok(" M Sources/file.swift\n"),
+        gitKey("add", "-A", "--", ".", ":!.agentctl"): ok(""),
+        gitKey("commit", "-m", "agentctl checkpoint: cashout-race"): ok("[agent/cashout-race abcdef1] checkpoint\n"),
+        gitKey("rev-parse", "HEAD"): ok("abcdef123\n")
+    ])))
+
+    let result = try manager.createCheckpoint(
+        task: task,
+        snapshot: RepositorySnapshot(
+            isGitRepository: true,
+            rootPath: root.path,
+            currentBranch: "main",
+            headSHA: "before",
+            isDirty: true
+        ),
+        repoURL: root
+    )
+
+    #expect(result.checkpoint.branch == "agent/cashout-race")
+    #expect(result.checkpoint.commitSHA == "abcdef123")
+    #expect(result.committed)
+    #expect(result.pushed == false)
+    #expect(result.dirtyStatus == " M Sources/file.swift\n")
+}
+
+@Test
+func gitCheckpointManagerPushesWhenRequested() throws {
+    let root = URL(fileURLWithPath: "/tmp/repo", isDirectory: true)
+    let task = TaskRecord(title: "Handoff", slug: "handoff")
+    let manager = GitCheckpointManager(git: GitRunner(runner: FakeProcessRunner(responses: [
+        gitKey("switch", "agent/handoff"): ok(""),
+        gitKey("status", "--porcelain=v1"): ok(""),
+        gitKey("rev-parse", "HEAD"): ok("feedface\n"),
+        gitKey("push", "-u", "origin", "agent/handoff"): ok("")
+    ])))
+
+    let result = try manager.createCheckpoint(
+        task: task,
+        snapshot: RepositorySnapshot(isGitRepository: true, rootPath: root.path),
+        repoURL: root,
+        options: GitCheckpointOptions(push: true)
+    )
+
+    #expect(result.checkpoint.commitSHA == "feedface")
+    #expect(result.committed == false)
+    #expect(result.pushed)
+    #expect(result.checkpoint.pushedAt != nil)
+}
+
+@Test
+func gitCheckpointManagerRestoresPushedCheckpointFromRemote() throws {
+    let root = URL(fileURLWithPath: "/tmp/repo", isDirectory: true)
+    let checkpoint = CheckpointRecord(
+        taskID: UUID(),
+        branch: "agent/handoff",
+        commitSHA: "feedface",
+        remoteName: "origin",
+        pushedAt: Date(timeIntervalSince1970: 0)
+    )
+    let manager = GitCheckpointManager(git: GitRunner(runner: FakeProcessRunner(responses: [
+        gitKey("fetch", "origin", "agent/handoff:refs/remotes/origin/agent/handoff"): ok(""),
+        gitKey("switch", "agent/handoff"): ProcessResult(exitCode: 1, stdout: "", stderr: "missing branch"),
+        gitKey("switch", "--track", "-c", "agent/handoff", "origin/agent/handoff"): ok(""),
+        gitKey("merge", "--ff-only", "origin/agent/handoff"): ok(""),
+        gitKey("rev-parse", "HEAD"): ok("feedface\n")
+    ])))
+
+    let result = try manager.restoreCheckpoint(
+        checkpoint,
+        snapshot: RepositorySnapshot(isGitRepository: true, rootPath: root.path),
+        repoURL: root
+    )
+
+    #expect(result.checkpoint == checkpoint)
+    #expect(result.fetched)
+    #expect(result.switched)
+    #expect(result.fastForwarded)
+    #expect(result.headSHA == "feedface")
+}
+
+@Test
+func gitCheckpointManagerRestoresLocalCheckpointWithoutFetching() throws {
+    let root = URL(fileURLWithPath: "/tmp/repo", isDirectory: true)
+    let checkpoint = CheckpointRecord(
+        taskID: UUID(),
+        branch: "agent/local",
+        commitSHA: "abc1234"
+    )
+    let manager = GitCheckpointManager(git: GitRunner(runner: FakeProcessRunner(responses: [
+        gitKey("switch", "agent/local"): ok(""),
+        gitKey("rev-parse", "HEAD"): ok("abc1234\n")
+    ])))
+
+    let result = try manager.restoreCheckpoint(
+        checkpoint,
+        snapshot: RepositorySnapshot(isGitRepository: true, rootPath: root.path),
+        repoURL: root
+    )
+
+    #expect(result.fetched == false)
+    #expect(result.fastForwarded == false)
+    #expect(result.headSHA == "abc1234")
 }
 
 @Test

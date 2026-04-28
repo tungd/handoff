@@ -94,7 +94,7 @@ struct Task: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "task",
         abstract: "Create, list, and resume agentctl tasks.",
-        subcommands: [New.self, List.self, Show.self, Send.self, Resume.self]
+        subcommands: [New.self, List.self, Show.self, Send.self, Resume.self, Checkpoint.self, Checkpoints.self]
     )
 
     struct New: AsyncParsableCommand {
@@ -346,13 +346,26 @@ struct Task: ParsableCommand {
             let snapshot = try RepositoryInspector().inspect(path: repoURL)
             try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
                 let task = try await store.findTask(task)
+                let restore = try await restoreLatestCheckpointIfAvailable(
+                    task: task,
+                    store: store,
+                    repoURL: repoURL,
+                    snapshot: snapshot
+                )
+                let activeSnapshot = restore == nil
+                    ? snapshot
+                    : try RepositoryInspector().inspect(path: repoURL)
 
                 if let prompt {
+                    if !json, let restore {
+                        printCheckpointRestoreResult(restore)
+                    }
+
                     let summary = try await runCodexTurn(
                         task: task,
                         prompt: prompt,
                         repoURL: repoURL,
-                        snapshot: snapshot,
+                        snapshot: activeSnapshot,
                         store: store,
                         fullAuto: fullAuto,
                         sandbox: sandbox
@@ -374,7 +387,106 @@ struct Task: ParsableCommand {
                     return
                 }
 
+                if let restore {
+                    printCheckpointRestoreResult(restore)
+                    print("")
+                }
                 printTaskSummary(summary)
+            }
+        }
+    }
+
+    struct Checkpoint: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "checkpoint",
+            abstract: "Create a git checkpoint for a task."
+        )
+
+        @Argument(help: "Task id, id prefix, or slug.")
+        var task: String
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @Option(help: "Checkpoint branch. Defaults to agent/<task-slug>.")
+        var branch: String?
+
+        @Option(help: "Git remote name to use when pushing.")
+        var remote: String = "origin"
+
+        @Option(name: .shortAndLong, help: "Commit message.")
+        var message: String?
+
+        @Flag(help: "Push the checkpoint branch after creating it.")
+        var push: Bool = false
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        @Flag(name: .long, help: "Emit JSON.")
+        var json: Bool = false
+
+        mutating func run() async throws {
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let task = try await store.findTask(task)
+                let result = try await createAndPersistCheckpoint(
+                    task: task,
+                    store: store,
+                    snapshot: snapshot,
+                    repoURL: repoURL,
+                    options: GitCheckpointOptions(
+                        branch: branch,
+                        remoteName: remote,
+                        message: message,
+                        push: push
+                    )
+                )
+
+                if json {
+                    try printJSON(result)
+                    return
+                }
+
+                printCheckpointResult(result)
+            }
+        }
+    }
+
+    struct Checkpoints: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "checkpoints",
+            abstract: "List git checkpoints for a task."
+        )
+
+        @Argument(help: "Task id, id prefix, or slug.")
+        var task: String
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        @Flag(name: .long, help: "Emit JSON.")
+        var json: Bool = false
+
+        mutating func run() async throws {
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let task = try await store.findTask(task)
+                let checkpoints = try await store.listCheckpoints(taskID: task.id)
+
+                if json {
+                    try printJSON(checkpoints)
+                    return
+                }
+
+                printCheckpoints(checkpoints)
             }
         }
     }
@@ -513,10 +625,11 @@ func runInteractiveAgent(
     let snapshot = try RepositoryInspector().inspect(path: repoURL)
 
     try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+        var activeSnapshot = snapshot
         let taskResolution = try await resolveInitialInteractiveTask(
             identifier: taskIdentifier,
             title: title,
-            snapshot: snapshot,
+            snapshot: activeSnapshot,
             repoURL: repoURL,
             store: store
         )
@@ -529,7 +642,7 @@ func runInteractiveAgent(
                 taskPersisted: taskPersisted,
                 storeOptions: storeOptions,
                 repoURL: repoURL,
-                snapshot: snapshot,
+                snapshot: activeSnapshot,
                 store: store,
                 fullAuto: fullAuto,
                 sandbox: sandbox
@@ -540,7 +653,7 @@ func runInteractiveAgent(
         let renderer = TerminalRenderer()
         var showRawEvents = false
 
-        renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
+        renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
 
         interactiveLoop: while true {
             renderer.prompt(task: task)
@@ -566,7 +679,7 @@ func runInteractiveAgent(
                         continue
                     }
                     let summary = try await store.summary(for: task)
-                    renderer.info(task: task, summary: summary, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
+                    renderer.info(task: task, summary: summary, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
                 case "tasks":
                     renderer.tasks(try await store.listTasks())
                 case "events":
@@ -575,6 +688,21 @@ func runInteractiveAgent(
                         continue
                     }
                     renderer.events(try await store.events(for: task.id))
+                case "checkpoint":
+                    guard taskPersisted else {
+                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                        continue
+                    }
+                    let options = try checkpointSlashOptions(command.argument)
+                    let result = try await createAndPersistCheckpoint(
+                        task: task,
+                        store: store,
+                        snapshot: activeSnapshot,
+                        repoURL: repoURL,
+                        options: options
+                    )
+                    activeSnapshot = try RepositoryInspector().inspect(path: repoURL)
+                    printCheckpointResult(result)
                 case "raw":
                     showRawEvents.toggle()
                     renderer.status(showRawEvents ? "Raw event rendering enabled." : "Raw event rendering disabled.")
@@ -582,20 +710,32 @@ func runInteractiveAgent(
                     task = try await resolveInteractiveTask(
                         identifier: nil,
                         title: command.argument?.isEmpty == false ? command.argument : nil,
-                        snapshot: snapshot,
+                        snapshot: activeSnapshot,
                         repoURL: repoURL,
                         store: store
                     )
                     taskPersisted = true
-                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
+                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
                 case "resume":
                     guard let identifier = command.argument, !identifier.isEmpty else {
                         renderer.error("usage: /resume <task>")
                         continue
                     }
                     task = try await store.findTask(identifier)
+                    let restore = try await restoreLatestCheckpointIfAvailable(
+                        task: task,
+                        store: store,
+                        repoURL: repoURL,
+                        snapshot: activeSnapshot
+                    )
+                    if restore != nil {
+                        activeSnapshot = try RepositoryInspector().inspect(path: repoURL)
+                    }
                     taskPersisted = true
-                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
+                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
+                    if let restore {
+                        renderer.status(checkpointRestoreStatus(restore))
+                    }
                 default:
                     renderer.error("unknown command: /\(command.name)")
                     renderer.help()
@@ -607,7 +747,7 @@ func runInteractiveAgent(
                 if !taskPersisted {
                     try await persistInteractiveTask(task, store: store)
                     taskPersisted = true
-                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
+                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
                 }
                 renderer.status("running Codex turn...")
                 let assistantRendered = SendableFlag()
@@ -616,7 +756,7 @@ func runInteractiveAgent(
                     task: task,
                     prompt: input,
                     repoURL: repoURL,
-                    snapshot: snapshot,
+                    snapshot: activeSnapshot,
                     store: store,
                     fullAuto: fullAuto,
                     sandbox: sandbox,
@@ -696,6 +836,71 @@ func persistInteractiveTask(
         "backend": .string(task.backendPreference.rawValue),
         "source": .string("interactive")
     ]))
+}
+
+func checkpointSlashOptions(_ argument: String?) throws -> GitCheckpointOptions {
+    let argument = argument?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if argument.isEmpty {
+        return GitCheckpointOptions()
+    }
+    if argument == "--push" {
+        return GitCheckpointOptions(push: true)
+    }
+    throw RuntimeError("usage: /checkpoint [--push]")
+}
+
+func createAndPersistCheckpoint(
+    task: TaskRecord,
+    store: any AgentTaskStore,
+    snapshot: RepositorySnapshot,
+    repoURL: URL,
+    options: GitCheckpointOptions = GitCheckpointOptions()
+) async throws -> GitCheckpointResult {
+    let result = try GitCheckpointManager().createCheckpoint(
+        task: task,
+        snapshot: snapshot,
+        repoURL: repoURL,
+        options: options
+    )
+    try await store.saveCheckpoint(result.checkpoint)
+    try await store.appendEvent(AgentEvent(
+        taskID: task.id,
+        kind: .checkpointCreated,
+        payload: checkpointPayload(result)
+    ))
+
+    if result.pushed {
+        try await store.appendEvent(AgentEvent(
+            taskID: task.id,
+            kind: .handoffCreated,
+            payload: checkpointPayload(result)
+        ))
+    }
+    return result
+}
+
+@discardableResult
+func restoreLatestCheckpointIfAvailable(
+    task: TaskRecord,
+    store: any AgentTaskStore,
+    repoURL: URL,
+    snapshot: RepositorySnapshot
+) async throws -> GitCheckpointRestoreResult? {
+    guard let checkpoint = try await store.listCheckpoints(taskID: task.id).first else {
+        return nil
+    }
+
+    let result = try GitCheckpointManager().restoreCheckpoint(
+        checkpoint,
+        snapshot: snapshot,
+        repoURL: repoURL
+    )
+    try await store.appendEvent(AgentEvent(
+        taskID: task.id,
+        kind: .backendEvent,
+        payload: checkpointRestorePayload(result)
+    ))
+    return result
 }
 
 func defaultInteractiveTaskTitle(snapshot: RepositorySnapshot, repoURL: URL) -> String {
@@ -884,6 +1089,97 @@ func printTaskSummary(_ summary: TaskRunSummary) {
         for event in summary.latestEvents {
             print("  \(event.sequence ?? 0): \(event.kind.rawValue)")
         }
+    }
+}
+
+func checkpointPayload(_ result: GitCheckpointResult) -> [String: JSONValue] {
+    var payload: [String: JSONValue] = [
+        "checkpointID": .string(result.checkpoint.id.uuidString),
+        "branch": .string(result.checkpoint.branch),
+        "remote": .string(result.checkpoint.remoteName),
+        "committed": .bool(result.committed),
+        "pushed": .bool(result.pushed),
+        "dirtyStatus": .string(result.dirtyStatus)
+    ]
+
+    if let commitSHA = result.checkpoint.commitSHA {
+        payload["commitSHA"] = .string(commitSHA)
+    }
+    if let pushedAt = result.checkpoint.pushedAt {
+        payload["pushedAt"] = .string(ISO8601DateFormatter().string(from: pushedAt))
+    }
+    return payload
+}
+
+func checkpointRestorePayload(_ result: GitCheckpointRestoreResult) -> [String: JSONValue] {
+    var payload: [String: JSONValue] = [
+        "type": .string("checkpoint.restored"),
+        "checkpointID": .string(result.checkpoint.id.uuidString),
+        "branch": .string(result.checkpoint.branch),
+        "remote": .string(result.checkpoint.remoteName),
+        "fetched": .bool(result.fetched),
+        "switched": .bool(result.switched),
+        "fastForwarded": .bool(result.fastForwarded)
+    ]
+
+    if let commitSHA = result.checkpoint.commitSHA {
+        payload["commitSHA"] = .string(commitSHA)
+    }
+    if let headSHA = result.headSHA {
+        payload["headSHA"] = .string(headSHA)
+    }
+    return payload
+}
+
+func printCheckpointResult(_ result: GitCheckpointResult) {
+    print("Checkpoint created")
+    print("  id:        \(result.checkpoint.id.uuidString)")
+    print("  branch:    \(result.checkpoint.branch)")
+    print("  commit:    \(result.checkpoint.commitSHA ?? "-")")
+    print("  committed: \(result.committed ? "yes" : "no")")
+    print("  pushed:    \(result.pushed ? "yes" : "no")")
+    if result.pushed {
+        print("  remote:    \(result.checkpoint.remoteName)")
+    }
+}
+
+func printCheckpointRestoreResult(_ result: GitCheckpointRestoreResult) {
+    print("Checkpoint restored")
+    print("  branch: \(result.checkpoint.branch)")
+    print("  commit: \(result.headSHA ?? result.checkpoint.commitSHA ?? "-")")
+    print("  remote: \(result.fetched ? result.checkpoint.remoteName : "-")")
+}
+
+func checkpointRestoreStatus(_ result: GitCheckpointRestoreResult) -> String {
+    let commit = shortCommit(result.headSHA ?? result.checkpoint.commitSHA)
+    return "Restored checkpoint \(result.checkpoint.branch) @ \(commit)."
+}
+
+func checkpointCreatedStatus(_ result: GitCheckpointResult) -> String {
+    let commit = shortCommit(result.checkpoint.commitSHA)
+    let pushed = result.pushed ? ", pushed to \(result.checkpoint.remoteName)" : ""
+    return "Created checkpoint \(result.checkpoint.branch) @ \(commit)\(pushed)."
+}
+
+func shortCommit(_ commit: String?) -> String {
+    guard let commit, !commit.isEmpty else {
+        return "-"
+    }
+    return String(commit.prefix(8))
+}
+
+func printCheckpoints(_ checkpoints: [CheckpointRecord]) {
+    if checkpoints.isEmpty {
+        print("No checkpoints found.")
+        return
+    }
+
+    for checkpoint in checkpoints {
+        print("\(checkpoint.branch)")
+        print("  id:      \(checkpoint.id.uuidString)")
+        print("  commit:  \(checkpoint.commitSHA ?? "-")")
+        print("  remote:  \(checkpoint.remoteName)")
+        print("  pushed:  \(checkpoint.pushedAt.map { ISO8601DateFormatter().string(from: $0) } ?? "-")")
     }
 }
 

@@ -34,9 +34,9 @@
 - List tasks by repo.
 - Resume a task from `task_id`.
 - Share task/session/event state through Postgres.
-- Create checkpoint branch.
-- Commit and push handoff branch.
-- Recreate or switch local worktree on another machine.
+- Create checkpoint branch. (initial command implemented)
+- Commit and push handoff branch. (initial command implemented)
+- Recreate or switch local worktree on another machine. (initial `/resume` restore implemented)
 
 ## Phase 4: Memory
 

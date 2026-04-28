@@ -46,6 +46,7 @@ swift run agentctl
 swift run agentctl repo inspect
 swift run agentctl task new "first task" --prompt "Reply briefly."
 swift run agentctl task send first-task "Continue."
+swift run agentctl task checkpoint first-task
 swift run agentctl db schema
 ```
 
@@ -57,6 +58,7 @@ The root command starts the interactive Codex shell. It currently supports:
 /tasks
 /new [title]
 /resume <task>
+/checkpoint [--push]
 /events
 /raw
 /exit
@@ -80,3 +82,18 @@ swift run agentctl task send postgres-task "Continue."
 You can also pass `--database-url` directly instead of using the environment
 variable. Use `--store local` to force the local fallback, or `--store postgres`
 to require Postgres even when the environment variable is not set.
+
+## Git Checkpoints
+
+`task checkpoint` creates or reuses `agent/<task-slug>`, commits current git
+changes when the worktree is dirty, and records the checkpoint in the task
+store. Push is explicit. `task resume` and interactive `/resume` restore the
+latest checkpoint automatically when one exists, fetching pushed checkpoint
+branches on another machine before switching:
+
+```bash
+swift run agentctl task checkpoint first-task
+swift run agentctl task checkpoint first-task --push
+swift run agentctl task resume first-task
+swift run agentctl task checkpoints first-task
+```
