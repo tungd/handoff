@@ -113,6 +113,7 @@ private struct TUITranscriptLine: Identifiable, Sendable {
     var id: Int
     var role: TUITranscriptRole
     var text: String
+    var spans: [AgentTUIStyledTextSpan]
     var isLabel: Bool
 }
 
@@ -432,6 +433,14 @@ private struct AgentTUIView: View {
             return AnyView(Text(line.text).foregroundStyle(labelColor(line.role)))
         }
 
+        if !line.spans.isEmpty {
+            return AnyView(HStack(spacing: 0) {
+                ViewArray(line.spans.map { span in
+                    transcriptSpan(span, role: line.role)
+                })
+            })
+        }
+
         switch line.role {
         case .user:
             return AnyView(Text(line.text).foregroundStyle(.palette.foreground))
@@ -443,6 +452,38 @@ private struct AgentTUIView: View {
             return AnyView(Text(line.text).foregroundStyle(.palette.error).bold())
         case .system:
             return AnyView(Text(line.text).foregroundStyle(.palette.foregroundSecondary))
+        }
+    }
+
+    private func transcriptSpan(_ span: AgentTUIStyledTextSpan, role: TUITranscriptRole) -> AnyView {
+        var text = Text(span.text).foregroundStyle(spanColor(span.tone, role: role))
+        if span.isBold {
+            text = text.bold()
+        }
+        if span.isItalic {
+            text = text.italic()
+        }
+        if span.isUnderlined {
+            text = text.underline()
+        }
+        return AnyView(text)
+    }
+
+    private func spanColor(_ tone: AgentTUIStyledTextTone, role: TUITranscriptRole) -> Color {
+        switch tone {
+        case .base:
+            switch role {
+            case .user, .codex:
+                return .palette.foreground
+            case .tool, .system:
+                return .palette.foregroundSecondary
+            case .error:
+                return .palette.error
+            }
+        case .secondary:
+            return .palette.foregroundTertiary
+        case .accent:
+            return .palette.accent
         }
     }
 
@@ -867,7 +908,23 @@ private func transcriptLines(_ entries: [TUITranscriptEntry], width: Int) -> [TU
     let bodyWidth = max(20, width - 2)
 
     func append(role: TUITranscriptRole, text: String, isLabel: Bool) {
-        lines.append(TUITranscriptLine(id: lines.count, role: role, text: text, isLabel: isLabel))
+        lines.append(TUITranscriptLine(
+            id: lines.count,
+            role: role,
+            text: text,
+            spans: isLabel ? [] : [AgentTUIStyledTextSpan(text)],
+            isLabel: isLabel
+        ))
+    }
+
+    func append(role: TUITranscriptRole, spans: [AgentTUIStyledTextSpan]) {
+        lines.append(TUITranscriptLine(
+            id: lines.count,
+            role: role,
+            text: agentTUIPlainText(spans),
+            spans: spans,
+            isLabel: false
+        ))
     }
 
     for entry in entries {
@@ -876,10 +933,8 @@ private func transcriptLines(_ entries: [TUITranscriptEntry], width: Int) -> [TU
         }
 
         append(role: entry.role, text: entry.role.rawValue, isLabel: true)
-        for rawLine in entry.text.split(separator: "\n", omittingEmptySubsequences: false) {
-            for wrapped in wrapText(String(rawLine), width: bodyWidth) {
-                append(role: entry.role, text: "  \(wrapped)", isLabel: false)
-            }
+        for renderedLine in agentTUIMarkdownStyledLines(entry.text, width: bodyWidth) {
+            append(role: entry.role, spans: [AgentTUIStyledTextSpan("  ")] + renderedLine)
         }
     }
 
