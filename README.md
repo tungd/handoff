@@ -58,6 +58,7 @@ The root command starts the interactive Codex shell. It currently supports:
 /new [title]
 /resume <task>
 /events
+/raw
 /exit
 ```
 

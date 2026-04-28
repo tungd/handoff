@@ -21,7 +21,7 @@
 - Normalize Codex events into `AgentEvent`.
 - Persist task/session/event records.
 - Start an interactive root CLI session backed by the task store.
-- Render a minimal terminal shell with task, info, events, new, and resume commands.
+- Render a full-screen terminal shell with task, info, events, new, resume, and raw-event commands.
 
 ## Phase 2.5: Codex App-Server
 
