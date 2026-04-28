@@ -198,6 +198,42 @@ func codexJSONLMapperPreservesUnknownLinesAsBackendEvents() {
 }
 
 @Test
+func codexJSONLMapperMapsSingleLines() {
+    let thread = CodexJSONLMapper.mapLine(#"{"type":"thread.started","thread_id":"thread-123"}"#)
+    let message = CodexJSONLMapper.mapLine(#"{"type":"item.completed","item":{"type":"agent_message","text":"hello"}}"#)
+
+    #expect(thread.threadID == "thread-123")
+    #expect(thread.event.kind == .backendSessionUpdated)
+    #expect(message.assistantText == "hello")
+    #expect(message.event.kind == .assistantDone)
+}
+
+@Test
+func codexStreamingBackendEmitsUpdatesAsLinesArrive() async throws {
+    let backend = CodexStreamingBackend(runner: FakeStreamingProcessRunner(events: [
+        .stdoutLine(#"{"type":"thread.started","thread_id":"thread-123"}"#),
+        .stdoutLine(#"{"type":"item.completed","item":{"type":"agent_message","text":"hello"}}"#),
+        .stderrLine("warning"),
+        .exited(0)
+    ]), executable: "/fake/env")
+    let sink = CodexUpdateSink()
+
+    let result = try await backend.run(
+        prompt: "hello",
+        cwd: URL(fileURLWithPath: "/tmp/repo")
+    ) { update in
+        await sink.append(update)
+    }
+
+    let updates = await sink.values()
+    #expect(result.exitCode == 0)
+    #expect(result.threadID == "thread-123")
+    #expect(result.assistantText == "hello")
+    #expect(result.stderr == "warning")
+    #expect(updates.count == 3)
+}
+
+@Test
 func codexExecArgumentsUseFreshExecShape() {
     let backend = CodexExecBackend()
     let args = backend.makeArguments(
@@ -290,6 +326,53 @@ func localTaskStoreConformsToAsyncStoreProtocol() async throws {
 }
 
 @Test
+func agentSessionControllerPersistsStreamingCodexTurn() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("agentctl-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let store: any AgentTaskStore = LocalTaskStore(root: root)
+    let task = TaskRecord(title: "Streaming", slug: "streaming")
+    try await store.saveTask(task)
+
+    let backend = CodexStreamingBackend(runner: FakeStreamingProcessRunner(events: [
+        .stdoutLine(#"{"type":"thread.started","thread_id":"thread-123"}"#),
+        .stdoutLine(#"{"type":"item.completed","item":{"type":"agent_message","text":"hello"}}"#),
+        .exited(0)
+    ]), executable: "/fake/env")
+    let controller = AgentSessionController(store: store, codexBackend: backend)
+    let sink = AgentSessionUpdateSink()
+
+    let summary = try await controller.runCodexTurn(
+        task: task,
+        prompt: "hello",
+        repoURL: root,
+        snapshot: RepositorySnapshot(isGitRepository: false),
+        onUpdate: { update in
+            await sink.append(update)
+        }
+    )
+
+    let events = try await store.events(for: task.id)
+    let updates = await sink.values()
+
+    #expect(summary.sessions.first?.backendSessionID == "thread-123")
+    #expect(events.map(\.kind) == [
+        .sessionStarted,
+        .userMessage,
+        .backendSessionUpdated,
+        .assistantDone,
+        .sessionEnded
+    ])
+    #expect(updates.contains { update in
+        if case .event(let event) = update {
+            return event.kind == .assistantDone
+        }
+        return false
+    })
+}
+
+@Test
 func postgresConfigurationParsesDatabaseURL() throws {
     let configuration = try AgentPostgresConfiguration(
         databaseURL: "postgres://agent:secret@localhost:55432/agentctl?sslmode=disable"
@@ -301,6 +384,47 @@ func postgresConfigurationParsesDatabaseURL() throws {
     #expect(configuration.password == "secret")
     #expect(configuration.database == "agentctl")
     #expect(configuration.tlsDisabled)
+}
+
+private actor CodexUpdateSink {
+    private var updates: [CodexStreamUpdate] = []
+
+    func append(_ update: CodexStreamUpdate) {
+        updates.append(update)
+    }
+
+    func values() -> [CodexStreamUpdate] {
+        updates
+    }
+}
+
+private actor AgentSessionUpdateSink {
+    private var updates: [AgentSessionUpdate] = []
+
+    func append(_ update: AgentSessionUpdate) {
+        updates.append(update)
+    }
+
+    func values() -> [AgentSessionUpdate] {
+        updates
+    }
+}
+
+private struct FakeStreamingProcessRunner: ProcessStreaming {
+    let events: [ProcessStreamEvent]
+
+    func stream(
+        _ executable: String,
+        arguments: [String],
+        workingDirectory: URL?
+    ) -> AsyncThrowingStream<ProcessStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            for event in events {
+                continuation.yield(event)
+            }
+            continuation.finish()
+        }
+    }
 }
 
 private struct FakeProcessRunner: ProcessRunning {

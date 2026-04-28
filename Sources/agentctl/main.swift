@@ -638,70 +638,16 @@ func runCodexTurn(
     fullAuto: Bool,
     sandbox: String?
 ) async throws -> TaskRunSummary {
-    guard task.backendPreference == .codex else {
-        throw RuntimeError("only the Codex backend is wired in v1")
-    }
-
-    let cwd = snapshot.rootPath.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? repoURL
-    let previousSession = try await store.latestSession(for: task.id)
-    var session = SessionRecord(
-        taskID: task.id,
-        backend: .codex,
-        backendSessionID: previousSession?.backendSessionID,
-        cwd: cwd.path,
-        state: .running
-    )
-
-    try await store.saveSession(session)
-    try await store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .sessionStarted, payload: [
-        "backend": .string(session.backend.rawValue),
-        "cwd": .string(session.cwd),
-        "resumeThreadID": session.backendSessionID.map { .string($0) } ?? .null
-    ]))
-    try await store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .userMessage, payload: [
-        "text": .string(prompt)
-    ]))
-
     printError("Running Codex turn for \(task.slug)...")
 
-    let result = try CodexExecBackend().run(
+    let controller = AgentSessionController(store: store)
+    return try await controller.runCodexTurn(
+        task: task,
         prompt: prompt,
-        cwd: cwd,
-        resumeThreadID: session.backendSessionID,
+        repoURL: repoURL,
+        snapshot: snapshot,
         options: CodexExecOptions(fullAuto: fullAuto, sandbox: sandbox)
     )
-
-    if let threadID = result.threadID {
-        session.backendSessionID = threadID
-    }
-
-    session.state = result.exitCode == 0 ? .ended : .failed
-    session.endedAt = Date()
-
-    for event in result.events {
-        var stored = event
-        stored.taskID = task.id
-        stored.sessionID = session.id
-        try await store.appendEvent(stored)
-    }
-
-    if !result.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        try await store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .backendEvent, payload: [
-            "stderr": .string(result.stderr)
-        ]))
-    }
-
-    try await store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .sessionEnded, payload: [
-        "exitCode": .int(Int64(result.exitCode)),
-        "threadID": session.backendSessionID.map { .string($0) } ?? .null
-    ]))
-    try await store.saveSession(session)
-
-    if result.exitCode != 0 {
-        throw RuntimeError("Codex exited with \(result.exitCode): \(result.stderr)")
-    }
-
-    return try await store.summary(for: task)
 }
 
 func withTaskStore<T>(
