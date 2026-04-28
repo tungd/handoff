@@ -1,5 +1,5 @@
 {
-  "originHash" : "0bfb13a03b5a041fcbb565eaf42bd17370350df4735e5354a33bb50fddb049a4",
+  "originHash" : "b636e5cff4426d279b42f25c49a86ee9483ebd55ef4440fe07853c9d344a0bbb",
   "pins" : [
     {
       "identity" : "postgres-nio",
@@ -125,6 +125,15 @@
       "state" : {
         "revision" : "7c6ad0fc39d0763e0b699210e4124afd5041c5df",
         "version" : "1.6.4"
+      }
+    },
+    {
+      "identity" : "tuikit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/phranck/TUIkit.git",
+      "state" : {
+        "revision" : "73a6a1e091616ab912ecd7d4130f67b317106b94",
+        "version" : "0.6.0"
       }
     }
   ],

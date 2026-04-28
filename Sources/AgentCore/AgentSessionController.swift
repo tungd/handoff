@@ -37,7 +37,7 @@ public struct AgentSessionController: Sendable {
         repoURL: URL,
         snapshot: RepositorySnapshot,
         options: CodexExecOptions = CodexExecOptions(),
-        onUpdate: (AgentSessionUpdate) async throws -> Void = { _ in }
+        onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void = { _ in }
     ) async throws -> TaskRunSummary {
         guard task.backendPreference == .codex else {
             throw AgentSessionControllerError.unsupportedBackend(task.backendPreference)
@@ -116,7 +116,7 @@ public struct AgentSessionController: Sendable {
     @discardableResult
     private func appendAndEmit(
         _ event: AgentEvent,
-        onUpdate: (AgentSessionUpdate) async throws -> Void
+        onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void
     ) async throws -> AgentEvent {
         let stored = try await store.appendEvent(event)
         try await onUpdate(.event(stored))

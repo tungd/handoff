@@ -11,7 +11,7 @@ enum StoreKind: String, ExpressibleByArgument {
     case postgres
 }
 
-struct StoreOptions: ParsableArguments {
+struct StoreOptions: ParsableArguments, @unchecked Sendable {
     @Option(help: "Task store to use: auto, postgres, or local.")
     var store: StoreKind = .auto
 
@@ -517,8 +517,8 @@ func runInteractiveAgent(
         )
 
         if TerminalCapability.isInteractive {
-            try await runFullScreenInteractiveLoop(
-                task: &task,
+            try await runTUIkitInteractiveLoop(
+                task: task,
                 storeOptions: storeOptions,
                 repoURL: repoURL,
                 snapshot: snapshot,
@@ -587,7 +587,8 @@ func runInteractiveAgent(
 
             do {
                 renderer.status("running Codex turn...")
-                var assistantRendered = false
+                let assistantRendered = SendableFlag()
+                let renderRawEvents = showRawEvents
                 let summary = try await runCodexTurn(
                     task: task,
                     prompt: input,
@@ -598,119 +599,15 @@ func runInteractiveAgent(
                     sandbox: sandbox,
                     showStatus: false
                 ) { update in
-                    if renderer.render(update: update, showRawEvents: showRawEvents) {
-                        assistantRendered = true
+                    if renderer.render(update: update, showRawEvents: renderRawEvents) {
+                        assistantRendered.value = true
                     }
                 }
-                if !assistantRendered {
+                if !assistantRendered.value {
                     printRunSummary(summary)
                 }
             } catch {
                 renderer.error("turn failed: \(error)")
-            }
-        }
-    }
-}
-
-func runFullScreenInteractiveLoop(
-    task: inout TaskRecord,
-    storeOptions: StoreOptions,
-    repoURL: URL,
-    snapshot: RepositorySnapshot,
-    store: any AgentTaskStore,
-    fullAuto: Bool,
-    sandbox: String?
-) async throws {
-    let terminal = FullScreenTerminal()
-    try terminal.start()
-    defer { terminal.stop() }
-
-    var state = FullScreenState(
-        task: task,
-        storeName: shortStoreName(storeDescription(options: storeOptions, repoURL: repoURL, snapshot: snapshot)),
-        entries: try await fullScreenEntries(for: task.id, store: store)
-    )
-
-    if state.entries.isEmpty {
-        state.append(.system, "Ready.")
-    }
-
-    fullScreenLoop: while true {
-        state.task = task
-        switch terminal.readInput(state: &state) {
-        case .quit:
-            break fullScreenLoop
-        case let .submit(input):
-            if let command = SlashCommand(input) {
-                switch command.name {
-                case "exit", "quit":
-                    break fullScreenLoop
-                case "help":
-                    state.append(.system, "/help /info /tasks /new [title] /resume <task> /events /raw /exit")
-                case "info", "task", "repo":
-                    let summary = try await store.summary(for: task)
-                    state.append(.system, fullScreenInfo(task: task, summary: summary, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot))
-                case "tasks":
-                    state.append(.system, fullScreenTasks(try await store.listTasks()))
-                case "events":
-                    state.append(.system, fullScreenEvents(try await store.events(for: task.id)))
-                case "raw":
-                    state.showRawEvents.toggle()
-                    state.append(.system, state.showRawEvents ? "Raw event rendering enabled." : "Raw event rendering disabled.")
-                case "new":
-                    task = try await resolveInteractiveTask(
-                        identifier: nil,
-                        title: command.argument?.isEmpty == false ? command.argument : nil,
-                        snapshot: snapshot,
-                        repoURL: repoURL,
-                        store: store
-                    )
-                    state = FullScreenState(
-                        task: task,
-                        storeName: shortStoreName(storeDescription(options: storeOptions, repoURL: repoURL, snapshot: snapshot)),
-                        entries: try await fullScreenEntries(for: task.id, store: store)
-                    )
-                    state.append(.system, "Created task \(task.slug).")
-                case "resume":
-                    guard let identifier = command.argument, !identifier.isEmpty else {
-                        state.append(.error, "usage: /resume <task>")
-                        continue
-                    }
-                    task = try await store.findTask(identifier)
-                    state = FullScreenState(
-                        task: task,
-                        storeName: shortStoreName(storeDescription(options: storeOptions, repoURL: repoURL, snapshot: snapshot)),
-                        entries: try await fullScreenEntries(for: task.id, store: store)
-                    )
-                    state.append(.system, "Resumed task \(task.slug).")
-                default:
-                    state.append(.error, "unknown command: /\(command.name)")
-                }
-                continue
-            }
-
-            state.append(.user, input)
-            state.status = "running Codex turn..."
-            terminal.render(state)
-
-            do {
-                _ = try await runCodexTurn(
-                    task: task,
-                    prompt: input,
-                    repoURL: repoURL,
-                    snapshot: snapshot,
-                    store: store,
-                    fullAuto: fullAuto,
-                    sandbox: sandbox,
-                    showStatus: false
-                ) { update in
-                    terminal.append(update: update, state: &state)
-                    terminal.render(state)
-                }
-                state.status = "ready"
-            } catch {
-                state.status = "turn failed"
-                state.append(.error, String(describing: error))
             }
         }
     }
@@ -758,70 +655,6 @@ func defaultInteractiveTaskTitle(snapshot: RepositorySnapshot, repoURL: URL) -> 
     return "Interactive \(workspaceName) \(formatter.string(from: Date()))"
 }
 
-func fullScreenEntries(for taskID: UUID, store: any AgentTaskStore) async throws -> [FullScreenEntry] {
-    try await store.events(for: taskID).compactMap { event in
-        switch event.kind {
-        case .userMessage:
-            return event.payload["text"]?.stringValue.map { FullScreenEntry(role: .user, text: $0) }
-        case .assistantDone:
-            return event.payload["text"]?.stringValue.map { FullScreenEntry(role: .codex, text: $0) }
-        case .toolStarted:
-            return FullScreenEntry(role: .tool, text: "start  \(compactPayload(event.payload))")
-        case .toolFinished:
-            return FullScreenEntry(role: .tool, text: "done   \(compactPayload(event.payload))")
-        default:
-            return nil
-        }
-    }
-}
-
-func fullScreenInfo(
-    task: TaskRecord,
-    summary: TaskRunSummary,
-    storeOptions: StoreOptions,
-    repoURL: URL,
-    snapshot: RepositorySnapshot
-) -> String {
-    var lines = [
-        "id: \(task.id.uuidString)",
-        "title: \(task.title)",
-        "state: \(task.state.rawValue)",
-        "backend: \(task.backendPreference.rawValue)",
-        "store: \(storeDescription(options: storeOptions, repoURL: repoURL, snapshot: snapshot))",
-        "repo: \(snapshot.rootPath ?? repoURL.path)",
-        "branch: \(snapshot.currentBranch ?? "-")"
-    ]
-
-    if let session = summary.sessions.first {
-        lines.append("thread: \(session.backendSessionID ?? "-")")
-        lines.append("cwd: \(session.cwd)")
-    }
-
-    return lines.joined(separator: "\n")
-}
-
-func fullScreenTasks(_ tasks: [TaskRecord]) -> String {
-    if tasks.isEmpty {
-        return "No tasks found."
-    }
-
-    return tasks
-        .map { "\($0.slug)  \($0.title)  \($0.state.rawValue)" }
-        .joined(separator: "\n")
-}
-
-func fullScreenEvents(_ events: [AgentEvent]) -> String {
-    if events.isEmpty {
-        return "No events found."
-    }
-
-    return events.map { event in
-        let sequence = event.sequence.map(String.init) ?? "-"
-        return "\(sequence) \(event.kind.rawValue) \(compactPayload(event.payload))"
-    }
-    .joined(separator: "\n")
-}
-
 func shortStoreName(_ store: String) -> String {
     if store.hasPrefix("postgres://") {
         return "postgres"
@@ -863,7 +696,7 @@ func runCodexTurn(
     fullAuto: Bool,
     sandbox: String?,
     showStatus: Bool = true,
-    onUpdate: (AgentSessionUpdate) async throws -> Void = { _ in }
+    onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void = { _ in }
 ) async throws -> TaskRunSummary {
     if showStatus {
         printError("Running Codex turn for \(task.slug)...")
