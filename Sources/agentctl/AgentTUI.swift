@@ -57,6 +57,31 @@ struct AgentTUIApp: App {
     }
 }
 
+private struct AgentTUIPalette: Palette {
+    let id = "agentctl-amber"
+    let name = "Agentctl Amber"
+
+    let background = Color.rgb(12, 12, 11)
+    let statusBarBackground = Color.rgb(12, 12, 11)
+    let appHeaderBackground = Color.rgb(12, 12, 11)
+    let overlayBackground = Color.rgb(12, 12, 11)
+
+    let foreground = Color.rgb(232, 226, 214)
+    let foregroundSecondary = Color.rgb(159, 151, 136)
+    let foregroundTertiary = Color.rgb(107, 101, 92)
+    let foregroundQuaternary = Color.rgb(67, 64, 59)
+
+    let accent = Color.rgb(214, 171, 93)
+    let success = Color.rgb(232, 226, 214)
+    let warning = Color.rgb(201, 157, 74)
+    let error = Color.rgb(211, 109, 95)
+    let info = Color.rgb(149, 168, 174)
+
+    let border = Color.rgb(183, 170, 143)
+    let focusBackground = Color.rgb(28, 27, 24)
+    let cursorColor = Color.rgb(231, 190, 111)
+}
+
 private enum TUITranscriptRole: String, Sendable {
     case user
     case codex
@@ -271,48 +296,55 @@ private struct AgentTUIView: View {
         let snapshot = model.snapshot()
         let _ = model.clearRenderCacheIfNeeded(for: snapshot.revision)
         let size = terminalSize()
-        let transcriptHeight = max(3, size.rows - 7)
-        let lines = transcriptLines(snapshot.entries, width: max(40, size.columns - 2))
+        let transcriptHeight = max(3, size.rows - 6)
+        let lines = transcriptLines(snapshot.entries, width: max(40, size.columns - 4))
         let visibleLines = visibleLines(lines, height: transcriptHeight, scrollOffset: snapshot.scrollOffset)
 
         VStack(alignment: .leading, spacing: 0) {
             header(snapshot)
-            Divider()
             VStack(alignment: .leading, spacing: 0) {
                 ViewArray(visibleLines.map(transcriptLine))
             }
+            .frame(height: transcriptHeight, alignment: .topLeading)
             Spacer(minLength: 0)
-            Divider()
-            statusLine(snapshot, totalLines: lines.count, visibleHeight: transcriptHeight)
-            composer(snapshot)
+            composer(snapshot, totalLines: lines.count, visibleHeight: transcriptHeight)
         }
         .padding(.horizontal, 1)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .palette(AgentTUIPalette())
+        .appearance(.line)
         .onKeyPress { event in
             handleKey(event, pageSize: transcriptHeight)
         }
         .agentStatusBarConfiguration()
-        .statusBarItems {
-            StatusBarItem(shortcut: "Esc", label: "quit", key: .escape) {
-                Darwin.raise(SIGINT)
-            }
-            StatusBarItem(shortcut: "PgUp/PgDn", label: "scroll")
-            StatusBarItem(shortcut: "^U/^D", label: "scroll")
-            StatusBarItem(shortcut: "/help", label: "commands")
-        }
     }
 
     private func header(_ snapshot: AgentTUISnapshot) -> some View {
         HStack(spacing: 1) {
-            Text("agentctl").foregroundStyle(.palette.accent).bold()
-            Text(snapshot.task.slug).foregroundStyle(.palette.foregroundSecondary)
+            Text("agentctl").foregroundStyle(.palette.accent)
+            Text(snapshot.task.slug).foregroundStyle(.palette.foregroundTertiary)
             Spacer()
-            Text(snapshot.task.backendPreference.rawValue).foregroundStyle(.palette.success)
-            Text(storeName).foregroundStyle(.palette.foregroundSecondary)
+            Text(storeName).foregroundStyle(.palette.foregroundTertiary)
         }
     }
 
-    private func statusLine(_ snapshot: AgentTUISnapshot, totalLines: Int, visibleHeight: Int) -> some View {
+    private func composer(_ snapshot: AgentTUISnapshot, totalLines: Int, visibleHeight: Int) -> some View {
+        Panel(modelLabel(snapshot), borderStyle: .line, borderColor: .palette.border, titleColor: .palette.accent) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 1) {
+                    Text(">").foregroundStyle(.palette.accent)
+                    TextField("", text: $input, prompt: Text(snapshot.isRunning ? "turn running..." : "message or /command"))
+                        .focusID("composer")
+                        .onSubmit {
+                            submitInput()
+                        }
+                }
+                composerStatus(snapshot, totalLines: totalLines, visibleHeight: visibleHeight)
+            }
+        }
+    }
+
+    private func composerStatus(_ snapshot: AgentTUISnapshot, totalLines: Int, visibleHeight: Int) -> some View {
         HStack(spacing: 1) {
             Text(snapshot.status).foregroundStyle(statusColor(snapshot))
             if snapshot.showRawEvents {
@@ -322,37 +354,42 @@ private struct AgentTUIView: View {
                 Text("scroll \(snapshot.scrollOffset)").foregroundStyle(.palette.foregroundSecondary)
             }
             Spacer()
-            Text("\(min(totalLines, visibleHeight))/\(totalLines)").dim()
-        }
-    }
-
-    private func composer(_ snapshot: AgentTUISnapshot) -> some View {
-        HStack(spacing: 1) {
-            Text(">").foregroundStyle(.palette.accent).bold()
-            TextField("message", text: $input, prompt: Text(snapshot.isRunning ? "turn running..." : "message or /command"))
-                .focusID("composer")
-                .onSubmit {
-                    submitInput()
-                }
+            Text("\(lineProgress(totalLines: totalLines, visibleHeight: visibleHeight, scrollOffset: snapshot.scrollOffset)) \(repoName)")
+                .foregroundStyle(.palette.foregroundTertiary)
         }
     }
 
     private func transcriptLine(_ line: TUITranscriptLine) -> AnyView {
+        if line.isLabel {
+            return AnyView(Text(line.text).foregroundStyle(labelColor(line.role)))
+        }
+
         switch line.role {
         case .user:
-            AnyView(Text(line.text).foregroundStyle(.palette.accent).bold())
+            return AnyView(Text(line.text).foregroundStyle(.palette.foreground))
         case .codex:
-            AnyView(Text(line.text).foregroundStyle(.palette.success))
+            return AnyView(Text(line.text).foregroundStyle(.palette.foreground))
         case .tool:
-            AnyView(Text(line.text).foregroundStyle(.palette.warning))
+            return AnyView(Text(line.text).foregroundStyle(.palette.foregroundSecondary))
         case .error:
-            AnyView(Text(line.text).foregroundStyle(.palette.error).bold())
+            return AnyView(Text(line.text).foregroundStyle(.palette.error).bold())
         case .system:
-            if line.isLabel {
-                AnyView(Text(line.text).foregroundStyle(.palette.foregroundSecondary).bold())
-            } else {
-                AnyView(Text(line.text).dim())
-            }
+            return AnyView(Text(line.text).foregroundStyle(.palette.foregroundSecondary))
+        }
+    }
+
+    private func labelColor(_ role: TUITranscriptRole) -> Color {
+        switch role {
+        case .user:
+            return .palette.accent
+        case .codex:
+            return .palette.foregroundSecondary
+        case .tool:
+            return .palette.warning
+        case .system:
+            return .palette.foregroundTertiary
+        case .error:
+            return .palette.error
         }
     }
 
@@ -371,6 +408,28 @@ private struct AgentTUIView: View {
             return "-"
         }
         return shortStoreName(storeDescription(options: runtime.storeOptions, repoURL: runtime.repoURL, snapshot: runtime.snapshot))
+    }
+
+    private var repoName: String {
+        guard let runtime = AgentTUIRuntimeBox.current else {
+            return "-"
+        }
+        let path = runtime.snapshot.rootPath ?? runtime.repoURL.path
+        return URL(fileURLWithPath: path).lastPathComponent
+    }
+
+    private func modelLabel(_ snapshot: AgentTUISnapshot) -> String {
+        snapshot.task.backendPreference.rawValue
+    }
+
+    private func lineProgress(totalLines: Int, visibleHeight: Int, scrollOffset: Int) -> String {
+        guard totalLines > 0 else {
+            return "0/0"
+        }
+        if scrollOffset > 0 {
+            return "-\(scrollOffset) \(min(totalLines, visibleHeight))/\(totalLines)"
+        }
+        return "\(min(totalLines, visibleHeight))/\(totalLines)"
     }
 
     private func submitInput() {
