@@ -10,6 +10,8 @@ private struct AgentTUIRuntime: @unchecked Sendable {
     var snapshot: RepositorySnapshot
     var store: any AgentTaskStore
     var model: AgentTUIModel
+    var modelDisplayName: String
+    var modelContextWindowTokens: Int64?
     var fullAuto: Bool
     var sandbox: String?
 }
@@ -29,6 +31,7 @@ func runTUIkitInteractiveLoop(
     sandbox: String?
 ) async throws {
     let initialEntries = try await tuiEntries(for: task.id, store: store)
+    let modelMetadata = resolvedCodexModelMetadata()
     let runtime = AgentTUIRuntime(
         task: task,
         storeOptions: storeOptions,
@@ -38,6 +41,8 @@ func runTUIkitInteractiveLoop(
         model: AgentTUIModel(task: task, entries: initialEntries.isEmpty ? [
             TUITranscriptEntry(role: .system, text: "Ready.")
         ] : initialEntries),
+        modelDisplayName: modelMetadata.displayName,
+        modelContextWindowTokens: modelMetadata.contextWindowTokens,
         fullAuto: fullAuto,
         sandbox: sandbox
     )
@@ -115,10 +120,23 @@ private struct AgentTUISnapshot: Sendable {
     var task: TaskRecord
     var entries: [TUITranscriptEntry]
     var status: String
+    var tokenUsage: TUITokenUsage?
     var scrollOffset: Int
     var showRawEvents: Bool
     var isRunning: Bool
     var revision: Int
+}
+
+private struct TUITokenUsage: Sendable, Equatable {
+    var inputTokens: Int64
+    var outputTokens: Int64
+    var reasoningTokens: Int64
+    var contextWindowTokens: Int64?
+}
+
+private struct CodexModelMetadata: Sendable, Equatable {
+    var displayName: String
+    var contextWindowTokens: Int64?
 }
 
 private final class AgentTUIModel: @unchecked Sendable {
@@ -131,6 +149,7 @@ private final class AgentTUIModel: @unchecked Sendable {
             task: task,
             entries: entries,
             status: "ready",
+            tokenUsage: nil,
             scrollOffset: 0,
             showRawEvents: false,
             isRunning: false,
@@ -224,9 +243,9 @@ private final class AgentTUIModel: @unchecked Sendable {
         }
     }
 
-    func adjustScroll(_ delta: Int) {
+    func adjustScroll(_ delta: Int, maxOffset: Int) {
         update { state in
-            state.scrollOffset = max(0, state.scrollOffset + delta)
+            state.scrollOffset = min(max(0, state.scrollOffset + delta), max(0, maxOffset))
         }
     }
 
@@ -234,6 +253,10 @@ private final class AgentTUIModel: @unchecked Sendable {
         self.update { state in
             switch update {
             case let .event(event):
+                if let tokenUsage = tuiTokenUsage(from: event.payload) {
+                    state.tokenUsage = tokenUsage
+                }
+
                 switch event.kind {
                 case .assistantDone:
                     if let text = event.payload["text"]?.stringValue {
@@ -305,25 +328,30 @@ private struct AgentTUIView: View {
         let snapshot = model.snapshot()
         let _ = model.clearRenderCacheIfNeeded(for: snapshot.revision)
         let size = terminalSize()
-        let transcriptHeight = max(3, size.rows - 7)
+        let transcriptHeight = max(3, size.rows - 9)
         let lines = transcriptLines(snapshot.entries, width: max(40, size.columns - 4))
-        let visibleLines = visibleLines(lines, height: transcriptHeight, scrollOffset: snapshot.scrollOffset)
+        let maxScrollOffset = max(0, lines.count - transcriptHeight)
+        let scrollOffset = clampedScrollOffset(snapshot.scrollOffset, maxOffset: maxScrollOffset)
+        let visibleLines = visibleLines(lines, height: transcriptHeight, scrollOffset: scrollOffset)
 
         VStack(alignment: .leading, spacing: 0) {
             header(snapshot)
-            Divider()
+            dividerLine(label: nil, width: max(20, size.columns))
             VStack(alignment: .leading, spacing: 0) {
                 ViewArray(visibleLines.map(transcriptLine))
             }
             .frame(height: transcriptHeight, alignment: .topLeading)
             Spacer(minLength: 0)
-            composer(snapshot, totalLines: lines.count, visibleHeight: transcriptHeight, terminalWidth: size.columns)
+            composer(
+                snapshot,
+                terminalWidth: size.columns
+            )
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .palette(AgentTUIPalette())
         .appearance(.line)
         .onKeyPress { event in
-            handleKey(event, pageSize: transcriptHeight)
+            handleKey(event, pageSize: transcriptHeight, maxScrollOffset: maxScrollOffset)
         }
         .agentStatusBarConfiguration()
     }
@@ -339,52 +367,64 @@ private struct AgentTUIView: View {
 
     private func composer(
         _ snapshot: AgentTUISnapshot,
-        totalLines: Int,
-        visibleHeight: Int,
         terminalWidth: Int
     ) -> some View {
-        Panel(modelLabel(snapshot), borderStyle: .line, borderColor: .palette.border, titleColor: .palette.accent) {
-            VStack(alignment: .leading, spacing: 0) {
-                inputLine(snapshot, width: max(20, terminalWidth - 4))
-                composerStatus(snapshot, totalLines: totalLines, visibleHeight: visibleHeight)
-                    .frame(width: max(20, terminalWidth - 4))
-            }
+        let width = max(20, terminalWidth)
+
+        return VStack(alignment: .leading, spacing: 0) {
+            Text("").frame(width: width)
+            activityLine(snapshot, width: width)
+            Text("").frame(width: width)
+            dividerLine(label: modelDisplayName, width: width)
+            inputLine(width: width)
+            dividerLine(label: nil, width: width)
+            composerStatus(snapshot, width: width).frame(width: width)
         }
     }
 
-    private func inputLine(_ snapshot: AgentTUISnapshot, width: Int) -> some View {
-        let visible = visibleInputParts(width: width)
-        let prompt = snapshot.isRunning ? "turn running..." : "message or /command"
-
-        return HStack(spacing: 0) {
-            Text("> ").foregroundStyle(.palette.accent)
-            if !visible.before.isEmpty {
-                Text(visible.before).foregroundStyle(.palette.foreground)
-            }
-            Text("█").foregroundStyle(.default)
-            if !visible.after.isEmpty {
-                Text(visible.after).foregroundStyle(.palette.foreground)
-            } else if input.isEmpty {
-                Text(prompt).foregroundStyle(.palette.foregroundTertiary)
+    private func activityLine(_ snapshot: AgentTUISnapshot, width: Int) -> some View {
+        HStack(spacing: 1) {
+            Text(" ")
+            if shouldSpinActivity(snapshot) {
+                Spinner(activityText(snapshot), style: .dots, color: .palette.info)
+            } else if shouldShowActivity(snapshot) {
+                Text(activityText(snapshot)).foregroundStyle(activityColor(snapshot))
+            } else {
+                Text("")
             }
             Spacer(minLength: 0)
         }
         .frame(width: width)
     }
 
-    private func composerStatus(_ snapshot: AgentTUISnapshot, totalLines: Int, visibleHeight: Int) -> some View {
-        HStack(spacing: 1) {
-            Text(snapshot.status).foregroundStyle(statusColor(snapshot))
-            if snapshot.showRawEvents {
-                Text("raw").foregroundStyle(.palette.warning)
+    private func dividerLine(label: String?, width: Int) -> some View {
+        Text(horizontalDivider(label: label, width: width))
+            .foregroundStyle(.palette.foregroundTertiary)
+            .frame(width: width)
+    }
+
+    private func inputLine(width: Int) -> some View {
+        let visible = visibleInputParts(width: width)
+
+        return HStack(spacing: 0) {
+            if !visible.before.isEmpty {
+                Text(visible.before).foregroundStyle(.palette.foreground)
             }
-            if snapshot.scrollOffset > 0 {
-                Text("scroll \(snapshot.scrollOffset)").foregroundStyle(.palette.foregroundSecondary)
+            Text("█").foregroundStyle(.default)
+            if !visible.after.isEmpty {
+                Text(visible.after).foregroundStyle(.palette.foreground)
             }
-            Spacer()
-            Text("\(lineProgress(totalLines: totalLines, visibleHeight: visibleHeight, scrollOffset: snapshot.scrollOffset)) \(repoName)")
-                .foregroundStyle(.palette.foregroundTertiary)
+            Spacer(minLength: 0)
         }
+        .frame(width: width)
+    }
+
+    private func composerStatus(
+        _ snapshot: AgentTUISnapshot,
+        width: Int
+    ) -> some View {
+        Text(statusLine(snapshot, width: width))
+            .foregroundStyle(.palette.foregroundTertiary)
     }
 
     private func transcriptLine(_ line: TUITranscriptLine) -> AnyView {
@@ -421,14 +461,32 @@ private struct AgentTUIView: View {
         }
     }
 
-    private func statusColor(_ snapshot: AgentTUISnapshot) -> Color {
+    private func shouldShowActivity(_ snapshot: AgentTUISnapshot) -> Bool {
+        snapshot.isRunning || snapshot.status != "ready"
+    }
+
+    private func shouldSpinActivity(_ snapshot: AgentTUISnapshot) -> Bool {
+        snapshot.isRunning || snapshot.status.hasSuffix("...")
+    }
+
+    private func activityText(_ snapshot: AgentTUISnapshot) -> String {
         if snapshot.status.hasPrefix("turn failed") {
-            return .palette.error
+            return "Turn failed."
+        }
+        if snapshot.status.hasPrefix("command failed") {
+            return "Command failed."
         }
         if snapshot.isRunning {
-            return .palette.warning
+            return "Working..."
         }
-        return .palette.foregroundSecondary
+        return snapshot.status
+    }
+
+    private func activityColor(_ snapshot: AgentTUISnapshot) -> Color {
+        if snapshot.status.hasPrefix("turn failed") || snapshot.status.hasPrefix("command failed") {
+            return .palette.error
+        }
+        return .palette.foregroundTertiary
     }
 
     private var storeName: String {
@@ -438,26 +496,80 @@ private struct AgentTUIView: View {
         return shortStoreName(storeDescription(options: runtime.storeOptions, repoURL: runtime.repoURL, snapshot: runtime.snapshot))
     }
 
-    private var repoName: String {
+    private var repoBranchText: String {
         guard let runtime = AgentTUIRuntimeBox.current else {
-            return "-"
+            return "- (-)"
         }
         let path = runtime.snapshot.rootPath ?? runtime.repoURL.path
-        return URL(fileURLWithPath: path).lastPathComponent
+        let branch = runtime.snapshot.currentBranch ?? "-"
+        return "\(abbreviatedHomePath(path)) (\(branch))"
     }
 
-    private func modelLabel(_ snapshot: AgentTUISnapshot) -> String {
-        snapshot.task.backendPreference.rawValue
+    private var modelDisplayName: String {
+        AgentTUIRuntimeBox.current?.modelDisplayName ?? "codex"
     }
 
-    private func lineProgress(totalLines: Int, visibleHeight: Int, scrollOffset: Int) -> String {
-        guard totalLines > 0 else {
-            return "0/0"
+    private func tokenStatus(_ snapshot: AgentTUISnapshot) -> String {
+        let usage = snapshot.tokenUsage ?? TUITokenUsage(
+            inputTokens: 0,
+            outputTokens: 0,
+            reasoningTokens: 0,
+            contextWindowTokens: nil
+        )
+        let contextWindow = usage.contextWindowTokens
+            ?? AgentTUIRuntimeBox.current?.modelContextWindowTokens
+            ?? defaultContextWindowTokens(modelDisplayName: modelDisplayName)
+        let percent = contextWindow > 0 ? (Double(max(0, usage.inputTokens)) / Double(contextWindow)) * 100 : 0
+        var parts = [
+            "↑\(formatTokenCount(usage.inputTokens))",
+            "↓\(formatTokenCount(usage.outputTokens))"
+        ]
+        if usage.reasoningTokens > 0 {
+            parts.append("R\(formatTokenCount(usage.reasoningTokens))")
         }
-        if scrollOffset > 0 {
-            return "-\(scrollOffset) \(min(totalLines, visibleHeight))/\(totalLines)"
+        parts.append("\(formatPercent(percent))%/\(formatTokenCount(contextWindow))")
+        return parts.joined(separator: " ")
+    }
+
+    private func statusLine(_ snapshot: AgentTUISnapshot, width: Int) -> String {
+        let right = tokenStatus(snapshot)
+        var leftParts = [repoBranchText]
+        if snapshot.showRawEvents {
+            leftParts.append("raw")
         }
-        return "\(min(totalLines, visibleHeight))/\(totalLines)"
+
+        let availableWidth = max(0, width)
+        guard availableWidth > 0 else {
+            return ""
+        }
+        guard right.count < availableWidth else {
+            return String(right.suffix(availableWidth))
+        }
+
+        let rightStart = availableWidth - right.count
+        let maxLeftWidth = max(0, rightStart - 1)
+        let left = truncateMiddle(leftParts.joined(separator: " "), maxWidth: maxLeftWidth)
+        let spaces = max(1, rightStart - left.count)
+        return left + String(repeating: " ", count: spaces) + right
+    }
+
+    private func horizontalDivider(label: String?, width: Int) -> String {
+        let width = max(0, width)
+        guard width > 0 else {
+            return ""
+        }
+        guard let label, !label.isEmpty else {
+            return String(repeating: "─", count: width)
+        }
+
+        let title = " \(label) "
+        guard title.count < width else {
+            return String(title.prefix(width))
+        }
+
+        let prefixWidth = min(2, max(0, width - title.count))
+        let suffixWidth = max(0, width - prefixWidth - title.count)
+        return String(repeating: "─", count: prefixWidth) + title + String(repeating: "─", count: suffixWidth)
     }
 
     private func submitInput() {
@@ -575,12 +687,15 @@ private struct AgentTUIView: View {
         }
     }
 
-    private func handleKey(_ event: KeyEvent, pageSize: Int) -> Bool {
+    private func handleKey(_ event: KeyEvent, pageSize: Int, maxScrollOffset: Int) -> Bool {
         switch event.key {
         case .enter:
             submitInput()
             return true
         case .escape:
+            Darwin.raise(SIGINT)
+            return true
+        case .character("c") where event.ctrl:
             Darwin.raise(SIGINT)
             return true
         case .backspace:
@@ -610,29 +725,29 @@ private struct AgentTUIView: View {
         case .character(let character) where !event.ctrl && !event.alt:
             insertInput(String(character))
             return true
-        case .up:
-            model.adjustScroll(3)
-            return true
-        case .down:
-            model.adjustScroll(-3)
-            return true
-        case .pageUp:
-            model.adjustScroll(pageSize)
-            return true
-        case .pageDown:
-            model.adjustScroll(-pageSize)
-            return true
         case .up where event.ctrl:
-            model.adjustScroll(1)
+            model.adjustScroll(1, maxOffset: maxScrollOffset)
             return true
         case .down where event.ctrl:
-            model.adjustScroll(-1)
+            model.adjustScroll(-1, maxOffset: maxScrollOffset)
+            return true
+        case .up:
+            model.adjustScroll(3, maxOffset: maxScrollOffset)
+            return true
+        case .down:
+            model.adjustScroll(-3, maxOffset: maxScrollOffset)
+            return true
+        case .pageUp:
+            model.adjustScroll(pageSize, maxOffset: maxScrollOffset)
+            return true
+        case .pageDown:
+            model.adjustScroll(-pageSize, maxOffset: maxScrollOffset)
             return true
         case .character("u") where event.ctrl:
-            model.adjustScroll(pageSize)
+            model.adjustScroll(pageSize, maxOffset: maxScrollOffset)
             return true
         case .character("d") where event.ctrl:
-            model.adjustScroll(-pageSize)
+            model.adjustScroll(-pageSize, maxOffset: maxScrollOffset)
             return true
         default:
             return false
@@ -671,7 +786,7 @@ private struct AgentTUIView: View {
     }
 
     private func visibleInputParts(width: Int) -> (before: String, after: String) {
-        let textWidth = max(1, width - 2)
+        let textWidth = max(1, width)
         let visibleTextCount = max(0, textWidth - 1)
         let characters = Array(input)
         let cursor = min(inputCursor, characters.count)
@@ -687,9 +802,13 @@ private struct AgentTUIView: View {
             return lines
         }
         let maxOffset = max(0, lines.count - height)
-        let offset = min(scrollOffset, maxOffset)
+        let offset = clampedScrollOffset(scrollOffset, maxOffset: maxOffset)
         let start = max(0, lines.count - height - offset)
         return Array(lines.dropFirst(start).prefix(height))
+    }
+
+    private func clampedScrollOffset(_ scrollOffset: Int, maxOffset: Int) -> Int {
+        min(max(0, scrollOffset), max(0, maxOffset))
     }
 }
 
@@ -831,6 +950,299 @@ private func wrapText(_ text: String, width: Int) -> [String] {
 
     flush()
     return lines.isEmpty ? [""] : lines
+}
+
+private func tuiTokenUsage(from payload: [String: JSONValue]) -> TUITokenUsage? {
+    var contextWindow = jsonInt(payload["model_context_window"])
+        ?? jsonInt(payload["context_window"])
+        ?? jsonInt(payload["context_window_tokens"])
+        ?? jsonInt(payload["context_limit"])
+    var usage = payload["usage"]?.objectValue
+
+    if let info = payload["info"]?.objectValue {
+        contextWindow = contextWindow
+            ?? jsonInt(info["model_context_window"])
+            ?? jsonInt(info["context_window"])
+            ?? jsonInt(info["context_window_tokens"])
+            ?? jsonInt(info["context_limit"])
+        usage = usage ?? info["last_token_usage"]?.objectValue
+    }
+
+    usage = usage ?? payload["last_token_usage"]?.objectValue
+
+    guard let usage else {
+        if let contextWindow {
+            return TUITokenUsage(
+                inputTokens: 0,
+                outputTokens: 0,
+                reasoningTokens: 0,
+                contextWindowTokens: contextWindow
+            )
+        }
+        return nil
+    }
+
+    let input = jsonInt(usage["input_tokens"])
+        ?? jsonInt(usage["prompt_tokens"])
+        ?? 0
+    let output = jsonInt(usage["output_tokens"])
+        ?? jsonInt(usage["completion_tokens"])
+        ?? 0
+    var reasoning = jsonInt(usage["reasoning_output_tokens"])
+        ?? jsonInt(usage["reasoning_tokens"])
+        ?? 0
+
+    if let outputDetails = usage["output_tokens_details"]?.objectValue {
+        reasoning = jsonInt(outputDetails["reasoning_tokens"]) ?? reasoning
+    }
+
+    contextWindow = contextWindow
+        ?? jsonInt(usage["model_context_window"])
+        ?? jsonInt(usage["context_window"])
+        ?? jsonInt(usage["context_window_tokens"])
+        ?? jsonInt(usage["context_limit"])
+
+    guard input > 0 || output > 0 || reasoning > 0 else {
+        return nil
+    }
+
+    return TUITokenUsage(
+        inputTokens: input,
+        outputTokens: output,
+        reasoningTokens: reasoning,
+        contextWindowTokens: contextWindow
+    )
+}
+
+private func jsonInt(_ value: JSONValue?) -> Int64? {
+    switch value {
+    case let .int(value):
+        return value
+    case let .double(value):
+        return Int64(value)
+    case let .string(value):
+        return Int64(value)
+    default:
+        return nil
+    }
+}
+
+private func formatTokenCount(_ value: Int64) -> String {
+    let sign = value < 0 ? "-" : ""
+    let absolute = abs(value)
+    guard absolute >= 1_000 else {
+        return "\(value)"
+    }
+
+    let scaled = Double(absolute) / 1_000
+    if absolute % 1_000 == 0 {
+        return "\(sign)\(Int(scaled.rounded()))k"
+    }
+    return "\(sign)\(String(format: "%.1f", scaled))k"
+}
+
+private func formatPercent(_ value: Double) -> String {
+    String(format: "%.1f", value)
+}
+
+private func defaultContextWindowTokens(modelDisplayName: String) -> Int64 {
+    if modelDisplayName.localizedCaseInsensitiveContains("gpt-5") {
+        return 128_000
+    }
+    return 128_000
+}
+
+private func abbreviatedHomePath(_ path: String) -> String {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    if path == home {
+        return "~"
+    }
+    if path.hasPrefix(home + "/") {
+        return "~" + path.dropFirst(home.count)
+    }
+    return path
+}
+
+private func truncateMiddle(_ value: String, maxWidth: Int) -> String {
+    guard maxWidth > 0 else {
+        return ""
+    }
+    guard value.count > maxWidth else {
+        return value
+    }
+    guard maxWidth > 3 else {
+        return String(value.prefix(maxWidth))
+    }
+
+    let marker = "..."
+    let remaining = maxWidth - marker.count
+    let prefixCount = max(1, remaining / 2)
+    let suffixCount = max(1, remaining - prefixCount)
+    return String(value.prefix(prefixCount)) + marker + String(value.suffix(suffixCount))
+}
+
+private func resolvedCodexModelMetadata() -> CodexModelMetadata {
+    let environment = ProcessInfo.processInfo.environment
+    let defaults = codexConfigDefaults()
+    let model = nonEmpty(environment["CODEX_MODEL"])
+        ?? nonEmpty(defaults["model"])
+        ?? "codex"
+    let effort = nonEmpty(environment["CODEX_MODEL_REASONING_EFFORT"])
+        ?? nonEmpty(defaults["model_reasoning_effort"])
+
+    let displayName: String
+    if let effort {
+        displayName = "\(model) (\(effort))"
+    } else {
+        displayName = model
+    }
+
+    return CodexModelMetadata(
+        displayName: displayName,
+        contextWindowTokens: codexCatalogContextWindow(modelSlug: model)
+    )
+}
+
+private func codexCatalogContextWindow(modelSlug: String) -> Int64? {
+    guard
+        let catalog = codexBundledModelCatalog(),
+        let models = catalog["models"] as? [[String: Any]],
+        let model = models.first(where: { catalogModelMatches($0, slug: modelSlug) })
+    else {
+        return nil
+    }
+
+    let contextWindow = intFromAny(model["context_window"])
+        ?? intFromAny(model["max_context_window"])
+    guard let contextWindow else {
+        return nil
+    }
+
+    guard let effectivePercent = doubleFromAny(model["effective_context_window_percent"]) else {
+        return contextWindow
+    }
+
+    return Int64((Double(contextWindow) * effectivePercent / 100).rounded())
+}
+
+private func codexBundledModelCatalog() -> [String: Any]? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = ["codex", "debug", "models", "--bundled"]
+    process.standardError = FileHandle.nullDevice
+
+    let output = Pipe()
+    process.standardOutput = output
+
+    do {
+        try process.run()
+    } catch {
+        return nil
+    }
+
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+
+    guard process.terminationStatus == 0 else {
+        return nil
+    }
+    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+}
+
+private func catalogModelMatches(_ model: [String: Any], slug: String) -> Bool {
+    if (model["slug"] as? String) == slug {
+        return true
+    }
+    if (model["display_name"] as? String)?.localizedCaseInsensitiveCompare(slug) == .orderedSame {
+        return true
+    }
+    return false
+}
+
+private func intFromAny(_ value: Any?) -> Int64? {
+    switch value {
+    case let value as Int:
+        return Int64(value)
+    case let value as Int64:
+        return value
+    case let value as Double:
+        return Int64(value)
+    case let value as String:
+        return Int64(value)
+    default:
+        return nil
+    }
+}
+
+private func doubleFromAny(_ value: Any?) -> Double? {
+    switch value {
+    case let value as Int:
+        return Double(value)
+    case let value as Int64:
+        return Double(value)
+    case let value as Double:
+        return value
+    case let value as String:
+        return Double(value)
+    default:
+        return nil
+    }
+}
+
+private func codexConfigDefaults() -> [String: String] {
+    let environment = ProcessInfo.processInfo.environment
+    let codexHome = nonEmpty(environment["CODEX_HOME"])
+        ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path
+    let configURL = URL(fileURLWithPath: codexHome).appendingPathComponent("config.toml")
+
+    guard let contents = try? String(contentsOf: configURL, encoding: .utf8) else {
+        return [:]
+    }
+
+    var values: [String: String] = [:]
+    var inTopLevel = true
+
+    for rawLine in contents.split(separator: "\n", omittingEmptySubsequences: false) {
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+        if line.isEmpty || line.hasPrefix("#") {
+            continue
+        }
+        if line.hasPrefix("[") {
+            inTopLevel = false
+            continue
+        }
+        guard inTopLevel, let separator = line.firstIndex(of: "=") else {
+            continue
+        }
+
+        let key = line[..<separator].trimmingCharacters(in: .whitespaces)
+        let value = line[line.index(after: separator)...].trimmingCharacters(in: .whitespaces)
+        values[key] = tomlScalarString(value)
+    }
+
+    return values
+}
+
+private func tomlScalarString(_ rawValue: String) -> String {
+    var value = rawValue
+    if let comment = value.firstIndex(of: "#") {
+        value = String(value[..<comment]).trimmingCharacters(in: .whitespaces)
+    }
+    if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 {
+        value.removeFirst()
+        value.removeLast()
+        return value
+            .replacingOccurrences(of: "\\\"", with: "\"")
+            .replacingOccurrences(of: "\\\\", with: "\\")
+    }
+    return value
+}
+
+private func nonEmpty(_ value: String?) -> String? {
+    guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+    }
+    return value
 }
 
 private func terminalSize() -> TerminalSize {

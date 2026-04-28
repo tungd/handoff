@@ -657,7 +657,7 @@ func defaultInteractiveTaskTitle(snapshot: RepositorySnapshot, repoURL: URL) -> 
 
 func shortStoreName(_ store: String) -> String {
     if store.hasPrefix("postgres://") {
-        return "postgres"
+        return "remote"
     }
     if store.hasSuffix("/.agentctl") {
         return "local"
