@@ -1,17 +1,19 @@
 import AgentCore
 import ArgumentParser
+import Darwin
 import Foundation
 
 extension AgentBackend: ExpressibleByArgument {}
 
 enum StoreKind: String, ExpressibleByArgument {
+    case auto
     case local
     case postgres
 }
 
 struct StoreOptions: ParsableArguments {
-    @Option(help: "Task store to use.")
-    var store: StoreKind = .local
+    @Option(help: "Task store to use: auto, postgres, or local.")
+    var store: StoreKind = .auto
 
     @Option(help: "PostgreSQL URL. Defaults to AGENTCTL_DATABASE_URL.")
     var databaseURL: String?
@@ -22,7 +24,7 @@ struct Agentctl: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "agentctl",
         abstract: "Task/session manager for Codex-first coding workflows.",
-        discussion: "Run without a subcommand to inspect the current repository.",
+        discussion: "Run without a subcommand to start an interactive Codex session.",
         subcommands: [
             Repo.self,
             Task.self,
@@ -35,8 +37,30 @@ struct Agentctl: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "Directory to use as the current workspace.")
     var cwd: String = "."
 
+    @OptionGroup
+    var storeOptions: StoreOptions
+
+    @Option(name: .customLong("task"), help: "Task id, id prefix, or slug to resume interactively.")
+    var taskIdentifier: String?
+
+    @Option(help: "Title for a newly created interactive task.")
+    var title: String?
+
+    @Flag(help: "Pass --full-auto to Codex.")
+    var fullAuto: Bool = false
+
+    @Option(help: "Codex sandbox mode.")
+    var sandbox: String?
+
     mutating func run() async throws {
-        try printRepositoryInspection(path: cwd, json: false)
+        try await runInteractiveAgent(
+            cwd: cwd,
+            storeOptions: storeOptions,
+            taskIdentifier: taskIdentifier,
+            title: title,
+            fullAuto: fullAuto,
+            sandbox: sandbox
+        )
     }
 }
 
@@ -471,6 +495,140 @@ struct TaskPreview: Codable {
     var repository: RepositorySnapshot
 }
 
+func runInteractiveAgent(
+    cwd: String,
+    storeOptions: StoreOptions,
+    taskIdentifier: String?,
+    title: String?,
+    fullAuto: Bool,
+    sandbox: String?
+) async throws {
+    let repoURL = URL(fileURLWithPath: cwd)
+    let snapshot = try RepositoryInspector().inspect(path: repoURL)
+
+    try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+        let task = try await resolveInteractiveTask(
+            identifier: taskIdentifier,
+            title: title,
+            snapshot: snapshot,
+            repoURL: repoURL,
+            store: store
+        )
+
+        printInteractiveHeader(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
+
+        interactiveLoop: while true {
+            flushStdout()
+            writeStdout("\n\(task.slug)> ")
+            guard let line = readLine() else {
+                writeStdout("\n")
+                break interactiveLoop
+            }
+
+            let input = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !input.isEmpty else {
+                continue
+            }
+
+            switch input {
+            case "/exit", "/quit":
+                break interactiveLoop
+            case "/help":
+                printInteractiveHelp()
+                continue
+            case "/task":
+                printTaskSummary(try await store.summary(for: task))
+                continue
+            case "/repo":
+                try printRepositoryInspection(path: cwd, json: false)
+                continue
+            default:
+                if input.hasPrefix("/") {
+                    print("Unknown command: \(input)")
+                    printInteractiveHelp()
+                    continue
+                }
+            }
+
+            do {
+                let summary = try await runCodexTurn(
+                    task: task,
+                    prompt: input,
+                    repoURL: repoURL,
+                    snapshot: snapshot,
+                    store: store,
+                    fullAuto: fullAuto,
+                    sandbox: sandbox
+                )
+                printRunSummary(summary)
+            } catch {
+                printError("Turn failed: \(error)")
+            }
+        }
+    }
+}
+
+func resolveInteractiveTask(
+    identifier: String?,
+    title: String?,
+    snapshot: RepositorySnapshot,
+    repoURL: URL,
+    store: any AgentTaskStore
+) async throws -> TaskRecord {
+    if let identifier {
+        return try await store.findTask(identifier)
+    }
+
+    let resolvedTitle = title ?? defaultInteractiveTaskTitle(snapshot: snapshot, repoURL: repoURL)
+    let task = TaskRecord(
+        title: resolvedTitle,
+        slug: Slug.make(resolvedTitle),
+        backendPreference: .codex
+    )
+
+    try await store.saveTask(task)
+    try await store.appendEvent(AgentEvent(taskID: task.id, kind: .taskCreated, payload: [
+        "title": .string(task.title),
+        "slug": .string(task.slug),
+        "backend": .string(task.backendPreference.rawValue),
+        "source": .string("interactive")
+    ]))
+
+    return task
+}
+
+func defaultInteractiveTaskTitle(snapshot: RepositorySnapshot, repoURL: URL) -> String {
+    let workspaceName: String
+    if let rootPath = snapshot.rootPath {
+        workspaceName = URL(fileURLWithPath: rootPath, isDirectory: true).lastPathComponent
+    } else {
+        workspaceName = repoURL.lastPathComponent.isEmpty ? "workspace" : repoURL.lastPathComponent
+    }
+
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    return "Interactive \(workspaceName) \(formatter.string(from: Date()))"
+}
+
+func printInteractiveHeader(
+    task: TaskRecord,
+    storeOptions: StoreOptions,
+    repoURL: URL,
+    snapshot: RepositorySnapshot
+) {
+    print("agentctl interactive")
+    print("  task:  \(task.slug)")
+    print("  repo:  \(snapshot.rootPath ?? repoURL.path)")
+    print("  store: \(storeDescription(options: storeOptions, repoURL: repoURL, snapshot: snapshot))")
+    print("")
+    printInteractiveHelp()
+}
+
+func printInteractiveHelp() {
+    print("Commands: /help, /task, /repo, /exit")
+    print("Send any other line to Codex.")
+}
+
 func runCodexTurn(
     task: TaskRecord,
     prompt: String,
@@ -552,7 +710,9 @@ func withTaskStore<T>(
     snapshot: RepositorySnapshot,
     operation: (any AgentTaskStore) async throws -> T
 ) async throws -> T {
-    switch options.store {
+    switch resolvedStoreKind(options) {
+    case .auto:
+        throw RuntimeError("auto store resolution failed")
     case .local:
         let local = LocalTaskStore(root: StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot))
         return try await operation(local)
@@ -562,21 +722,57 @@ func withTaskStore<T>(
     }
 }
 
+func resolvedStoreKind(_ options: StoreOptions) -> StoreKind {
+    switch options.store {
+    case .auto:
+        return databaseURLValue(options.databaseURL) == nil ? .local : .postgres
+    case .local, .postgres:
+        return options.store
+    }
+}
+
 func postgresConfiguration(_ databaseURL: String?) throws -> AgentPostgresConfiguration {
-    let value = databaseURL ?? ProcessInfo.processInfo.environment["AGENTCTL_DATABASE_URL"]
+    let value = databaseURLValue(databaseURL)
     guard let value, !value.isEmpty else {
         throw PostgresConfigurationError.missingDatabaseURL
     }
     return try AgentPostgresConfiguration(databaseURL: value)
 }
 
+func databaseURLValue(_ databaseURL: String?) -> String? {
+    if let databaseURL, !databaseURL.isEmpty {
+        return databaseURL
+    }
+
+    guard let environmentValue = ProcessInfo.processInfo.environment["AGENTCTL_DATABASE_URL"],
+          !environmentValue.isEmpty else {
+        return nil
+    }
+
+    return environmentValue
+}
+
 func storeDescription(options: StoreOptions, repoURL: URL, snapshot: RepositorySnapshot) -> String {
-    switch options.store {
+    switch resolvedStoreKind(options) {
+    case .auto:
+        return "auto"
     case .local:
         return StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot).path
     case .postgres:
-        return options.databaseURL ?? ProcessInfo.processInfo.environment["AGENTCTL_DATABASE_URL"] ?? "postgres"
+        return redactedDatabaseDescription(databaseURLValue(options.databaseURL))
     }
+}
+
+func redactedDatabaseDescription(_ databaseURL: String?) -> String {
+    guard let databaseURL,
+          let components = URLComponents(string: databaseURL),
+          let host = components.host else {
+        return "postgres"
+    }
+
+    let port = components.port.map { ":\($0)" } ?? ""
+    let database = components.path.isEmpty ? "" : components.path
+    return "postgres://\(host)\(port)\(database)"
 }
 
 func printRepositoryInspection(path: String, json: Bool) throws {
@@ -668,4 +864,12 @@ struct RuntimeError: Error, CustomStringConvertible {
 
 func printError(_ text: String) {
     FileHandle.standardError.write(Data((text + "\n").utf8))
+}
+
+func writeStdout(_ text: String) {
+    FileHandle.standardOutput.write(Data(text.utf8))
+}
+
+func flushStdout() {
+    fflush(stdout)
 }

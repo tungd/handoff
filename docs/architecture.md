@@ -70,12 +70,13 @@ Hybrid semantic search can be added later with `pgvector`.
 `agentctl` currently supports two task stores:
 
 ```text
+auto      default; Postgres when configured, otherwise local fallback
+postgres  shared task/session/event store
 local     .agentctl/ inside the current git repository
-postgres  shared task/session/event store selected with --store postgres
 ```
 
 Use `AGENTCTL_DATABASE_URL` or `--database-url` for Postgres. Local storage is
-kept as the offline/cache path.
+kept as the offline/cache path and can be forced with `--store local`.
 
 ## Git Handoff
 

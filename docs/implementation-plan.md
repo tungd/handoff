@@ -20,6 +20,7 @@
 - Receive assistant/tool events from JSONL.
 - Normalize Codex events into `AgentEvent`.
 - Persist task/session/event records.
+- Start an interactive root CLI session backed by the task store.
 
 ## Phase 2.5: Codex App-Server
 

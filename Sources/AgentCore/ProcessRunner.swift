@@ -44,12 +44,15 @@ public struct SubprocessRunner: ProcessRunning {
         process.arguments = arguments
         process.currentDirectoryURL = workingDirectory
 
+        let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
+        process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
         try process.run()
+        try stdinPipe.fileHandleForWriting.close()
 
         let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
         let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
