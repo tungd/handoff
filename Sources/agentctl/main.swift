@@ -36,8 +36,7 @@ struct Agentctl: AsyncParsableCommand {
     var cwd: String = "."
 
     mutating func run() async throws {
-        var inspect = Repo.Inspect(path: cwd, json: false)
-        try inspect.run()
+        try printRepositoryInspection(path: cwd, json: false)
     }
 }
 
@@ -61,29 +60,7 @@ struct Repo: ParsableCommand {
         var json: Bool = false
 
         mutating func run() throws {
-            let snapshot = try RepositoryInspector().inspect(path: URL(fileURLWithPath: path))
-
-            if json {
-                try printJSON(snapshot)
-                return
-            }
-
-            if !snapshot.isGitRepository {
-                print("No git repository found at \(path).")
-                return
-            }
-
-            print("Repository")
-            print("  root:   \(snapshot.rootPath ?? "-")")
-            print("  remote: \(snapshot.originURL ?? "-")")
-            print("  branch: \(snapshot.currentBranch ?? "-")")
-            print("  head:   \(snapshot.headSHA ?? "-")")
-            print("  dirty:  \(snapshot.isDirty ? "yes" : "no")")
-
-            if snapshot.isDirty {
-                print("")
-                print(snapshot.porcelainStatus.trimmingCharacters(in: .whitespacesAndNewlines))
-            }
+            try printRepositoryInspection(path: path, json: json)
         }
     }
 }
@@ -599,6 +576,32 @@ func storeDescription(options: StoreOptions, repoURL: URL, snapshot: RepositoryS
         return StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot).path
     case .postgres:
         return options.databaseURL ?? ProcessInfo.processInfo.environment["AGENTCTL_DATABASE_URL"] ?? "postgres"
+    }
+}
+
+func printRepositoryInspection(path: String, json: Bool) throws {
+    let snapshot = try RepositoryInspector().inspect(path: URL(fileURLWithPath: path))
+
+    if json {
+        try printJSON(snapshot)
+        return
+    }
+
+    if !snapshot.isGitRepository {
+        print("No git repository found at \(path).")
+        return
+    }
+
+    print("Repository")
+    print("  root:   \(snapshot.rootPath ?? "-")")
+    print("  remote: \(snapshot.originURL ?? "-")")
+    print("  branch: \(snapshot.currentBranch ?? "-")")
+    print("  head:   \(snapshot.headSHA ?? "-")")
+    print("  dirty:  \(snapshot.isDirty ? "yes" : "no")")
+
+    if snapshot.isDirty {
+        print("")
+        print(snapshot.porcelainStatus.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }
 
