@@ -9,6 +9,52 @@ public enum JSONValue: Codable, Equatable, Sendable {
     case array([JSONValue])
     case null
 
+    public init(any value: Any) {
+        switch value {
+        case let value as String:
+            self = .string(value)
+        case let value as Bool:
+            self = .bool(value)
+        case let value as Int:
+            self = .int(Int64(value))
+        case let value as Int64:
+            self = .int(value)
+        case let value as Double:
+            self = .double(value)
+        case let value as Float:
+            self = .double(Double(value))
+        case let value as [String: Any]:
+            self = .object(value.mapValues { JSONValue(any: $0) })
+        case let value as [Any]:
+            self = .array(value.map { JSONValue(any: $0) })
+        case _ as NSNull:
+            self = .null
+        default:
+            self = .string(String(describing: value))
+        }
+    }
+
+    public var stringValue: String? {
+        if case let .string(value) = self {
+            return value
+        }
+        return nil
+    }
+
+    public var objectValue: [String: JSONValue]? {
+        if case let .object(value) = self {
+            return value
+        }
+        return nil
+    }
+
+    public var arrayValue: [JSONValue]? {
+        if case let .array(value) = self {
+            return value
+        }
+        return nil
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
 

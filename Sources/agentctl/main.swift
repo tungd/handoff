@@ -79,13 +79,13 @@ struct Task: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "task",
         abstract: "Create, list, and resume agentctl tasks.",
-        subcommands: [New.self, List.self, Resume.self]
+        subcommands: [New.self, List.self, Show.self, Send.self, Resume.self]
     )
 
     struct New: ParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "new",
-            abstract: "Create a task record preview."
+            abstract: "Create a task record, optionally running the first Codex turn."
         )
 
         @Argument(help: "Task title.")
@@ -97,57 +97,249 @@ struct Task: ParsableCommand {
         @Option(name: .shortAndLong, help: "Repository path.")
         var repo: String = "."
 
+        @Option(help: "Initial prompt to send to the preferred backend.")
+        var prompt: String?
+
+        @Flag(help: "Pass --full-auto to Codex.")
+        var fullAuto: Bool = false
+
+        @Option(help: "Codex sandbox mode.")
+        var sandbox: String?
+
         @Flag(name: .long, help: "Emit JSON.")
         var json: Bool = false
 
         mutating func run() throws {
-            let snapshot = try RepositoryInspector().inspect(path: URL(fileURLWithPath: repo))
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+            let store = LocalTaskStore(root: StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot))
             let task = TaskRecord(
                 title: title,
                 slug: Slug.make(title),
                 backendPreference: backend
             )
 
-            let preview = TaskPreview(task: task, repository: snapshot)
+            try store.saveTask(task)
+            try store.appendEvent(AgentEvent(taskID: task.id, kind: .taskCreated, payload: [
+                "title": .string(task.title),
+                "slug": .string(task.slug),
+                "backend": .string(task.backendPreference.rawValue)
+            ]))
 
+            if let prompt {
+                let summary = try runCodexTurn(
+                    task: task,
+                    prompt: prompt,
+                    repoURL: repoURL,
+                    snapshot: snapshot,
+                    store: store,
+                    fullAuto: fullAuto,
+                    sandbox: sandbox
+                )
+
+                if json {
+                    try printJSON(summary)
+                    return
+                }
+
+                printRunSummary(summary)
+                return
+            }
+
+            let preview = TaskPreview(task: task, repository: snapshot)
             if json {
                 try printJSON(preview)
                 return
             }
 
-            print("Task preview")
+            print("Task created")
             print("  id:      \(task.id.uuidString)")
             print("  title:   \(task.title)")
             print("  slug:    \(task.slug)")
             print("  backend: \(task.backendPreference.rawValue)")
             print("  repo:    \(snapshot.rootPath ?? "not detected")")
-            print("")
-            print("Persistence is not wired yet; this command currently verifies the model and repo binding.")
+            print("  store:   \(store.root.path)")
         }
     }
 
     struct List: ParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "list",
-            abstract: "List tasks from the sync store."
+            abstract: "List local tasks."
         )
 
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @Flag(name: .long, help: "Emit JSON.")
+        var json: Bool = false
+
         mutating func run() throws {
-            print("Task store is not wired yet. Next step: PostgresNIO-backed TaskStore.")
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+            let store = LocalTaskStore(root: StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot))
+            let tasks = try store.listTasks()
+
+            if json {
+                try printJSON(tasks)
+                return
+            }
+
+            if tasks.isEmpty {
+                print("No local tasks found at \(store.root.path).")
+                return
+            }
+
+            for task in tasks {
+                let sessions = try store.listSessions(taskID: task.id)
+                let thread = sessions.first?.backendSessionID ?? "-"
+                print("\(task.slug)")
+                print("  id:      \(task.id.uuidString)")
+                print("  title:   \(task.title)")
+                print("  backend: \(task.backendPreference.rawValue)")
+                print("  state:   \(task.state.rawValue)")
+                print("  thread:  \(thread)")
+            }
+        }
+    }
+
+    struct Show: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "show",
+            abstract: "Show a local task summary."
+        )
+
+        @Argument(help: "Task id, id prefix, or slug.")
+        var task: String
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @Flag(name: .long, help: "Emit JSON.")
+        var json: Bool = false
+
+        mutating func run() throws {
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+            let store = LocalTaskStore(root: StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot))
+            let task = try store.findTask(task)
+            let summary = try store.summary(for: task)
+
+            if json {
+                try printJSON(summary)
+                return
+            }
+
+            printTaskSummary(summary)
+        }
+    }
+
+    struct Send: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "send",
+            abstract: "Send one prompt to a task's backend session."
+        )
+
+        @Argument(help: "Task id, id prefix, or slug.")
+        var task: String
+
+        @Argument(help: "Prompt to send.")
+        var prompt: String
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @Flag(help: "Pass --full-auto to Codex.")
+        var fullAuto: Bool = false
+
+        @Option(help: "Codex sandbox mode.")
+        var sandbox: String?
+
+        @Flag(name: .long, help: "Emit JSON.")
+        var json: Bool = false
+
+        mutating func run() throws {
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+            let store = LocalTaskStore(root: StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot))
+            let task = try store.findTask(task)
+
+            let summary = try runCodexTurn(
+                task: task,
+                prompt: prompt,
+                repoURL: repoURL,
+                snapshot: snapshot,
+                store: store,
+                fullAuto: fullAuto,
+                sandbox: sandbox
+            )
+
+            if json {
+                try printJSON(summary)
+                return
+            }
+
+            printRunSummary(summary)
         }
     }
 
     struct Resume: ParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "resume",
-            abstract: "Resume a task by agentctl task id."
+            abstract: "Show a task summary, or send a prompt if one is provided."
         )
 
-        @Argument(help: "Task id or slug.")
+        @Argument(help: "Task id, id prefix, or slug.")
         var task: String
 
+        @Argument(help: "Optional prompt to send.")
+        var prompt: String?
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @Flag(help: "Pass --full-auto to Codex.")
+        var fullAuto: Bool = false
+
+        @Option(help: "Codex sandbox mode.")
+        var sandbox: String?
+
+        @Flag(name: .long, help: "Emit JSON.")
+        var json: Bool = false
+
         mutating func run() throws {
-            print("Resume is not wired yet for \(task). Next step: CodexBackend + event store.")
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+            let store = LocalTaskStore(root: StorePathResolver.defaultRoot(cwd: repoURL, snapshot: snapshot))
+            let task = try store.findTask(task)
+
+            if let prompt {
+                let summary = try runCodexTurn(
+                    task: task,
+                    prompt: prompt,
+                    repoURL: repoURL,
+                    snapshot: snapshot,
+                    store: store,
+                    fullAuto: fullAuto,
+                    sandbox: sandbox
+                )
+
+                if json {
+                    try printJSON(summary)
+                    return
+                }
+
+                printRunSummary(summary)
+            } else {
+                let summary = try store.summary(for: task)
+
+                if json {
+                    try printJSON(summary)
+                    return
+                }
+
+                printTaskSummary(summary)
+            }
         }
     }
 }
@@ -246,6 +438,121 @@ struct TaskPreview: Codable {
     var repository: RepositorySnapshot
 }
 
+func runCodexTurn(
+    task: TaskRecord,
+    prompt: String,
+    repoURL: URL,
+    snapshot: RepositorySnapshot,
+    store: LocalTaskStore,
+    fullAuto: Bool,
+    sandbox: String?
+) throws -> TaskRunSummary {
+    guard task.backendPreference == .codex else {
+        throw RuntimeError("only the Codex backend is wired in v1")
+    }
+
+    let cwd = snapshot.rootPath.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? repoURL
+    let previousSession = try store.latestSession(for: task.id)
+    var session = SessionRecord(
+        taskID: task.id,
+        backend: .codex,
+        backendSessionID: previousSession?.backendSessionID,
+        cwd: cwd.path,
+        state: .running
+    )
+
+    try store.saveSession(session)
+    try store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .sessionStarted, payload: [
+        "backend": .string(session.backend.rawValue),
+        "cwd": .string(session.cwd),
+        "resumeThreadID": session.backendSessionID.map { .string($0) } ?? .null
+    ]))
+    try store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .userMessage, payload: [
+        "text": .string(prompt)
+    ]))
+
+    printError("Running Codex turn for \(task.slug)...")
+
+    let result = try CodexExecBackend().run(
+        prompt: prompt,
+        cwd: cwd,
+        resumeThreadID: session.backendSessionID,
+        options: CodexExecOptions(fullAuto: fullAuto, sandbox: sandbox)
+    )
+
+    if let threadID = result.threadID {
+        session.backendSessionID = threadID
+    }
+
+    session.state = result.exitCode == 0 ? .ended : .failed
+    session.endedAt = Date()
+
+    for event in result.events {
+        var stored = event
+        stored.taskID = task.id
+        stored.sessionID = session.id
+        try store.appendEvent(stored)
+    }
+
+    if !result.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        try store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .backendEvent, payload: [
+            "stderr": .string(result.stderr)
+        ]))
+    }
+
+    try store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .sessionEnded, payload: [
+        "exitCode": .int(Int64(result.exitCode)),
+        "threadID": session.backendSessionID.map { .string($0) } ?? .null
+    ]))
+    try store.saveSession(session)
+
+    if result.exitCode != 0 {
+        throw RuntimeError("Codex exited with \(result.exitCode): \(result.stderr)")
+    }
+
+    return try store.summary(for: task)
+}
+
+func printTaskSummary(_ summary: TaskRunSummary) {
+    print("\(summary.task.slug)")
+    print("  id:      \(summary.task.id.uuidString)")
+    print("  title:   \(summary.task.title)")
+    print("  backend: \(summary.task.backendPreference.rawValue)")
+    print("  state:   \(summary.task.state.rawValue)")
+
+    if let session = summary.sessions.first {
+        print("  thread:  \(session.backendSessionID ?? "-")")
+        print("  cwd:     \(session.cwd)")
+    }
+
+    if !summary.latestEvents.isEmpty {
+        print("")
+        print("Recent events")
+        for event in summary.latestEvents {
+            print("  \(event.sequence ?? 0): \(event.kind.rawValue)")
+        }
+    }
+}
+
+func printRunSummary(_ summary: TaskRunSummary) {
+    let latestSessionID = summary.sessions.first?.id
+    let assistantMessages = summary.latestEvents.compactMap { event -> String? in
+        guard event.kind == .assistantDone else {
+            return nil
+        }
+        if let latestSessionID, event.sessionID != latestSessionID {
+            return nil
+        }
+        return event.payload["text"]?.stringValue
+    }
+
+    if assistantMessages.isEmpty {
+        printTaskSummary(summary)
+    } else {
+        print(assistantMessages.joined(separator: "\n"))
+    }
+}
+
 func printJSON<T: Encodable>(_ value: T) throws {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -265,4 +572,8 @@ struct RuntimeError: Error, CustomStringConvertible {
     init(_ description: String) {
         self.description = description
     }
+}
+
+func printError(_ text: String) {
+    FileHandle.standardError.write(Data((text + "\n").utf8))
 }

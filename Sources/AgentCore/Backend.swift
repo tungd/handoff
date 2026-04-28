@@ -4,6 +4,7 @@ public enum BackendCapability: String, Codable, CaseIterable, Sendable {
     case structuredInput = "structured_input"
     case structuredOutput = "structured_output"
     case appServer = "app_server"
+    case execJSON = "exec_json"
     case resumeNativeSession = "resume_native_session"
     case cancel
 }
@@ -35,8 +36,8 @@ public struct CodexBackendAdapter: AgentBackendAdapter {
     public let descriptor = BackendDescriptor(
         backend: .codex,
         displayName: "Codex",
-        capabilities: [.appServer, .structuredOutput, .cancel],
-        notes: "Primary backend. Implementation should target codex app-server/exec-server first."
+        capabilities: [.execJSON, .appServer, .structuredOutput, .resumeNativeSession, .cancel],
+        notes: "Primary backend. v1 uses codex exec --json/resume; app-server is the next backend target."
     )
 
     public init() {}

@@ -81,7 +81,9 @@ func backendDescriptorsCaptureInitialBackendPriorities() {
     let claude = ClaudeBackendAdapter()
 
     #expect(codex.descriptor.backend == .codex)
+    #expect(codex.descriptor.capabilities.contains(.execJSON))
     #expect(codex.descriptor.capabilities.contains(.appServer))
+    #expect(codex.descriptor.capabilities.contains(.resumeNativeSession))
     #expect(codex.appServerCommand == ["codex", "app-server", "--listen", "stdio://"])
     #expect(codex.execServerCommand == ["codex", "exec-server"])
 
@@ -160,6 +162,116 @@ func repositoryInspectorMarksDirtyStatusAndHandlesDetachedHead() throws {
     #expect(snapshot.headSHA == "deadbeef")
     #expect(snapshot.isDirty)
     #expect(snapshot.porcelainStatus == status)
+}
+
+@Test
+func codexJSONLMapperExtractsThreadAndAssistantMessage() {
+    let stdout = """
+    {"type":"thread.started","thread_id":"thread-123"}
+    {"type":"turn.started"}
+    {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"hello"}}
+    {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}
+    """
+
+    let result = CodexJSONLMapper.map(stdout: stdout)
+
+    #expect(result.threadID == "thread-123")
+    #expect(result.assistantText == "hello")
+    #expect(result.events.map(\.kind) == [
+        .backendSessionUpdated,
+        .backendEvent,
+        .assistantDone,
+        .backendEvent
+    ])
+}
+
+@Test
+func codexJSONLMapperPreservesUnknownLinesAsBackendEvents() {
+    let result = CodexJSONLMapper.map(stdout: "not json\n{\"type\":\"mystery\",\"value\":1}\n")
+
+    #expect(result.threadID == nil)
+    #expect(result.assistantText == "")
+    #expect(result.events.count == 2)
+    #expect(result.events[0].kind == .backendEvent)
+    #expect(result.events[0].payload["line"] == .string("not json"))
+    #expect(result.events[1].payload["type"] == .string("mystery"))
+}
+
+@Test
+func codexExecArgumentsUseFreshExecShape() {
+    let backend = CodexExecBackend()
+    let args = backend.makeArguments(
+        prompt: "hello",
+        cwd: URL(fileURLWithPath: "/tmp/repo"),
+        options: CodexExecOptions(fullAuto: true, sandbox: "workspace-write", model: "gpt-test", profile: "default")
+    )
+
+    #expect(args == [
+        "codex",
+        "exec",
+        "--json",
+        "--full-auto",
+        "--sandbox",
+        "workspace-write",
+        "--model",
+        "gpt-test",
+        "--profile",
+        "default",
+        "-C",
+        "/tmp/repo",
+        "hello"
+    ])
+}
+
+@Test
+func codexExecArgumentsUseResumeShapeWithoutUnsupportedFlags() {
+    let backend = CodexExecBackend()
+    let args = backend.makeArguments(
+        prompt: "continue",
+        cwd: URL(fileURLWithPath: "/tmp/repo"),
+        resumeThreadID: "thread-123",
+        options: CodexExecOptions(fullAuto: true, sandbox: "workspace-write", model: "gpt-test", profile: "default")
+    )
+
+    #expect(args == [
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "--full-auto",
+        "--model",
+        "gpt-test",
+        "thread-123",
+        "continue"
+    ])
+}
+
+@Test
+func localTaskStorePersistsTasksSessionsAndEvents() throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("agentctl-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let store = LocalTaskStore(root: root)
+    let task = TaskRecord(title: "Test Task", slug: "test-task")
+    let session = SessionRecord(
+        taskID: task.id,
+        backend: .codex,
+        backendSessionID: "thread-123",
+        cwd: "/tmp/repo"
+    )
+
+    try store.saveTask(task)
+    try store.saveSession(session)
+    let first = try store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .userMessage))
+    let second = try store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .assistantDone))
+
+    #expect(first.sequence == 1)
+    #expect(second.sequence == 2)
+    #expect(try store.findTask("test-task").id == task.id)
+    #expect(try store.findTask(String(task.id.uuidString.prefix(8))).id == task.id)
+    #expect(try store.listSessions(taskID: task.id).first?.backendSessionID == "thread-123")
+    #expect(try store.events(for: task.id).map(\.kind) == [.userMessage, .assistantDone])
 }
 
 private struct FakeProcessRunner: ProcessRunning {

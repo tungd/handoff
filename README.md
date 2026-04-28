@@ -9,9 +9,11 @@ Codex is the first-class backend. Claude support comes after the Codex loop is s
 
 ```text
 agentctl
-  -> Postgres task/event/memory store
+  -> local .agentctl task/event store now
+  -> Postgres task/event/memory store next
   -> local git/GitHub
-  -> Codex app-server / exec-server backend
+  -> Codex exec --json/resume backend now
+  -> Codex app-server / exec-server backend next
   -> Claude stream-json backend later
   -> optional Hummingbird PWA/API mode later
 ```
@@ -41,5 +43,7 @@ Run:
 ```bash
 swift build
 swift run agentctl repo inspect
+swift run agentctl task new "first task" --prompt "Reply briefly."
+swift run agentctl task send first-task "Continue."
 swift run agentctl db schema
 ```

@@ -11,11 +11,19 @@
 
 ## Phase 2: Codex MVP
 
-- Start Codex app-server or exec-server.
-- Send a user message.
-- Receive assistant/tool events.
+- Drive `codex exec --json`.
+- Store returned Codex thread id.
+- Resume with `codex exec resume --json`.
+- Send user messages one turn at a time.
+- Receive assistant/tool events from JSONL.
 - Normalize Codex events into `AgentEvent`.
 - Persist task/session/event records.
+
+## Phase 2.5: Codex App-Server
+
+- Start Codex app-server or exec-server.
+- Implement live turn start/steer/cancel.
+- Replace turn-at-a-time subprocess execution where useful.
 
 ## Phase 3: Resume And Handoff
 

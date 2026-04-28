@@ -36,6 +36,8 @@ public enum EventKind: String, Codable, CaseIterable, Sendable {
     case checkpointCreated = "checkpoint.created"
     case handoffCreated = "handoff.created"
     case memoryWritten = "memory.written"
+    case backendSessionUpdated = "backend.session.updated"
+    case backendEvent = "backend.event"
     case taskCompleted = "task.completed"
     case taskFailed = "task.failed"
 }
