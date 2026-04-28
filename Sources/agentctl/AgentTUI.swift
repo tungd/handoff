@@ -9,7 +9,7 @@ private struct AgentTUIRuntime: @unchecked Sendable {
     var repoURL: URL
     var snapshot: RepositorySnapshot
     var store: any AgentTaskStore
-    var initialEntries: [TUITranscriptEntry]
+    var model: AgentTUIModel
     var fullAuto: Bool
     var sandbox: String?
 }
@@ -35,9 +35,9 @@ func runTUIkitInteractiveLoop(
         repoURL: repoURL,
         snapshot: snapshot,
         store: store,
-        initialEntries: initialEntries.isEmpty ? [
+        model: AgentTUIModel(task: task, entries: initialEntries.isEmpty ? [
             TUITranscriptEntry(role: .system, text: "Ready.")
-        ] : initialEntries,
+        ] : initialEntries),
         fullAuto: fullAuto,
         sandbox: sandbox
     )
@@ -78,44 +78,213 @@ private struct TUITranscriptLine: Identifiable, Sendable {
     var isLabel: Bool
 }
 
+private struct AgentTUISnapshot: Sendable {
+    var task: TaskRecord
+    var entries: [TUITranscriptEntry]
+    var status: String
+    var scrollOffset: Int
+    var showRawEvents: Bool
+    var isRunning: Bool
+    var revision: Int
+}
+
+private final class AgentTUIModel: @unchecked Sendable {
+    private let lock = NSLock()
+    private var state: AgentTUISnapshot
+    private var cacheClearedRevision = 0
+
+    init(task: TaskRecord, entries: [TUITranscriptEntry]) {
+        state = AgentTUISnapshot(
+            task: task,
+            entries: entries,
+            status: "ready",
+            scrollOffset: 0,
+            showRawEvents: false,
+            isRunning: false,
+            revision: 0
+        )
+    }
+
+    func snapshot() -> AgentTUISnapshot {
+        lock.withLock { state }
+    }
+
+    func clearRenderCacheIfNeeded(for revision: Int) {
+        let shouldClear = lock.withLock { () -> Bool in
+            guard revision > cacheClearedRevision else {
+                return false
+            }
+            cacheClearedRevision = revision
+            return true
+        }
+        if shouldClear {
+            RenderCache.shared.clearAll()
+        }
+    }
+
+    func append(_ role: TUITranscriptRole, _ text: String) {
+        update { state in
+            append(role, text, to: &state)
+        }
+    }
+
+    func startTurn(prompt: String) -> TaskRecord? {
+        var task: TaskRecord?
+        update { state in
+            guard !state.isRunning else {
+                append(.error, "A Codex turn is already running.", to: &state)
+                return
+            }
+            append(.user, prompt, to: &state)
+            state.isRunning = true
+            state.status = "running Codex turn..."
+            task = state.task
+        }
+        return task
+    }
+
+    func finishTurn() {
+        update { state in
+            state.status = "ready"
+            state.isRunning = false
+        }
+    }
+
+    func failTurn(_ error: Error) {
+        update { state in
+            state.status = "turn failed"
+            state.isRunning = false
+            append(.error, String(describing: error), to: &state)
+        }
+    }
+
+    func setStatus(_ status: String) {
+        update { state in
+            state.status = status
+        }
+    }
+
+    func commandFailed(_ error: Error) {
+        update { state in
+            state.status = "command failed"
+            append(.error, String(describing: error), to: &state)
+        }
+    }
+
+    func toggleRawEvents() -> Bool {
+        var enabled = false
+        update { state in
+            state.showRawEvents.toggle()
+            enabled = state.showRawEvents
+            append(.system, enabled ? "Raw event rendering enabled." : "Raw event rendering disabled.", to: &state)
+        }
+        return enabled
+    }
+
+    func setTask(_ task: TaskRecord, entries: [TUITranscriptEntry], message: String) {
+        update { state in
+            state.task = task
+            state.entries = entries
+            state.scrollOffset = 0
+            append(.system, message, to: &state)
+            state.status = "ready"
+        }
+    }
+
+    func adjustScroll(_ delta: Int) {
+        update { state in
+            state.scrollOffset = max(0, state.scrollOffset + delta)
+        }
+    }
+
+    func render(_ update: AgentSessionUpdate) {
+        self.update { state in
+            switch update {
+            case let .event(event):
+                switch event.kind {
+                case .assistantDone:
+                    if let text = event.payload["text"]?.stringValue {
+                        append(.codex, text, to: &state)
+                    }
+                case .toolStarted:
+                    append(.tool, "start  \(compactPayload(event.payload))", to: &state)
+                case .toolFinished:
+                    append(.tool, "done   \(compactPayload(event.payload))", to: &state)
+                case .userMessage:
+                    break
+                case .backendSessionUpdated, .backendEvent:
+                    if state.showRawEvents {
+                        append(.system, "\(event.kind.rawValue) \(compactPayload(event.payload))", to: &state)
+                    }
+                default:
+                    if state.showRawEvents {
+                        append(.system, "\(event.kind.rawValue) \(compactPayload(event.payload))", to: &state)
+                    }
+                }
+            case let .session(session):
+                state.status = "session \(session.state.rawValue)"
+            }
+        }
+    }
+
+    private func update(_ body: (inout AgentTUISnapshot) -> Void) {
+        lock.withLock {
+            body(&state)
+            state.revision += 1
+        }
+        AppState.shared.setNeedsRender()
+        // TUIkit's runner owns a private AppState; SIGWINCH is its process-wide render wake-up.
+        Darwin.raise(SIGWINCH)
+    }
+
+    private func append(_ role: TUITranscriptRole, _ text: String, to state: inout AgentTUISnapshot) {
+        state.entries.append(TUITranscriptEntry(role: role, text: text))
+        state.scrollOffset = 0
+    }
+}
+
+private extension NSLock {
+    func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock()
+        defer { unlock() }
+        return try body()
+    }
+}
+
 private struct TerminalSize {
     var rows: Int
     var columns: Int
 }
 
 private struct AgentTUIView: View {
-    @State private var task: TaskRecord
-    @State private var entries: [TUITranscriptEntry]
+    private let model: AgentTUIModel
     @State private var input = ""
-    @State private var status = "ready"
-    @State private var scrollOffset = 0
-    @State private var showRawEvents = false
-    @State private var isRunning = false
 
     init() {
         guard let runtime = AgentTUIRuntimeBox.current else {
             fatalError("AgentTUIView launched without runtime")
         }
-        _task = State(wrappedValue: runtime.task)
-        _entries = State(wrappedValue: runtime.initialEntries)
+        model = runtime.model
     }
 
     var body: some View {
+        let snapshot = model.snapshot()
+        let _ = model.clearRenderCacheIfNeeded(for: snapshot.revision)
         let size = terminalSize()
         let transcriptHeight = max(3, size.rows - 7)
-        let lines = transcriptLines(entries, width: max(40, size.columns - 2))
-        let visibleLines = visibleLines(lines, height: transcriptHeight)
+        let lines = transcriptLines(snapshot.entries, width: max(40, size.columns - 2))
+        let visibleLines = visibleLines(lines, height: transcriptHeight, scrollOffset: snapshot.scrollOffset)
 
         VStack(alignment: .leading, spacing: 0) {
-            header
+            header(snapshot)
             Divider()
             VStack(alignment: .leading, spacing: 0) {
                 ViewArray(visibleLines.map(transcriptLine))
             }
             Spacer(minLength: 0)
             Divider()
-            statusLine(totalLines: lines.count, visibleHeight: transcriptHeight)
-            composer
+            statusLine(snapshot, totalLines: lines.count, visibleHeight: transcriptHeight)
+            composer(snapshot)
         }
         .padding(.horizontal, 1)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -133,34 +302,34 @@ private struct AgentTUIView: View {
         }
     }
 
-    private var header: some View {
+    private func header(_ snapshot: AgentTUISnapshot) -> some View {
         HStack(spacing: 1) {
             Text("agentctl").foregroundStyle(.palette.accent).bold()
-            Text(task.slug).foregroundStyle(.palette.foregroundSecondary)
+            Text(snapshot.task.slug).foregroundStyle(.palette.foregroundSecondary)
             Spacer()
-            Text(task.backendPreference.rawValue).foregroundStyle(.palette.success)
+            Text(snapshot.task.backendPreference.rawValue).foregroundStyle(.palette.success)
             Text(storeName).foregroundStyle(.palette.foregroundSecondary)
         }
     }
 
-    private func statusLine(totalLines: Int, visibleHeight: Int) -> some View {
+    private func statusLine(_ snapshot: AgentTUISnapshot, totalLines: Int, visibleHeight: Int) -> some View {
         HStack(spacing: 1) {
-            Text(status).foregroundStyle(statusColor)
-            if showRawEvents {
+            Text(snapshot.status).foregroundStyle(statusColor(snapshot))
+            if snapshot.showRawEvents {
                 Text("raw").foregroundStyle(.palette.warning)
             }
-            if scrollOffset > 0 {
-                Text("scroll \(scrollOffset)").foregroundStyle(.palette.foregroundSecondary)
+            if snapshot.scrollOffset > 0 {
+                Text("scroll \(snapshot.scrollOffset)").foregroundStyle(.palette.foregroundSecondary)
             }
             Spacer()
             Text("\(min(totalLines, visibleHeight))/\(totalLines)").dim()
         }
     }
 
-    private var composer: some View {
+    private func composer(_ snapshot: AgentTUISnapshot) -> some View {
         HStack(spacing: 1) {
             Text(">").foregroundStyle(.palette.accent).bold()
-            TextField("message", text: $input, prompt: Text(isRunning ? "turn running..." : "message or /command"))
+            TextField("message", text: $input, prompt: Text(snapshot.isRunning ? "turn running..." : "message or /command"))
                 .focusID("composer")
                 .onSubmit {
                     submitInput()
@@ -187,11 +356,11 @@ private struct AgentTUIView: View {
         }
     }
 
-    private var statusColor: Color {
-        if status.hasPrefix("turn failed") {
+    private func statusColor(_ snapshot: AgentTUISnapshot) -> Color {
+        if snapshot.status.hasPrefix("turn failed") {
             return .palette.error
         }
-        if isRunning {
+        if snapshot.isRunning {
             return .palette.warning
         }
         return .palette.foregroundSecondary
@@ -216,22 +385,17 @@ private struct AgentTUIView: View {
             return
         }
 
-        guard !isRunning else {
-            append(.error, "A Codex turn is already running.")
+        guard let currentTask = model.startTurn(prompt: text) else {
             return
         }
 
         guard let runtime = AgentTUIRuntimeBox.current else {
-            append(.error, "TUI runtime is not available.")
+            model.failTurn(RuntimeError("TUI runtime is not available."))
             return
         }
 
-        let currentTask = task
-        append(.user, text)
-        isRunning = true
-        status = "running Codex turn..."
-
-        _Concurrency.Task {
+        let model = model
+        _Concurrency.Task.detached {
             do {
                 _ = try await runCodexTurn(
                     task: currentTask,
@@ -243,27 +407,18 @@ private struct AgentTUIView: View {
                     sandbox: runtime.sandbox,
                     showStatus: false
                 ) { update in
-                    await MainActor.run {
-                        render(update)
-                    }
+                    model.render(update)
                 }
-                await MainActor.run {
-                    status = "ready"
-                    isRunning = false
-                }
+                model.finishTurn()
             } catch {
-                await MainActor.run {
-                    status = "turn failed"
-                    isRunning = false
-                    append(.error, String(describing: error))
-                }
+                model.failTurn(error)
             }
         }
     }
 
     private func handle(_ command: SlashCommand) {
         guard let runtime = AgentTUIRuntimeBox.current else {
-            append(.error, "TUI runtime is not available.")
+            model.append(.error, "TUI runtime is not available.")
             return
         }
 
@@ -271,33 +426,28 @@ private struct AgentTUIView: View {
         case "exit", "quit":
             Darwin.raise(SIGINT)
         case "help":
-            append(.system, "/help /info /tasks /new [title] /resume <task> /events /raw /exit")
+            model.append(.system, "/help /info /tasks /new [title] /resume <task> /events /raw /exit")
         case "raw":
-            showRawEvents.toggle()
-            append(.system, showRawEvents ? "Raw event rendering enabled." : "Raw event rendering disabled.")
+            _ = model.toggleRawEvents()
         case "info", "task", "repo":
+            let task = model.snapshot().task
             runCommand(status: "loading task info...") {
                 let summary = try await runtime.store.summary(for: task)
-                await MainActor.run {
-                    append(.system, tuiInfo(task: task, summary: summary, runtime: runtime))
-                    status = "ready"
-                }
+                model.append(.system, tuiInfo(task: task, summary: summary, runtime: runtime))
+                model.setStatus("ready")
             }
         case "tasks":
             runCommand(status: "loading tasks...") {
                 let tasks = try await runtime.store.listTasks()
-                await MainActor.run {
-                    append(.system, tuiTasks(tasks))
-                    status = "ready"
-                }
+                model.append(.system, tuiTasks(tasks))
+                model.setStatus("ready")
             }
         case "events":
+            let task = model.snapshot().task
             runCommand(status: "loading events...") {
                 let events = try await runtime.store.events(for: task.id)
-                await MainActor.run {
-                    append(.system, tuiEvents(events))
-                    status = "ready"
-                }
+                model.append(.system, tuiEvents(events))
+                model.setStatus("ready")
             }
         case "new":
             runCommand(status: "creating task...") {
@@ -308,108 +458,61 @@ private struct AgentTUIView: View {
                     repoURL: runtime.repoURL,
                     store: runtime.store
                 )
-                await MainActor.run {
-                    task = newTask
-                    entries = []
-                    scrollOffset = 0
-                    append(.system, "Created task \(newTask.slug).")
-                    status = "ready"
-                }
+                model.setTask(newTask, entries: [], message: "Created task \(newTask.slug).")
             }
         case "resume":
             guard let identifier = command.argument, !identifier.isEmpty else {
-                append(.error, "usage: /resume <task>")
+                model.append(.error, "usage: /resume <task>")
                 return
             }
             runCommand(status: "resuming task...") {
                 let resumedTask = try await runtime.store.findTask(identifier)
                 let loadedEntries = try await tuiEntries(for: resumedTask.id, store: runtime.store)
-                await MainActor.run {
-                    task = resumedTask
-                    entries = loadedEntries
-                    append(.system, "Resumed task \(resumedTask.slug).")
-                    scrollOffset = 0
-                    status = "ready"
-                }
+                model.setTask(resumedTask, entries: loadedEntries, message: "Resumed task \(resumedTask.slug).")
             }
         default:
-            append(.error, "unknown command: /\(command.name)")
+            model.append(.error, "unknown command: /\(command.name)")
         }
     }
 
     private func runCommand(status newStatus: String, operation: @escaping @Sendable () async throws -> Void) {
-        status = newStatus
-        _Concurrency.Task {
+        model.setStatus(newStatus)
+        let model = model
+        _Concurrency.Task.detached {
             do {
                 try await operation()
             } catch {
-                await MainActor.run {
-                    status = "command failed"
-                    append(.error, String(describing: error))
-                }
+                model.commandFailed(error)
             }
         }
-    }
-
-    private func render(_ update: AgentSessionUpdate) {
-        switch update {
-        case let .event(event):
-            switch event.kind {
-            case .assistantDone:
-                if let text = event.payload["text"]?.stringValue {
-                    append(.codex, text)
-                }
-            case .toolStarted:
-                append(.tool, "start  \(compactPayload(event.payload))")
-            case .toolFinished:
-                append(.tool, "done   \(compactPayload(event.payload))")
-            case .userMessage:
-                break
-            case .backendSessionUpdated, .backendEvent:
-                if showRawEvents {
-                    append(.system, "\(event.kind.rawValue) \(compactPayload(event.payload))")
-                }
-            default:
-                if showRawEvents {
-                    append(.system, "\(event.kind.rawValue) \(compactPayload(event.payload))")
-                }
-            }
-        case let .session(session):
-            status = "session \(session.state.rawValue)"
-        }
-    }
-
-    private func append(_ role: TUITranscriptRole, _ text: String) {
-        entries.append(TUITranscriptEntry(role: role, text: text))
-        scrollOffset = 0
     }
 
     private func handleKey(_ event: KeyEvent, pageSize: Int) -> Bool {
         switch event.key {
         case .pageUp:
-            scrollOffset += pageSize
+            model.adjustScroll(pageSize)
             return true
         case .pageDown:
-            scrollOffset = max(0, scrollOffset - pageSize)
+            model.adjustScroll(-pageSize)
             return true
         case .up where event.ctrl:
-            scrollOffset += 1
+            model.adjustScroll(1)
             return true
         case .down where event.ctrl:
-            scrollOffset = max(0, scrollOffset - 1)
+            model.adjustScroll(-1)
             return true
         case .character("u") where event.ctrl:
-            scrollOffset += pageSize
+            model.adjustScroll(pageSize)
             return true
         case .character("d") where event.ctrl:
-            scrollOffset = max(0, scrollOffset - pageSize)
+            model.adjustScroll(-pageSize)
             return true
         default:
             return false
         }
     }
 
-    private func visibleLines(_ lines: [TUITranscriptLine], height: Int) -> [TUITranscriptLine] {
+    private func visibleLines(_ lines: [TUITranscriptLine], height: Int, scrollOffset: Int) -> [TUITranscriptLine] {
         guard lines.count > height else {
             return lines
         }
