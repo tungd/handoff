@@ -49,6 +49,18 @@ swift run agentctl task send first-task "Continue."
 swift run agentctl db schema
 ```
 
+The root command starts the interactive Codex shell. It currently supports:
+
+```text
+/help
+/info
+/tasks
+/new [title]
+/resume <task>
+/events
+/exit
+```
+
 ## Postgres Store
 
 The default store is `auto`: if `AGENTCTL_DATABASE_URL` is set, `agentctl`

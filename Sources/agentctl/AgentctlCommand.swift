@@ -19,6 +19,7 @@ struct StoreOptions: ParsableArguments {
     var databaseURL: String?
 }
 
+@available(macOS 10.15, macCatalyst 13, iOS 13, tvOS 13, watchOS 6, *)
 @main
 struct Agentctl: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -507,19 +508,19 @@ func runInteractiveAgent(
     let snapshot = try RepositoryInspector().inspect(path: repoURL)
 
     try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
-        let task = try await resolveInteractiveTask(
+        var task = try await resolveInteractiveTask(
             identifier: taskIdentifier,
             title: title,
             snapshot: snapshot,
             repoURL: repoURL,
             store: store
         )
+        let renderer = TerminalRenderer()
 
-        printInteractiveHeader(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
+        renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
 
         interactiveLoop: while true {
-            flushStdout()
-            writeStdout("\n\(task.slug)> ")
+            renderer.prompt(task: task)
             guard let line = readLine() else {
                 writeStdout("\n")
                 break interactiveLoop
@@ -530,27 +531,45 @@ func runInteractiveAgent(
                 continue
             }
 
-            switch input {
-            case "/exit", "/quit":
-                break interactiveLoop
-            case "/help":
-                printInteractiveHelp()
-                continue
-            case "/task":
-                printTaskSummary(try await store.summary(for: task))
-                continue
-            case "/repo":
-                try printRepositoryInspection(path: cwd, json: false)
-                continue
-            default:
-                if input.hasPrefix("/") {
-                    print("Unknown command: \(input)")
-                    printInteractiveHelp()
-                    continue
+            if let command = SlashCommand(input) {
+                switch command.name {
+                case "exit", "quit":
+                    break interactiveLoop
+                case "help":
+                    renderer.help()
+                case "info", "task", "repo":
+                    let summary = try await store.summary(for: task)
+                    renderer.info(task: task, summary: summary, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
+                case "tasks":
+                    renderer.tasks(try await store.listTasks())
+                case "events":
+                    renderer.events(try await store.events(for: task.id))
+                case "new":
+                    task = try await resolveInteractiveTask(
+                        identifier: nil,
+                        title: command.argument?.isEmpty == false ? command.argument : nil,
+                        snapshot: snapshot,
+                        repoURL: repoURL,
+                        store: store
+                    )
+                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
+                case "resume":
+                    guard let identifier = command.argument, !identifier.isEmpty else {
+                        renderer.error("usage: /resume <task>")
+                        continue
+                    }
+                    task = try await store.findTask(identifier)
+                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: snapshot)
+                default:
+                    renderer.error("unknown command: /\(command.name)")
+                    renderer.help()
                 }
+                continue
             }
 
             do {
+                renderer.status("running Codex turn...")
+                var assistantRendered = false
                 let summary = try await runCodexTurn(
                     task: task,
                     prompt: input,
@@ -558,11 +577,18 @@ func runInteractiveAgent(
                     snapshot: snapshot,
                     store: store,
                     fullAuto: fullAuto,
-                    sandbox: sandbox
-                )
-                printRunSummary(summary)
+                    sandbox: sandbox,
+                    showStatus: false
+                ) { update in
+                    if renderer.render(update: update, showRawEvents: false) {
+                        assistantRendered = true
+                    }
+                }
+                if !assistantRendered {
+                    printRunSummary(summary)
+                }
             } catch {
-                printError("Turn failed: \(error)")
+                renderer.error("turn failed: \(error)")
             }
         }
     }
@@ -610,25 +636,6 @@ func defaultInteractiveTaskTitle(snapshot: RepositorySnapshot, repoURL: URL) -> 
     return "Interactive \(workspaceName) \(formatter.string(from: Date()))"
 }
 
-func printInteractiveHeader(
-    task: TaskRecord,
-    storeOptions: StoreOptions,
-    repoURL: URL,
-    snapshot: RepositorySnapshot
-) {
-    print("agentctl interactive")
-    print("  task:  \(task.slug)")
-    print("  repo:  \(snapshot.rootPath ?? repoURL.path)")
-    print("  store: \(storeDescription(options: storeOptions, repoURL: repoURL, snapshot: snapshot))")
-    print("")
-    printInteractiveHelp()
-}
-
-func printInteractiveHelp() {
-    print("Commands: /help, /task, /repo, /exit")
-    print("Send any other line to Codex.")
-}
-
 func runCodexTurn(
     task: TaskRecord,
     prompt: String,
@@ -636,9 +643,13 @@ func runCodexTurn(
     snapshot: RepositorySnapshot,
     store: any AgentTaskStore,
     fullAuto: Bool,
-    sandbox: String?
+    sandbox: String?,
+    showStatus: Bool = true,
+    onUpdate: (AgentSessionUpdate) async throws -> Void = { _ in }
 ) async throws -> TaskRunSummary {
-    printError("Running Codex turn for \(task.slug)...")
+    if showStatus {
+        printError("Running Codex turn for \(task.slug)...")
+    }
 
     let controller = AgentSessionController(store: store)
     return try await controller.runCodexTurn(
@@ -646,7 +657,8 @@ func runCodexTurn(
         prompt: prompt,
         repoURL: repoURL,
         snapshot: snapshot,
-        options: CodexExecOptions(fullAuto: fullAuto, sandbox: sandbox)
+        options: CodexExecOptions(fullAuto: fullAuto, sandbox: sandbox),
+        onUpdate: onUpdate
     )
 }
 
