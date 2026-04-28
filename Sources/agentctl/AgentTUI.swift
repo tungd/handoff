@@ -107,6 +107,8 @@ private struct TUITranscriptEntry: Identifiable, Sendable {
     var id = UUID()
     var role: TUITranscriptRole
     var text: String
+    var style: TUITranscriptStyle = .message
+    var toolKey: String?
 }
 
 private struct TUITranscriptLine: Identifiable, Sendable {
@@ -115,6 +117,13 @@ private struct TUITranscriptLine: Identifiable, Sendable {
     var text: String
     var spans: [AgentTUIStyledTextSpan]
     var isLabel: Bool
+}
+
+private enum TUITranscriptStyle: Sendable, Equatable {
+    case message
+    case userQuote
+    case toolCall(AgentTUIToolStatus)
+    case toolOutput
 }
 
 private struct AgentTUISnapshot: Sendable {
@@ -264,9 +273,9 @@ private final class AgentTUIModel: @unchecked Sendable {
                         append(.codex, text, to: &state)
                     }
                 case .toolStarted:
-                    append(.tool, "start  \(compactPayload(event.payload))", to: &state)
+                    appendToolCall(event.payload, status: .running, to: &state)
                 case .toolFinished:
-                    append(.tool, "done   \(compactPayload(event.payload))", to: &state)
+                    finishToolCall(event.payload, to: &state)
                 case .userMessage:
                     break
                 case .backendSessionUpdated, .backendEvent:
@@ -294,9 +303,58 @@ private final class AgentTUIModel: @unchecked Sendable {
         Darwin.raise(SIGWINCH)
     }
 
-    private func append(_ role: TUITranscriptRole, _ text: String, to state: inout AgentTUISnapshot) {
-        state.entries.append(TUITranscriptEntry(role: role, text: text))
+    private func append(
+        _ role: TUITranscriptRole,
+        _ text: String,
+        style: TUITranscriptStyle? = nil,
+        toolKey: String? = nil,
+        to state: inout AgentTUISnapshot
+    ) {
+        let resolvedStyle = style ?? (role == .user ? .userQuote : .message)
+        state.entries.append(TUITranscriptEntry(
+            role: role,
+            text: text,
+            style: resolvedStyle,
+            toolKey: toolKey
+        ))
         state.scrollOffset = 0
+    }
+
+    private func appendToolCall(
+        _ payload: [String: JSONValue],
+        status: AgentTUIToolStatus,
+        to state: inout AgentTUISnapshot
+    ) {
+        append(
+            .tool,
+            agentTUIToolCallText(from: payload),
+            style: .toolCall(status),
+            toolKey: agentTUIToolCallKey(from: payload),
+            to: &state
+        )
+    }
+
+    private func finishToolCall(_ payload: [String: JSONValue], to state: inout AgentTUISnapshot) {
+        let key = agentTUIToolCallKey(from: payload)
+        let status: AgentTUIToolStatus
+        if case let .int(exitCode) = payload["exitCode"], exitCode != 0 {
+            status = .failed
+        } else {
+            status = .succeeded
+        }
+
+        if let index = state.entries.lastIndex(where: { entry in
+            entry.toolKey == key && entry.style == .toolCall(.running)
+        }) {
+            state.entries[index].text = agentTUIToolCallText(from: payload)
+            state.entries[index].style = .toolCall(status)
+        } else {
+            appendToolCall(payload, status: status, to: &state)
+        }
+
+        if let output = agentTUIToolOutputText(from: payload) {
+            append(.tool, output, style: .toolOutput, toolKey: key, to: &state)
+        }
     }
 }
 
@@ -484,6 +542,12 @@ private struct AgentTUIView: View {
             return .palette.foregroundTertiary
         case .accent:
             return .palette.accent
+        case .success:
+            return .palette.success
+        case .failure:
+            return .palette.error
+        case .quote:
+            return .palette.warning
         }
     }
 
@@ -846,20 +910,66 @@ private extension View {
 }
 
 private func tuiEntries(for taskID: UUID, store: any AgentTaskStore) async throws -> [TUITranscriptEntry] {
-    try await store.events(for: taskID).compactMap { event in
+    var entries: [TUITranscriptEntry] = []
+
+    func append(
+        _ role: TUITranscriptRole,
+        _ text: String,
+        style: TUITranscriptStyle? = nil,
+        toolKey: String? = nil
+    ) {
+        entries.append(TUITranscriptEntry(
+            role: role,
+            text: text,
+            style: style ?? (role == .user ? .userQuote : .message),
+            toolKey: toolKey
+        ))
+    }
+
+    for event in try await store.events(for: taskID) {
         switch event.kind {
         case .userMessage:
-            return event.payload["text"]?.stringValue.map { TUITranscriptEntry(role: .user, text: $0) }
+            if let text = event.payload["text"]?.stringValue {
+                append(.user, text)
+            }
         case .assistantDone:
-            return event.payload["text"]?.stringValue.map { TUITranscriptEntry(role: .codex, text: $0) }
+            if let text = event.payload["text"]?.stringValue {
+                append(.codex, text)
+            }
         case .toolStarted:
-            return TUITranscriptEntry(role: .tool, text: "start  \(compactPayload(event.payload))")
+            append(
+                .tool,
+                agentTUIToolCallText(from: event.payload),
+                style: .toolCall(.running),
+                toolKey: agentTUIToolCallKey(from: event.payload)
+            )
         case .toolFinished:
-            return TUITranscriptEntry(role: .tool, text: "done   \(compactPayload(event.payload))")
+            let key = agentTUIToolCallKey(from: event.payload)
+            let status: AgentTUIToolStatus
+            if case let .int(exitCode) = event.payload["exitCode"], exitCode != 0 {
+                status = .failed
+            } else {
+                status = .succeeded
+            }
+
+            if let index = entries.lastIndex(where: { entry in
+                entry.toolKey == key && entry.style == .toolCall(.running)
+            }) {
+                entries[index].text = agentTUIToolCallText(from: event.payload)
+                entries[index].style = .toolCall(status)
+            } else {
+                append(.tool, agentTUIToolCallText(from: event.payload), style: .toolCall(status), toolKey: key)
+            }
+
+            if let output = agentTUIToolOutputText(from: event.payload) {
+                append(.tool, output, style: .toolOutput, toolKey: key)
+            }
         default:
-            return nil
+            break
         }
     }
+
+    return entries
 }
 
 private func tuiInfo(task: TaskRecord, summary: TaskRunSummary, runtime: AgentTUIRuntime) -> String {
@@ -932,9 +1042,22 @@ private func transcriptLines(_ entries: [TUITranscriptEntry], width: Int) -> [TU
             append(role: .system, text: "", isLabel: false)
         }
 
-        append(role: entry.role, text: entry.role.rawValue, isLabel: true)
-        for renderedLine in agentTUIMarkdownStyledLines(entry.text, width: bodyWidth) {
-            append(role: entry.role, spans: [AgentTUIStyledTextSpan("  ")] + renderedLine)
+        switch entry.style {
+        case .message:
+            append(role: entry.role, text: entry.role.rawValue, isLabel: true)
+            for renderedLine in agentTUIMarkdownStyledLines(entry.text, width: bodyWidth) {
+                append(role: entry.role, spans: [AgentTUIStyledTextSpan("  ")] + renderedLine)
+            }
+        case .userQuote:
+            for renderedLine in agentTUIQuoteStyledLines(entry.text, width: bodyWidth) {
+                append(role: entry.role, spans: renderedLine)
+            }
+        case let .toolCall(status):
+            append(role: entry.role, spans: agentTUIToolCallStyledLine(entry.text, status: status))
+        case .toolOutput:
+            for renderedLine in agentTUIToolOutputStyledLines(entry.text, width: bodyWidth) {
+                append(role: entry.role, spans: renderedLine)
+            }
         }
     }
 

@@ -1,9 +1,19 @@
+import AgentCore
 import Foundation
 
 enum AgentTUIStyledTextTone: Sendable, Equatable {
     case base
     case secondary
     case accent
+    case success
+    case failure
+    case quote
+}
+
+enum AgentTUIToolStatus: Sendable, Equatable {
+    case running
+    case succeeded
+    case failed
 }
 
 struct AgentTUIStyledTextSpan: Sendable, Equatable {
@@ -60,6 +70,125 @@ func agentTUIMarkdownStyledLines(_ markdown: String, width: Int) -> [[AgentTUISt
     }
 
     return result.isEmpty ? [[AgentTUIStyledTextSpan("")]] : result
+}
+
+func agentTUIQuoteStyledLines(_ markdown: String, width: Int) -> [[AgentTUIStyledTextSpan]] {
+    agentTUIMarkdownStyledLines(markdown, width: max(1, width - 2)).map { line in
+        [AgentTUIStyledTextSpan("│ ", tone: .quote)] + line.map { span in
+            var copy = span
+            copy.isItalic = true
+            if copy.tone == .base {
+                copy.tone = .quote
+            }
+            return copy
+        }
+    }
+}
+
+func agentTUIToolCallKey(from payload: [String: JSONValue]) -> String {
+    agentTUICommandText(from: payload) ?? agentTUIToolCallText(from: payload)
+}
+
+func agentTUIToolCallText(from payload: [String: JSONValue]) -> String {
+    if let title = payload["title"]?.stringValue {
+        return title
+    }
+
+    if let name = payload["name"]?.stringValue {
+        if let detail = payload["detail"]?.stringValue, !detail.isEmpty {
+            return "\(name) \(detail)"
+        }
+        return name
+    }
+
+    guard let command = agentTUICommandText(from: payload), !command.isEmpty else {
+        return "Tool"
+    }
+
+    let script = agentTUIShellScript(command)
+    return "Bash \(script)"
+}
+
+func agentTUIToolCallStyledLine(
+    _ text: String,
+    status: AgentTUIToolStatus
+) -> [AgentTUIStyledTextSpan] {
+    let symbol: String
+    let symbolTone: AgentTUIStyledTextTone
+    switch status {
+    case .running:
+        symbol = "⋯"
+        symbolTone = .secondary
+    case .succeeded:
+        symbol = "✓"
+        symbolTone = .success
+    case .failed:
+        symbol = "×"
+        symbolTone = .failure
+    }
+
+    let parts = text.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+    let title = parts.first.map(String.init) ?? text
+    let detail = parts.count > 1 ? String(parts[1]) : ""
+
+    var spans = [
+        AgentTUIStyledTextSpan(symbol, tone: symbolTone),
+        AgentTUIStyledTextSpan(" "),
+        AgentTUIStyledTextSpan(title, isBold: true)
+    ]
+
+    if !detail.isEmpty {
+        appendSpan(AgentTUIStyledTextSpan(" "), to: &spans)
+        appendSpan(AgentTUIStyledTextSpan(detail, tone: .secondary), to: &spans)
+    }
+
+    return spans
+}
+
+func agentTUIToolOutputText(
+    from payload: [String: JSONValue],
+    maxLines: Int = 12,
+    maxLineLength: Int = 140
+) -> String? {
+    guard let output = payload["output"]?.stringValue?.trimmingCharacters(in: .newlines),
+          !output.isEmpty,
+          !agentTUIIsDiffLikeOutput(output)
+    else {
+        return nil
+    }
+
+    let command = agentTUICommandText(from: payload).map(agentTUIShellScript) ?? "tool"
+    var outputLines = output
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .map(String.init)
+        .map { truncateLine($0, maxLength: maxLineLength) }
+
+    if outputLines.count > maxLines {
+        let hidden = outputLines.count - maxLines
+        outputLines = ["[... \(hidden) lines truncated ...]"] + outputLines.suffix(maxLines)
+    }
+
+    return (["$ \(command)"] + outputLines).joined(separator: "\n")
+}
+
+func agentTUIToolOutputStyledLines(_ text: String, width: Int) -> [[AgentTUIStyledTextSpan]] {
+    let lines = text
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .map(String.init)
+
+    return lines.enumerated().flatMap { index, line -> [[AgentTUIStyledTextSpan]] in
+        if index == 0, line.hasPrefix("$ ") {
+            return wrapStyledSpans([
+                AgentTUIStyledTextSpan("$", tone: .success),
+                AgentTUIStyledTextSpan(" "),
+                AgentTUIStyledTextSpan(String(line.dropFirst(2)), isBold: true)
+            ], width: width)
+        }
+
+        return wrapStyledSpans([
+            AgentTUIStyledTextSpan(line, tone: .secondary)
+        ], width: width)
+    }
 }
 
 private struct MarkdownInlineState: Equatable {
@@ -290,21 +419,52 @@ private func parseMarkdownTable(lines: [String], startIndex: Int, width: Int) ->
     let normalizedRows = rows.map { row in
         row + Array(repeating: "", count: max(0, columnCount - row.count))
     }
-    let columnWidths = (0..<columnCount).map { column in
+    let naturalColumnWidths = (0..<columnCount).map { column in
         max(3, normalizedRows.map { plainInlineText($0[column]).count }.max() ?? 3)
     }
+    let columnWidths = constrainedTableColumnWidths(
+        naturalColumnWidths,
+        availableWidth: width,
+        separatorWidth: max(0, columnCount - 1) * 3
+    )
 
     var rendered: [[AgentTUIStyledTextSpan]] = []
-    rendered.append(renderTableRow(normalizedRows[0], columnWidths: columnWidths, header: true))
+    rendered.append(contentsOf: renderTableRow(normalizedRows[0], columnWidths: columnWidths, header: true))
     rendered.append([AgentTUIStyledTextSpan(tableDivider(columnWidths), tone: .secondary)])
     for row in normalizedRows.dropFirst() {
-        rendered.append(renderTableRow(row, columnWidths: columnWidths, header: false))
+        rendered.append(contentsOf: renderTableRow(row, columnWidths: columnWidths, header: false))
     }
 
     return MarkdownTableParseResult(
-        lines: rendered.flatMap { wrapStyledSpans($0, width: width) },
+        lines: rendered,
         nextIndex: index
     )
+}
+
+private func constrainedTableColumnWidths(
+    _ naturalWidths: [Int],
+    availableWidth: Int,
+    separatorWidth: Int
+) -> [Int] {
+    guard !naturalWidths.isEmpty else {
+        return []
+    }
+
+    let minimumWidth = 3
+    let availableCellWidth = max(
+        naturalWidths.count * minimumWidth,
+        availableWidth - separatorWidth
+    )
+    var widths = naturalWidths.map { max(minimumWidth, $0) }
+
+    while widths.reduce(0, +) > availableCellWidth {
+        guard let shrinkIndex = widths.indices.reversed().first(where: { widths[$0] > minimumWidth }) else {
+            break
+        }
+        widths[shrinkIndex] -= 1
+    }
+
+    return widths
 }
 
 private func parseTableRow(_ line: String) -> [String]? {
@@ -344,28 +504,45 @@ private func renderTableRow(
     _ row: [String],
     columnWidths: [Int],
     header: Bool
-) -> [AgentTUIStyledTextSpan] {
-    var spans: [AgentTUIStyledTextSpan] = []
-
-    for (column, cell) in row.enumerated() {
-        if column > 0 {
-            appendSpan(AgentTUIStyledTextSpan(" │ ", tone: .secondary), to: &spans)
-        }
-
-        let cellSpans = parseInlineMarkdown(cell)
-        for span in cellSpans {
-            var copy = span
-            copy.isBold = copy.isBold || header
-            appendSpan(copy, to: &spans)
-        }
-
-        let padding = columnWidths[column] - plainInlineText(cell).count
-        if padding > 0 {
-            appendSpan(AgentTUIStyledTextSpan(String(repeating: " ", count: padding)), to: &spans)
-        }
+) -> [[AgentTUIStyledTextSpan]] {
+    let cells = row.enumerated().map { column, cell in
+        wrapStyledSpans(tableCellSpans(cell, header: header), width: columnWidths[column])
     }
+    let rowHeight = cells.map(\.count).max() ?? 1
 
-    return spans
+    return (0..<rowHeight).map { rowIndex in
+        var spans: [AgentTUIStyledTextSpan] = []
+
+        for column in row.indices {
+            if column > 0 {
+                appendSpan(AgentTUIStyledTextSpan(" │ ", tone: .secondary), to: &spans)
+            }
+
+            let cellLine = rowIndex < cells[column].count
+                ? cells[column][rowIndex]
+                : [AgentTUIStyledTextSpan("")]
+            for span in cellLine {
+                appendSpan(span, to: &spans)
+            }
+
+            if column < row.count - 1 {
+                let padding = columnWidths[column] - agentTUIPlainText(cellLine).count
+                if padding > 0 {
+                    appendSpan(AgentTUIStyledTextSpan(String(repeating: " ", count: padding)), to: &spans)
+                }
+            }
+        }
+
+        return spans
+    }
+}
+
+private func tableCellSpans(_ cell: String, header: Bool) -> [AgentTUIStyledTextSpan] {
+    parseInlineMarkdown(cell).map { span in
+        var copy = span
+        copy.isBold = copy.isBold || header
+        return copy
+    }
 }
 
 private func tableDivider(_ widths: [Int]) -> String {
@@ -376,6 +553,61 @@ private func tableDivider(_ widths: [Int]) -> String {
 
 private func plainInlineText(_ markdown: String) -> String {
     agentTUIPlainText(parseInlineMarkdown(markdown))
+}
+
+private func agentTUICommandText(from payload: [String: JSONValue]) -> String? {
+    payload["command"]?.stringValue
+        ?? payload["cmd"]?.stringValue
+        ?? payload["script"]?.stringValue
+}
+
+private func agentTUIShellScript(_ command: String) -> String {
+    let prefixes = [
+        "/bin/zsh -lc ",
+        "/usr/bin/zsh -lc ",
+        "zsh -lc ",
+        "/bin/bash -lc ",
+        "/usr/bin/bash -lc ",
+        "bash -lc "
+    ]
+
+    for prefix in prefixes where command.hasPrefix(prefix) {
+        return unquoteShellArgument(String(command.dropFirst(prefix.count)))
+    }
+
+    return command
+}
+
+private func unquoteShellArgument(_ value: String) -> String {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.count >= 2,
+          let first = trimmed.first,
+          let last = trimmed.last,
+          (first == "'" && last == "'") || (first == "\"" && last == "\"")
+    else {
+        return trimmed
+    }
+
+    return String(trimmed.dropFirst().dropLast())
+}
+
+private func agentTUIIsDiffLikeOutput(_ output: String) -> Bool {
+    let lines = output.split(separator: "\n", omittingEmptySubsequences: false).prefix(12)
+    return lines.contains { line in
+        line.hasPrefix("diff --git")
+            || line.hasPrefix("@@")
+            || line.hasPrefix("+++ ")
+            || line.hasPrefix("--- ")
+    }
+}
+
+private func truncateLine(_ line: String, maxLength: Int) -> String {
+    guard maxLength > 0, line.count > maxLength else {
+        return line
+    }
+
+    let end = line.index(line.startIndex, offsetBy: max(0, maxLength - 1))
+    return String(line[..<end]) + "…"
 }
 
 private struct StyledToken {
