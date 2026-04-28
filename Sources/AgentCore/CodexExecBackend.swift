@@ -245,6 +245,15 @@ public enum CodexJSONLMapper {
                 threadID: object["thread_id"]?.stringValue,
                 event: AgentEvent(kind: .backendSessionUpdated, payload: object)
             )
+        case "item.started":
+            let item = object["item"]?.objectValue
+            if item?["type"]?.stringValue == "command_execution" {
+                return CodexJSONLLineMapping(event: AgentEvent(kind: .toolStarted, payload: [
+                    "command": item?["command"] ?? .null,
+                    "raw": .object(object)
+                ]))
+            }
+            return CodexJSONLLineMapping(event: AgentEvent(kind: .backendEvent, payload: object))
         case "item.completed":
             let item = object["item"]?.objectValue
             if item?["type"]?.stringValue == "agent_message",
@@ -256,6 +265,14 @@ public enum CodexJSONLMapper {
                         "raw": .object(object)
                     ])
                 )
+            }
+            if item?["type"]?.stringValue == "command_execution" {
+                return CodexJSONLLineMapping(event: AgentEvent(kind: .toolFinished, payload: [
+                    "command": item?["command"] ?? .null,
+                    "exitCode": item?["exit_code"] ?? .null,
+                    "output": item?["aggregated_output"] ?? .null,
+                    "raw": .object(object)
+                ]))
             }
             return CodexJSONLLineMapping(event: AgentEvent(kind: .backendEvent, payload: object))
         case "turn.completed", "turn.started":

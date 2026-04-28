@@ -12,11 +12,7 @@ struct TerminalRenderer {
     func header(task: TaskRecord, storeOptions: StoreOptions, repoURL: URL, snapshot: RepositorySnapshot) {
         let store = storeDescription(options: storeOptions, repoURL: repoURL, snapshot: snapshot)
         print("")
-        print(line(" agentctl ", fill: "="))
-        print("\(label("task"))  \(task.slug)")
-        print("\(label("repo"))  \(snapshot.rootPath ?? repoURL.path)")
-        print("\(label("backend"))  \(task.backendPreference.rawValue)")
-        print("\(label("store"))  \(store)")
+        print(line(" agentctl | task \(task.slug) | \(task.backendPreference.rawValue) | \(shortStore(store)) ", fill: "="))
         print(line("", fill: "-"))
         help()
     }
@@ -88,8 +84,10 @@ struct TerminalRenderer {
                     block(label: "codex", text: text, colorCode: "32")
                     return true
                 }
-            case .toolStarted, .toolFinished:
-                print(dim("\(event.kind.rawValue) \(shortPayload(event.payload))"))
+            case .toolStarted:
+                print("\(color("tool", code: "33"))  start  \(shortPayload(event.payload))")
+            case .toolFinished:
+                print("\(color("tool", code: "33"))  done   \(shortPayload(event.payload))")
             case .backendSessionUpdated:
                 if showRawEvents {
                     print(dim("\(event.kind.rawValue) \(shortPayload(event.payload))"))
@@ -157,6 +155,15 @@ struct TerminalRenderer {
     }
 
     private func shortPayload(_ payload: [String: JSONValue]) -> String {
+        if let command = payload["command"]?.stringValue {
+            let exitCode: String
+            if case let .int(value) = payload["exitCode"] {
+                exitCode = " exit \(value)"
+            } else {
+                exitCode = ""
+            }
+            return "\(command)\(exitCode)"
+        }
         if let type = payload["type"]?.stringValue {
             return type
         }
@@ -167,6 +174,16 @@ struct TerminalRenderer {
             return stderr.replacingOccurrences(of: "\n", with: " ")
         }
         return ""
+    }
+
+    private func shortStore(_ store: String) -> String {
+        if store.hasPrefix("postgres://") {
+            return "postgres"
+        }
+        if store.hasSuffix("/.agentctl") {
+            return "local"
+        }
+        return store
     }
 }
 

@@ -201,11 +201,17 @@ func codexJSONLMapperPreservesUnknownLinesAsBackendEvents() {
 func codexJSONLMapperMapsSingleLines() {
     let thread = CodexJSONLMapper.mapLine(#"{"type":"thread.started","thread_id":"thread-123"}"#)
     let message = CodexJSONLMapper.mapLine(#"{"type":"item.completed","item":{"type":"agent_message","text":"hello"}}"#)
+    let toolStarted = CodexJSONLMapper.mapLine(#"{"type":"item.started","item":{"type":"command_execution","command":"/bin/zsh -lc pwd","status":"in_progress"}}"#)
+    let toolFinished = CodexJSONLMapper.mapLine(#"{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc pwd","aggregated_output":"/tmp\n","exit_code":0,"status":"completed"}}"#)
 
     #expect(thread.threadID == "thread-123")
     #expect(thread.event.kind == .backendSessionUpdated)
     #expect(message.assistantText == "hello")
     #expect(message.event.kind == .assistantDone)
+    #expect(toolStarted.event.kind == .toolStarted)
+    #expect(toolStarted.event.payload["command"] == .string("/bin/zsh -lc pwd"))
+    #expect(toolFinished.event.kind == .toolFinished)
+    #expect(toolFinished.event.payload["exitCode"] == .int(0))
 }
 
 @Test
