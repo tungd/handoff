@@ -79,7 +79,7 @@ private struct AgentTUIPalette: Palette {
 
     let border = Color.rgb(183, 170, 143)
     let focusBackground = Color.rgb(28, 27, 24)
-    let cursorColor = Color.rgb(231, 190, 111)
+    let cursorColor = Color.default
 }
 
 private enum TUITranscriptRole: String, Sendable {
@@ -284,6 +284,7 @@ private struct TerminalSize {
 private struct AgentTUIView: View {
     private let model: AgentTUIModel
     @State private var input = ""
+    @State private var inputCursor = 0
 
     init() {
         guard let runtime = AgentTUIRuntimeBox.current else {
@@ -296,20 +297,20 @@ private struct AgentTUIView: View {
         let snapshot = model.snapshot()
         let _ = model.clearRenderCacheIfNeeded(for: snapshot.revision)
         let size = terminalSize()
-        let transcriptHeight = max(3, size.rows - 6)
+        let transcriptHeight = max(3, size.rows - 7)
         let lines = transcriptLines(snapshot.entries, width: max(40, size.columns - 4))
         let visibleLines = visibleLines(lines, height: transcriptHeight, scrollOffset: snapshot.scrollOffset)
 
         VStack(alignment: .leading, spacing: 0) {
             header(snapshot)
+            Divider()
             VStack(alignment: .leading, spacing: 0) {
                 ViewArray(visibleLines.map(transcriptLine))
             }
             .frame(height: transcriptHeight, alignment: .topLeading)
             Spacer(minLength: 0)
-            composer(snapshot, totalLines: lines.count, visibleHeight: transcriptHeight)
+            composer(snapshot, totalLines: lines.count, visibleHeight: transcriptHeight, terminalWidth: size.columns)
         }
-        .padding(.horizontal, 1)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .palette(AgentTUIPalette())
         .appearance(.line)
@@ -328,20 +329,39 @@ private struct AgentTUIView: View {
         }
     }
 
-    private func composer(_ snapshot: AgentTUISnapshot, totalLines: Int, visibleHeight: Int) -> some View {
+    private func composer(
+        _ snapshot: AgentTUISnapshot,
+        totalLines: Int,
+        visibleHeight: Int,
+        terminalWidth: Int
+    ) -> some View {
         Panel(modelLabel(snapshot), borderStyle: .line, borderColor: .palette.border, titleColor: .palette.accent) {
             VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 1) {
-                    Text(">").foregroundStyle(.palette.accent)
-                    TextField("", text: $input, prompt: Text(snapshot.isRunning ? "turn running..." : "message or /command"))
-                        .focusID("composer")
-                        .onSubmit {
-                            submitInput()
-                        }
-                }
+                inputLine(snapshot, width: max(20, terminalWidth - 4))
                 composerStatus(snapshot, totalLines: totalLines, visibleHeight: visibleHeight)
+                    .frame(width: max(20, terminalWidth - 4))
             }
         }
+    }
+
+    private func inputLine(_ snapshot: AgentTUISnapshot, width: Int) -> some View {
+        let visible = visibleInputParts(width: width)
+        let prompt = snapshot.isRunning ? "turn running..." : "message or /command"
+
+        return HStack(spacing: 0) {
+            Text("> ").foregroundStyle(.palette.accent)
+            if !visible.before.isEmpty {
+                Text(visible.before).foregroundStyle(.palette.foreground)
+            }
+            Text("█").foregroundStyle(.default)
+            if !visible.after.isEmpty {
+                Text(visible.after).foregroundStyle(.palette.foreground)
+            } else if input.isEmpty {
+                Text(prompt).foregroundStyle(.palette.foregroundTertiary)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(width: width)
     }
 
     private func composerStatus(_ snapshot: AgentTUISnapshot, totalLines: Int, visibleHeight: Int) -> some View {
@@ -435,6 +455,7 @@ private struct AgentTUIView: View {
     private func submitInput() {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         input = ""
+        inputCursor = 0
         guard !text.isEmpty else {
             return
         }
@@ -548,6 +569,39 @@ private struct AgentTUIView: View {
 
     private func handleKey(_ event: KeyEvent, pageSize: Int) -> Bool {
         switch event.key {
+        case .enter:
+            submitInput()
+            return true
+        case .escape:
+            Darwin.raise(SIGINT)
+            return true
+        case .backspace:
+            deleteInputBackward()
+            return true
+        case .delete:
+            deleteInputForward()
+            return true
+        case .left:
+            inputCursor = max(0, inputCursor - 1)
+            return true
+        case .right:
+            inputCursor = min(input.count, inputCursor + 1)
+            return true
+        case .home:
+            inputCursor = 0
+            return true
+        case .end:
+            inputCursor = input.count
+            return true
+        case .space where !event.ctrl && !event.alt:
+            insertInput(" ")
+            return true
+        case .paste(let text):
+            insertInput(text.replacingOccurrences(of: "\n", with: " "))
+            return true
+        case .character(let character) where !event.ctrl && !event.alt:
+            insertInput(String(character))
+            return true
         case .pageUp:
             model.adjustScroll(pageSize)
             return true
@@ -569,6 +623,49 @@ private struct AgentTUIView: View {
         default:
             return false
         }
+    }
+
+    private func insertInput(_ text: String) {
+        guard !text.isEmpty else {
+            return
+        }
+        let safeText = text.sanitizedForTerminal
+        let cursor = min(inputCursor, input.count)
+        let index = input.index(input.startIndex, offsetBy: cursor)
+        input.insert(contentsOf: safeText, at: index)
+        inputCursor = cursor + safeText.count
+    }
+
+    private func deleteInputBackward() {
+        guard inputCursor > 0 else {
+            return
+        }
+        let cursor = min(inputCursor, input.count)
+        let index = input.index(input.startIndex, offsetBy: cursor - 1)
+        input.remove(at: index)
+        inputCursor = cursor - 1
+    }
+
+    private func deleteInputForward() {
+        guard inputCursor < input.count else {
+            return
+        }
+        let cursor = min(inputCursor, input.count)
+        let index = input.index(input.startIndex, offsetBy: cursor)
+        input.remove(at: index)
+        inputCursor = cursor
+    }
+
+    private func visibleInputParts(width: Int) -> (before: String, after: String) {
+        let textWidth = max(1, width - 2)
+        let visibleTextCount = max(0, textWidth - 1)
+        let characters = Array(input)
+        let cursor = min(inputCursor, characters.count)
+        let start = max(0, min(cursor, characters.count) - visibleTextCount)
+        let end = min(characters.count, start + visibleTextCount)
+        let before = start < cursor ? String(characters[start..<cursor]) : ""
+        let after = cursor < end ? String(characters[cursor..<end]) : ""
+        return (before, after)
     }
 
     private func visibleLines(_ lines: [TUITranscriptLine], height: Int, scrollOffset: Int) -> [TUITranscriptLine] {
