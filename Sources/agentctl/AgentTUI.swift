@@ -43,10 +43,18 @@ func runTUIkitInteractiveLoop(
     )
 
     await MainActor.run {
+        setTerminalAlternateScrollMode(enabled: true)
+        defer { setTerminalAlternateScrollMode(enabled: false) }
         AgentTUIRuntimeBox.current = runtime
         AgentTUIApp.main()
         AgentTUIRuntimeBox.current = nil
     }
+}
+
+private func setTerminalAlternateScrollMode(enabled: Bool) {
+    // xterm alternate-scroll mode turns wheel events into Up/Down keys in alternate screen.
+    let sequence = enabled ? "\u{1B}[?1007h" : "\u{1B}[?1007l"
+    FileHandle.standardOutput.write(Data(sequence.utf8))
 }
 
 struct AgentTUIApp: App {
@@ -601,6 +609,12 @@ private struct AgentTUIView: View {
             return true
         case .character(let character) where !event.ctrl && !event.alt:
             insertInput(String(character))
+            return true
+        case .up:
+            model.adjustScroll(3)
+            return true
+        case .down:
+            model.adjustScroll(-3)
             return true
         case .pageUp:
             model.adjustScroll(pageSize)
