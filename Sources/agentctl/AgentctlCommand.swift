@@ -44,49 +44,59 @@ struct Agentctl: AsyncParsableCommand {
         abstract: "Task/session manager for coding-agent workflows.",
         discussion: "Run without a subcommand to start an interactive agent session.",
         subcommands: [
+            Interactive.self,
             Repo.self,
             Task.self,
+            Memory.self,
             DB.self,
-            Backend.self,
-            MCP.self
-        ]
+            Backend.self
+        ],
+        defaultSubcommand: Interactive.self
     )
 
-    @Option(name: .shortAndLong, help: "Directory to use as the current workspace.")
-    var cwd: String = "."
-
-    @OptionGroup
-    var storeOptions: StoreOptions
-
-    @Option(name: .customLong("task"), help: "Task id, id prefix, or slug to resume interactively.")
-    var taskIdentifier: String?
-
-    @Option(help: "Title for a newly created interactive task.")
-    var title: String?
-
-    @Option(help: "Preferred backend for a newly created interactive task.")
-    var backend: AgentBackend = .codex
-
-    @Flag(help: "Pass --full-auto to Codex.")
-    var fullAuto: Bool = false
-
-    @Option(help: "Codex sandbox mode.")
-    var sandbox: String?
-
-    @OptionGroup
-    var backendRunOptions: BackendRunOptions
-
-    mutating func run() async throws {
-        try await runInteractiveAgent(
-            cwd: cwd,
-            storeOptions: storeOptions,
-            taskIdentifier: taskIdentifier,
-            title: title,
-            backend: backend,
-            fullAuto: fullAuto,
-            sandbox: sandbox,
-            backendRunOptions: backendRunOptions
+    struct Interactive: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "interactive",
+            abstract: "Start an interactive agent session.",
+            shouldDisplay: false
         )
+
+        @Option(name: .shortAndLong, help: "Directory to use as the current workspace.")
+        var cwd: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        @Option(name: .customLong("task"), help: "Task id, id prefix, or slug to resume interactively.")
+        var taskIdentifier: String?
+
+        @Option(help: "Title for a newly created interactive task.")
+        var title: String?
+
+        @Option(help: "Preferred backend for a newly created interactive task.")
+        var backend: AgentBackend = .codex
+
+        @Flag(help: "Pass --full-auto to Codex.")
+        var fullAuto: Bool = false
+
+        @Option(help: "Codex sandbox mode.")
+        var sandbox: String?
+
+        @OptionGroup
+        var backendRunOptions: BackendRunOptions
+
+        mutating func run() async throws {
+            try await runInteractiveAgent(
+                cwd: cwd,
+                storeOptions: storeOptions,
+                taskIdentifier: taskIdentifier,
+                title: title,
+                backend: backend,
+                fullAuto: fullAuto,
+                sandbox: sandbox,
+                backendRunOptions: backendRunOptions
+            )
+        }
     }
 }
 
@@ -742,38 +752,303 @@ struct Backend: ParsableCommand {
     }
 }
 
-struct MCP: ParsableCommand {
+enum MemoryScopeArgument: String, ExpressibleByArgument {
+    case task
+    case repo
+    case globalPersonal = "global-personal"
+    case globalWork = "global-work"
+    case session
+    case machine
+
+    var kind: MemoryScopeKind {
+        switch self {
+        case .task:
+            return .task
+        case .repo:
+            return .repo
+        case .globalPersonal:
+            return .globalPersonal
+        case .globalWork:
+            return .globalWork
+        case .session:
+            return .session
+        case .machine:
+            return .machine
+        }
+    }
+}
+
+struct MemoryRecordOutput: Codable, Equatable {
+    var id: UUID
+    var title: String
+    var summary: String
+    var body: String
+    var scope: String
+    var tags: [String]
+    var score: Double?
+    var createdAt: Date
+    var updatedAt: Date
+    var archivedAt: Date?
+
+    init(memory: MemoryItem, score: Double? = nil) {
+        id = memory.id
+        title = memory.title
+        summary = memory.summary ?? ""
+        body = memory.body
+        scope = MemoryScopeArgument(scopeKind: memory.scopeKind).rawValue
+        tags = memory.tags
+        self.score = score
+        createdAt = memory.createdAt
+        updatedAt = memory.updatedAt
+        archivedAt = memory.archivedAt
+    }
+}
+
+extension MemoryScopeArgument {
+    init(scopeKind: MemoryScopeKind) {
+        switch scopeKind {
+        case .task:
+            self = .task
+        case .repo:
+            self = .repo
+        case .globalPersonal:
+            self = .globalPersonal
+        case .globalWork:
+            self = .globalWork
+        case .session:
+            self = .session
+        case .machine:
+            self = .machine
+        }
+    }
+}
+
+struct Memory: ParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "mcp",
-        abstract: "MCP server helpers.",
-        subcommands: [Memory.self]
+        commandName: "memory",
+        abstract: "Search and write agent memory.",
+        subcommands: [Search.self, Recent.self, Write.self, Archive.self]
     )
 
-    struct Memory: ParsableCommand {
+    struct Search: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
-            commandName: "memory",
-            abstract: "Describe the planned memory MCP tools."
+            commandName: "search",
+            abstract: "Search active agent memory."
         )
 
-        mutating func run() throws {
-            let tools = [
-                "memory.search(query, scope?, repo?, task?, limit?)",
-                "memory.get(id)",
-                "memory.write(kind, title, body, tags?, scope?)",
-                "memory.update(id, patch)",
-                "memory.archive(id)",
-                "memory.recent(repo?, task?)",
-                "context.current()",
-                "skill.search(query)",
-                "skill.get(id)"
-            ]
+        @Argument(help: "Search query.")
+        var query: String
 
-            print("Planned memory MCP tools")
-            for tool in tools {
-                print("  \(tool)")
+        @Option(help: "Maximum number of memories to return.")
+        var limit: Int = 10
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        mutating func run() async throws {
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let results = try await store.searchMemory(query, limit: limit)
+                    .map { MemoryRecordOutput(memory: $0.item, score: $0.score) }
+                try printJSON(results)
             }
         }
     }
+
+    struct Recent: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "recent",
+            abstract: "List recent active agent memory."
+        )
+
+        @Option(help: "Maximum number of memories to return.")
+        var limit: Int = 10
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        mutating func run() async throws {
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let memories = try await store.recentMemories(limit: limit)
+                    .map { MemoryRecordOutput(memory: $0) }
+                try printJSON(memories)
+            }
+        }
+    }
+
+    struct Write: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "write",
+            abstract: "Write an active memory item."
+        )
+
+        @Option(help: "Memory title.")
+        var title: String
+
+        @Option(help: "Memory body.")
+        var body: String
+
+        @Option(help: "Memory scope: task, repo, global-personal, global-work, session, or machine.")
+        var scope: MemoryScopeArgument = .repo
+
+        @Option(name: .customLong("tag"), help: "Memory tag. Repeat for multiple tags.")
+        var tags: [String] = []
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        mutating func run() async throws {
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+            let memory = makeMemoryItem(
+                title: title,
+                body: body,
+                scope: scope,
+                tags: tags,
+                repoURL: repoURL,
+                snapshot: snapshot
+            )
+
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let stored = try await store.writeMemory(memory)
+                try printJSON(MemoryRecordOutput(memory: stored))
+            }
+        }
+    }
+
+    struct Archive: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "archive",
+            abstract: "Archive an active memory item."
+        )
+
+        @Argument(help: "Memory id.")
+        var id: String
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        mutating func run() async throws {
+            guard let memoryID = UUID(uuidString: id) else {
+                throw RuntimeError("invalid memory id: \(id)")
+            }
+
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let memory = try await store.archiveMemory(id: memoryID)
+                try printJSON(MemoryRecordOutput(memory: memory))
+            }
+        }
+    }
+}
+
+func makeMemoryItem(
+    title: String,
+    body: String,
+    scope: MemoryScopeArgument,
+    tags: [String],
+    repoURL: URL,
+    snapshot: RepositorySnapshot
+) -> MemoryItem {
+    let now = Date()
+    let environment = ProcessInfo.processInfo.environment
+    let taskID = environmentUUID("AGENTCTL_TASK_ID", environment: environment)
+    let sessionID = environmentUUID("AGENTCTL_SESSION_ID", environment: environment)
+    let scopeID: UUID?
+
+    switch scope {
+    case .task:
+        scopeID = taskID
+    case .session:
+        scopeID = sessionID
+    case .repo, .globalPersonal, .globalWork, .machine:
+        scopeID = nil
+    }
+
+    var metadata: [String: JSONValue] = [
+        "reviewStatus": .string("unreviewed"),
+        "creationSurface": .string("agentctl.memory.write"),
+        "scope": .string(scope.rawValue),
+        "cwd": .string(repoURL.path)
+    ]
+
+    if let rootPath = snapshot.rootPath {
+        metadata["repoRoot"] = .string(rootPath)
+    }
+    if let originURL = snapshot.originURL {
+        metadata["repoOrigin"] = .string(originURL)
+    }
+    if let currentBranch = snapshot.currentBranch {
+        metadata["repoBranch"] = .string(currentBranch)
+    }
+    if let headSHA = snapshot.headSHA {
+        metadata["repoHead"] = .string(headSHA)
+    }
+    if let taskID {
+        metadata["taskID"] = .string(taskID.uuidString)
+    }
+    if let sessionID {
+        metadata["sessionID"] = .string(sessionID.uuidString)
+    }
+
+    return MemoryItem(
+        scopeKind: scope.kind,
+        scopeID: scopeID,
+        taskID: taskID,
+        title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+        body: body.trimmingCharacters(in: .whitespacesAndNewlines),
+        summary: nil,
+        tags: normalizedMemoryTags(tags),
+        status: .active,
+        createdBy: "agentctl",
+        createdAt: now,
+        updatedAt: now,
+        metadata: metadata
+    )
+}
+
+func normalizedMemoryTags(_ tags: [String]) -> [String] {
+    var seen = Set<String>()
+    var normalized: [String] = []
+    for tag in tags {
+        let value = tag.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            continue
+        }
+        let key = value.lowercased()
+        guard seen.insert(key).inserted else {
+            continue
+        }
+        normalized.append(value)
+    }
+    return normalized
+}
+
+func environmentUUID(_ key: String, environment: [String: String]) -> UUID? {
+    guard let value = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !value.isEmpty else {
+        return nil
+    }
+    return UUID(uuidString: value)
 }
 
 struct TaskPreview: Codable {

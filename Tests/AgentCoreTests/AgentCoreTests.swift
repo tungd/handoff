@@ -76,6 +76,62 @@ func schemaLoaderFindsInitialMigration() throws {
 }
 
 @Test
+func localMemoryWriteSearchRecentAndArchive() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("agentctl-memory-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let store: any AgentTaskStore = LocalTaskStore(root: root)
+    let first = MemoryItem(
+        scopeKind: .repo,
+        title: "Postgres memory search",
+        body: "Use websearch_to_tsquery for durable memory lookup.",
+        tags: ["database", "search"],
+        createdBy: "test",
+        createdAt: Date(timeIntervalSince1970: 1),
+        updatedAt: Date(timeIntervalSince1970: 1),
+        metadata: ["reviewStatus": .string("unreviewed")]
+    )
+    let second = MemoryItem(
+        scopeKind: .globalPersonal,
+        title: "Preferred test store",
+        body: "Use local storage in fast tests.",
+        tags: ["tests"],
+        createdBy: "test",
+        createdAt: Date(timeIntervalSince1970: 2),
+        updatedAt: Date(timeIntervalSince1970: 2)
+    )
+    let expired = MemoryItem(
+        scopeKind: .repo,
+        title: "Expired memory",
+        body: "This should not be visible.",
+        tags: ["search"],
+        createdBy: "test",
+        expiresAt: Date(timeIntervalSince1970: 0),
+        createdAt: Date(timeIntervalSince1970: 3),
+        updatedAt: Date(timeIntervalSince1970: 3)
+    )
+
+    try await store.writeMemory(first)
+    try await store.writeMemory(second)
+    try await store.writeMemory(expired)
+
+    let searchResults = try await store.searchMemory("websearch durable", limit: 10)
+    #expect(searchResults.map(\.item.id) == [first.id])
+    #expect(searchResults.first?.score ?? 0 > 0)
+
+    let recent = try await store.recentMemories(limit: 10)
+    #expect(recent.map(\.id) == [second.id, first.id])
+
+    let archived = try await store.archiveMemory(id: first.id)
+    #expect(archived.status == .archived)
+    #expect(archived.archivedAt != nil)
+
+    #expect(try await store.searchMemory("websearch", limit: 10).isEmpty)
+    #expect(try await store.recentMemories(limit: 10).map(\.id) == [second.id])
+}
+
+@Test
 func backendDescriptorsCaptureInitialBackendPriorities() {
     let codex = CodexBackendAdapter()
     let pi = PiBackendAdapter()

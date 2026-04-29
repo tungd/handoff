@@ -56,7 +56,7 @@
 
 - Store memory in Postgres.
 - Add full-text search.
-- Expose `agentctl mcp memory` for agent self-retrieval.
+- Expose top-level `agentctl memory` commands for agent self-retrieval.
 - Keep durable writes reviewable by default.
 
 ## Phase 6: PWA/API

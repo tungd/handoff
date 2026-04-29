@@ -33,8 +33,9 @@ Implemented and usable:
 Goal: make persistent project/task memory useful without turning it into hidden
 magic.
 
-- Implement first real memory commands beyond the placeholder:
-  `memory search`, `memory write`, `memory recent`, and `memory archive`.
+- Implement top-level memory commands for agent consumption:
+  `agentctl memory search`, `agentctl memory write`,
+  `agentctl memory recent`, and `agentctl memory archive`.
 - Store memory in Postgres first, with local fallback where practical.
 - Use Postgres full-text search before embeddings.
 - Add reviewable memory writes by default:
@@ -79,6 +80,10 @@ Goal: inspect and manage task state outside the terminal.
 - Better Pi support:
   keep the native RPC path, improve model display/status, and treat it as a
   worker backend for bounded polishing tasks.
+- Restate durable runtime exploration:
+  evaluate whether Restate can replace or shrink the transcript checkpoint layer
+  for long-running/resumable agent turns, and measure the operational footprint
+  before adding it to the runtime path.
 - Remote unattended runner mode.
 - Semantic memory search with embeddings after full-text search proves useful.
 

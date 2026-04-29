@@ -39,7 +39,7 @@ Postgres schema
 repo detection
 task/session/event model
 backend runtime boundary
-memory MCP boundary
+memory CLI boundary
 basic CLI commands
 ```
 
@@ -53,6 +53,7 @@ swift run agentctl task new "first task" --prompt "Reply briefly."
 swift run agentctl task send first-task "Continue."
 swift run agentctl task new "polish task" --backend pi --model openai/gpt-4o-mini --prompt "Tighten README wording."
 swift run agentctl task checkpoint first-task
+swift run agentctl memory recent
 swift run agentctl db schema
 ```
 

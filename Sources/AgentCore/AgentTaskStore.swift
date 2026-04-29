@@ -15,6 +15,13 @@ public protocol AgentTaskStore: Sendable {
     func saveArtifact(_ artifact: ArtifactRecord) async throws
     func listArtifacts(taskID: UUID?) async throws -> [ArtifactRecord]
 
+    @discardableResult
+    func writeMemory(_ memory: MemoryItem) async throws -> MemoryItem
+    func searchMemory(_ query: String, limit: Int) async throws -> [MemorySearchResult]
+    func recentMemories(limit: Int) async throws -> [MemoryItem]
+    @discardableResult
+    func archiveMemory(id: UUID) async throws -> MemoryItem
+
     func claimTask(
         taskID: UUID,
         checkpointID: UUID?,
@@ -94,6 +101,24 @@ extension LocalTaskStore: AgentTaskStore {
 
     public func listArtifacts(taskID: UUID?) async throws -> [ArtifactRecord] {
         try listArtifactsSync(taskID: taskID)
+    }
+
+    @discardableResult
+    public func writeMemory(_ memory: MemoryItem) async throws -> MemoryItem {
+        try writeMemorySync(memory)
+    }
+
+    public func searchMemory(_ query: String, limit: Int) async throws -> [MemorySearchResult] {
+        try searchMemorySync(query, limit: limit)
+    }
+
+    public func recentMemories(limit: Int) async throws -> [MemoryItem] {
+        try recentMemoriesSync(limit: limit)
+    }
+
+    @discardableResult
+    public func archiveMemory(id: UUID) async throws -> MemoryItem {
+        try archiveMemorySync(id: id)
     }
 
     public func claimTask(

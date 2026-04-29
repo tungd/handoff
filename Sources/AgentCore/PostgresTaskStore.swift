@@ -377,6 +377,185 @@ public struct PostgresTaskStore: AgentTaskStore {
         return artifacts
     }
 
+    @discardableResult
+    public func writeMemory(_ memory: MemoryItem) async throws -> MemoryItem {
+        let metadataJSON = try jsonString(memory.metadata)
+        try await drain(client.query("""
+            INSERT INTO memory_items (
+                id,
+                scope_kind,
+                scope_id,
+                repo_id,
+                task_id,
+                title,
+                body,
+                summary,
+                tags,
+                status,
+                created_by,
+                expires_at,
+                archived_at,
+                created_at,
+                updated_at,
+                metadata
+            )
+            VALUES (
+                \(memory.id),
+                \(memory.scopeKind.rawValue),
+                \(memory.scopeID),
+                \(memory.repoID),
+                \(memory.taskID),
+                \(memory.title),
+                \(memory.body),
+                \(memory.summary),
+                \(memory.tags),
+                \(memory.status.rawValue),
+                \(memory.createdBy),
+                \(memory.expiresAt),
+                \(memory.archivedAt),
+                \(memory.createdAt),
+                \(memory.updatedAt),
+                \(metadataJSON)::jsonb
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                scope_kind = EXCLUDED.scope_kind,
+                scope_id = EXCLUDED.scope_id,
+                repo_id = EXCLUDED.repo_id,
+                task_id = EXCLUDED.task_id,
+                title = EXCLUDED.title,
+                body = EXCLUDED.body,
+                summary = EXCLUDED.summary,
+                tags = EXCLUDED.tags,
+                status = EXCLUDED.status,
+                created_by = EXCLUDED.created_by,
+                expires_at = EXCLUDED.expires_at,
+                archived_at = EXCLUDED.archived_at,
+                updated_at = EXCLUDED.updated_at,
+                metadata = EXCLUDED.metadata
+            """))
+
+        return memory
+    }
+
+    public func searchMemory(_ query: String, limit: Int) async throws -> [MemorySearchResult] {
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard limit > 0, !trimmedQuery.isEmpty else {
+            return []
+        }
+
+        let boundedLimit = min(limit, 100)
+        let rows = try await client.query("""
+            WITH memory_query AS (
+                SELECT websearch_to_tsquery('english', \(trimmedQuery)) AS tsquery
+            )
+            SELECT
+                id,
+                scope_kind,
+                scope_id,
+                repo_id,
+                task_id,
+                title,
+                body,
+                summary,
+                to_json(tags)::text,
+                status,
+                created_by,
+                expires_at,
+                archived_at,
+                created_at,
+                updated_at,
+                metadata::text,
+                ts_rank(search_vector, memory_query.tsquery)::double precision AS score
+            FROM memory_items, memory_query
+            WHERE memory_query.tsquery @@ search_vector
+              AND status = 'active'
+              AND archived_at IS NULL
+              AND (expires_at IS NULL OR expires_at > now())
+            ORDER BY score DESC, created_at DESC
+            LIMIT \(boundedLimit)
+            """)
+
+        var results: [MemorySearchResult] = []
+        for row in try await decodeMemoryRows(rows, includeScore: true) {
+            results.append(MemorySearchResult(item: row.item, score: row.score ?? 0))
+        }
+        return results
+    }
+
+    public func recentMemories(limit: Int) async throws -> [MemoryItem] {
+        guard limit > 0 else {
+            return []
+        }
+
+        let boundedLimit = min(limit, 100)
+        let rows = try await client.query("""
+            SELECT
+                id,
+                scope_kind,
+                scope_id,
+                repo_id,
+                task_id,
+                title,
+                body,
+                summary,
+                to_json(tags)::text,
+                status,
+                created_by,
+                expires_at,
+                archived_at,
+                created_at,
+                updated_at,
+                metadata::text
+            FROM memory_items
+            WHERE status = 'active'
+              AND archived_at IS NULL
+              AND (expires_at IS NULL OR expires_at > now())
+            ORDER BY created_at DESC, updated_at DESC
+            LIMIT \(boundedLimit)
+            """)
+
+        var memories: [MemoryItem] = []
+        for row in try await decodeMemoryRows(rows, includeScore: false) {
+            memories.append(row.item)
+        }
+        return memories
+    }
+
+    @discardableResult
+    public func archiveMemory(id: UUID) async throws -> MemoryItem {
+        let now = Date()
+        let rows = try await client.query("""
+            UPDATE memory_items
+            SET status = 'archived',
+                archived_at = COALESCE(archived_at, \(now)),
+                updated_at = \(now)
+            WHERE id = \(id)
+            RETURNING
+                id,
+                scope_kind,
+                scope_id,
+                repo_id,
+                task_id,
+                title,
+                body,
+                summary,
+                to_json(tags)::text,
+                status,
+                created_by,
+                expires_at,
+                archived_at,
+                created_at,
+                updated_at,
+                metadata::text
+            """)
+
+        for row in try await decodeMemoryRows(rows, includeScore: false) {
+            return row.item
+        }
+
+        throw LocalTaskStoreError.memoryNotFound(id)
+    }
+
     public func claimTask(
         taskID: UUID,
         checkpointID: UUID?,
@@ -660,6 +839,175 @@ public struct PostgresTaskStore: AgentTaskStore {
             ))
         }
         return claims
+    }
+
+    private func decodeMemoryRows(
+        _ rows: PostgresRowSequence,
+        includeScore: Bool
+    ) async throws -> [(item: MemoryItem, score: Double?)] {
+        var memories: [(item: MemoryItem, score: Double?)] = []
+
+        if includeScore {
+            for try await (
+                id,
+                scopeKind,
+                scopeID,
+                repoID,
+                taskID,
+                title,
+                body,
+                summary,
+                tagsText,
+                status,
+                createdBy,
+                expiresAt,
+                archivedAt,
+                createdAt,
+                updatedAt,
+                metadataText,
+                score
+            ) in rows.decode((
+                UUID,
+                String,
+                UUID?,
+                UUID?,
+                UUID?,
+                String,
+                String,
+                String?,
+                String,
+                String,
+                String,
+                Date?,
+                Date?,
+                Date,
+                Date,
+                String,
+                Double
+            ).self) {
+                memories.append(try makeMemoryRow(
+                    id: id,
+                    scopeKind: scopeKind,
+                    scopeID: scopeID,
+                    repoID: repoID,
+                    taskID: taskID,
+                    title: title,
+                    body: body,
+                    summary: summary,
+                    tagsText: tagsText,
+                    status: status,
+                    createdBy: createdBy,
+                    expiresAt: expiresAt,
+                    archivedAt: archivedAt,
+                    createdAt: createdAt,
+                    updatedAt: updatedAt,
+                    metadataText: metadataText,
+                    score: score
+                ))
+            }
+        } else {
+            for try await (
+                id,
+                scopeKind,
+                scopeID,
+                repoID,
+                taskID,
+                title,
+                body,
+                summary,
+                tagsText,
+                status,
+                createdBy,
+                expiresAt,
+                archivedAt,
+                createdAt,
+                updatedAt,
+                metadataText
+            ) in rows.decode((
+                UUID,
+                String,
+                UUID?,
+                UUID?,
+                UUID?,
+                String,
+                String,
+                String?,
+                String,
+                String,
+                String,
+                Date?,
+                Date?,
+                Date,
+                Date,
+                String
+            ).self) {
+                memories.append(try makeMemoryRow(
+                    id: id,
+                    scopeKind: scopeKind,
+                    scopeID: scopeID,
+                    repoID: repoID,
+                    taskID: taskID,
+                    title: title,
+                    body: body,
+                    summary: summary,
+                    tagsText: tagsText,
+                    status: status,
+                    createdBy: createdBy,
+                    expiresAt: expiresAt,
+                    archivedAt: archivedAt,
+                    createdAt: createdAt,
+                    updatedAt: updatedAt,
+                    metadataText: metadataText,
+                    score: nil
+                ))
+            }
+        }
+
+        return memories
+    }
+
+    private func makeMemoryRow(
+        id: UUID,
+        scopeKind: String,
+        scopeID: UUID?,
+        repoID: UUID?,
+        taskID: UUID?,
+        title: String,
+        body: String,
+        summary: String?,
+        tagsText: String,
+        status: String,
+        createdBy: String,
+        expiresAt: Date?,
+        archivedAt: Date?,
+        createdAt: Date,
+        updatedAt: Date,
+        metadataText: String,
+        score: Double?
+    ) throws -> (item: MemoryItem, score: Double?) {
+        let tags = try decoder.decode([String].self, from: Data(tagsText.utf8))
+        let metadata = try decoder.decode([String: JSONValue].self, from: Data(metadataText.utf8))
+        return (
+            item: MemoryItem(
+                id: id,
+                scopeKind: MemoryScopeKind(rawValue: scopeKind) ?? .repo,
+                scopeID: scopeID,
+                repoID: repoID,
+                taskID: taskID,
+                title: title,
+                body: body,
+                summary: summary,
+                tags: tags,
+                status: MemoryStatus(rawValue: status) ?? .active,
+                createdBy: createdBy,
+                expiresAt: expiresAt,
+                archivedAt: archivedAt,
+                createdAt: createdAt,
+                updatedAt: updatedAt,
+                metadata: metadata
+            ),
+            score: score
+        )
     }
 
     private func ensureTaskClaimsSchema() async throws {
