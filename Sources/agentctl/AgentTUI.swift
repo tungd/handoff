@@ -513,9 +513,9 @@ private final class AgentTUIModel: @unchecked Sendable {
                 case .toolFinished:
                     finishToolCall(event.payload, to: &state)
                 case .userMessage:
-                    if let text = event.payload["text"]?.stringValue {
-                        append(.user, text, to: &state)
-                    }
+                    // Skip - user message already added in startTurn() for immediate feedback.
+                    // History hydration (tuiEntries) loads this from persisted events.
+                    break
                 case .backendSessionUpdated, .backendEvent:
                     if state.showRawEvents {
                         append(.system, "\(event.kind.rawValue) \(compactPayload(event.payload))", to: &state)
