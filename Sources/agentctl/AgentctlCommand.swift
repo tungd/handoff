@@ -1351,6 +1351,7 @@ func runAgentTurn(
     fullAuto: Bool,
     sandbox: String?,
     backendRunOptions: BackendRunOptions,
+    images: [PiRPCImage] = [],
     showStatus: Bool = true,
     interruptHandle: AgentInterruptHandle? = nil,
     onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void = { _ in }
@@ -1377,6 +1378,7 @@ func runAgentTurn(
             tools: backendRunOptions.tools,
             noTools: backendRunOptions.noTools
         ),
+        images: images,
         interruptHandle: interruptHandle,
         onUpdate: onUpdate
     )

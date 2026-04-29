@@ -1,5 +1,17 @@
 import Foundation
 
+/// Image content for sending to Pi backend via RPC.
+public struct PiRPCImage: Codable, Equatable, Sendable {
+    public var type: String = "image"
+    public var data: String  // base64-encoded
+    public var mimeType: String
+
+    public init(data: String, mimeType: String) {
+        self.data = data
+        self.mimeType = mimeType
+    }
+}
+
 public struct PiRPCOptions: Codable, Equatable, Sendable {
     public var provider: String?
     public var model: String?
@@ -83,6 +95,7 @@ public struct PiRPCBackend: Sendable {
         cwd: URL,
         sessionPath: URL,
         options: PiRPCOptions = PiRPCOptions(),
+        images: [PiRPCImage] = [],
         interruptHandle: AgentInterruptHandle? = nil,
         onUpdate: (PiRPCStreamUpdate) async throws -> Void
     ) async throws -> PiRPCResult {
@@ -99,11 +112,19 @@ public struct PiRPCBackend: Sendable {
 
         let promptID = "prompt-\(UUID().uuidString)"
         let statsID = "stats-\(UUID().uuidString)"
-        try process.sendLine(Self.encodeCommand([
+        
+        // Build prompt command with optional images
+        var promptCommand: [String: Any] = [
             "id": promptID,
             "type": "prompt",
             "message": prompt
-        ]))
+        ]
+        if !images.isEmpty {
+            promptCommand["images"] = images.map { img -> [String: String] in
+                ["type": "image", "data": img.data, "mimeType": img.mimeType]
+            }
+        }
+        try process.sendLine(Self.encodeCommand(promptCommand))
 
         interruptHandle?.setAction {
             do {

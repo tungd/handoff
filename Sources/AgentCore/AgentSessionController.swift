@@ -44,6 +44,7 @@ public struct AgentSessionController: Sendable {
         snapshot: RepositorySnapshot,
         codexOptions: CodexExecOptions = CodexExecOptions(),
         piOptions: PiRPCOptions = PiRPCOptions(),
+        images: [PiRPCImage] = [],
         interruptHandle: AgentInterruptHandle? = nil,
         onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void = { _ in }
     ) async throws -> TaskRunSummary {
@@ -65,6 +66,7 @@ public struct AgentSessionController: Sendable {
                 repoURL: repoURL,
                 snapshot: snapshot,
                 options: piOptions,
+                images: images,
                 interruptHandle: interruptHandle,
                 onUpdate: onUpdate
             )
@@ -164,6 +166,7 @@ public struct AgentSessionController: Sendable {
         repoURL: URL,
         snapshot: RepositorySnapshot,
         options: PiRPCOptions = PiRPCOptions(),
+        images: [PiRPCImage] = [],
         interruptHandle: AgentInterruptHandle? = nil,
         onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void = { _ in }
     ) async throws -> TaskRunSummary {
@@ -192,15 +195,21 @@ public struct AgentSessionController: Sendable {
             "sessionPath": .string(sessionPath.path)
         ]), onUpdate: onUpdate)
 
-        try await appendAndEmit(AgentEvent(taskID: task.id, sessionID: session.id, kind: .userMessage, payload: [
-            "text": .string(prompt)
-        ]), onUpdate: onUpdate)
+        // Include images in userMessage payload if present
+        var userMessagePayload: [String: JSONValue] = ["text": .string(prompt)]
+        if !images.isEmpty {
+            userMessagePayload["images"] = .array(images.map { img in
+                .object(["type": .string("image"), "data": .string(img.data), "mimeType": .string(img.mimeType)])
+            })
+        }
+        try await appendAndEmit(AgentEvent(taskID: task.id, sessionID: session.id, kind: .userMessage, payload: userMessagePayload), onUpdate: onUpdate)
 
         let result = try await piBackend.run(
             prompt: prompt,
             cwd: cwd,
             sessionPath: sessionPath,
             options: options,
+            images: images,
             interruptHandle: interruptHandle
         ) { update in
             switch update {

@@ -3,6 +3,82 @@ import Darwin
 import Foundation
 import TUIkit
 
+// MARK: - File Drop Support
+
+/// Represents a file dropped onto the terminal (iTerm2/Ghostty OSC 1337 protocol).
+private struct AgentTUIDroppedFile: Sendable, Equatable {
+    var name: String
+    var mimeType: String
+    var base64Data: String
+    var size: Int
+
+    /// Detects if paste content is actually a dropped file from OSC 1337.
+    static func parse(fromPaste text: String) -> AgentTUIDroppedFile? {
+        // OSC 1337 File format embedded in paste:
+        // ESC ] 1337 ; File=name=<base64>;size=<bytes>:[<base64content>] BEL
+        // We encode this as a JSON object for detection: {"_osc1337": {...}}
+        guard text.hasPrefix("{_osc1337:"), text.hasSuffix("}") else {
+            return nil
+        }
+        let inner = text.dropFirst(10).dropLast(1)
+        guard let data = String(inner).data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        guard let name = json["name"] as? String,
+              let base64Data = json["data"] as? String else {
+            return nil
+        }
+        let mimeType = json["mimeType"] as? String ?? mimeTypeForFilename(name)
+        let size = json["size"] as? Int ?? 0
+        return AgentTUIDroppedFile(name: name, mimeType: mimeType, base64Data: base64Data, size: size)
+    }
+
+    static func mimeTypeForFilename(_ name: String) -> String {
+        let ext = (name as NSString).pathExtension.lowercased()
+        switch ext {
+        case "png": return "image/png"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "gif": return "image/gif"
+        case "webp": return "image/webp"
+        case "svg": return "image/svg+xml"
+        case "pdf": return "application/pdf"
+        case "txt", "md": return "text/plain"
+        case "json": return "application/json"
+        case "swift": return "text/x-swift"
+        case "py": return "text/x-python"
+        case "js", "ts": return "text/javascript"
+        default: return "application/octet-stream"
+        }
+    }
+}
+
+/// Wrapper for KeyEvent that can include file drop information.
+private struct AgentTUIInputEvent: Sendable, Equatable {
+    var keyEvent: KeyEvent
+    var droppedFile: AgentTUIDroppedFile?
+
+    init(keyEvent: KeyEvent, droppedFile: AgentTUIDroppedFile? = nil) {
+        self.keyEvent = keyEvent
+        self.droppedFile = droppedFile
+    }
+
+    /// Check if this is a dropped file event.
+    var isFileDrop: Bool {
+        droppedFile != nil
+    }
+
+    /// Parse from KeyEvent, detecting if paste contains OSC 1337 file data.
+    static func from(keyEvent: KeyEvent) -> AgentTUIInputEvent {
+        if case .paste(let text) = keyEvent.key {
+            if let file = AgentTUIDroppedFile.parse(fromPaste: text) {
+                return AgentTUIInputEvent(keyEvent: keyEvent, droppedFile: file)
+            }
+        }
+        return AgentTUIInputEvent(keyEvent: keyEvent)
+    }
+}
+
 private let agentTUITranscriptEventLimit = 80
 private let agentTUIHydratedUserTextLimit = 2_000
 private let agentTUIHydratedAssistantTextLimit = 8_000
@@ -553,6 +629,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
     private var composerLineCount = 0
     private let exitLock = NSLock()
     private var shouldExitStorage = false
+    private var pendingImages: [AgentTUIDroppedFile] = []  // Images waiting to be sent with prompt
 
     private var shouldExit: Bool {
         get {
@@ -729,6 +806,19 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             isUnderlined: false,
             palette: palette
         ))
+        // Show pending images indicator
+        if !pendingImages.isEmpty {
+            let imageNames = pendingImages.map { $0.name }.joined(separator: ", ")
+            let countText = pendingImages.count == 1 ? "1 image" : "\(pendingImages.count) images"
+            lines.append(agentTUIANSIStyled(
+                "  🎎 \(countText) attached: \(imageNames)  [Esc to clear]",
+                color: .palette.accent,
+                isBold: false,
+                isItalic: false,
+                isUnderlined: false,
+                palette: palette
+            ))
+        }
         for row in rows {
             lines.append(inputRow(row, palette: palette))
         }
@@ -823,12 +913,14 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
 
     private func submitInput() {
         let text = input.trimmingCharacters(in: .newlines)
+        let images = pendingImages
         input = ""
         inputCursor = 0
         promptHistoryIndex = nil
         promptHistoryDraft = ""
+        pendingImages = []
         requestRender()
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !images.isEmpty else {
             return
         }
 
@@ -844,11 +936,11 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
                 enqueue(.prompt(prompt))
                 return
             }
-            startPromptTurn(prompt)
+            startPromptTurn(prompt, images: images)
         }
     }
 
-    private func startPromptTurn(_ text: String) {
+    private func startPromptTurn(_ text: String, images: [AgentTUIDroppedFile] = []) {
         guard let turn = model.startTurn(prompt: text) else {
             enqueue(.prompt(text), atFront: true, announce: false)
             return
@@ -862,6 +954,8 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
 
         let model = model
         let interruptHandle = AgentInterruptHandle()
+        // Convert dropped files to PiRPCImage format
+        let rpcImages = images.map { PiRPCImage(data: $0.base64Data, mimeType: $0.mimeType) }
         let operation = _Concurrency.Task.detached {
             defer {
                 model.clearRunningOperation()
@@ -883,6 +977,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
                     fullAuto: runtime.fullAuto,
                     sandbox: runtime.sandbox,
                     backendRunOptions: runtime.backendRunOptions,
+                    images: rpcImages,
                     showStatus: false,
                     interruptHandle: interruptHandle
                 ) { update in
@@ -1203,6 +1298,15 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
     }
 
     private func handleKey(_ event: KeyEvent) -> Bool {
+        // Check for file drop (OSC 1337)
+        let inputEvent = AgentTUIInputEvent.from(keyEvent: event)
+        if let file = inputEvent.droppedFile {
+            // Add to pending images
+            pendingImages.append(file)
+            requestRender()
+            return true
+        }
+
         switch event.key {
         case .enter where event.shift || event.alt:
             insertInput("\n")
@@ -1211,6 +1315,12 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             submitInput()
             return true
         case .escape:
+            // Clear pending images on escape
+            if !pendingImages.isEmpty {
+                pendingImages = []
+                requestRender()
+                return true
+            }
             if model.interruptRunningOperation() {
                 return true
             }
@@ -1641,11 +1751,128 @@ private final class AgentTUINativeTerminal: @unchecked Sendable {
             return nil
         }
 
+        // Bracketed paste start: ESC [ 200 ~
         if bytes == [0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E] {
             return KeyEvent(key: .paste(readBracketedPasteContent()))
         }
 
+        // OSC sequence (ESC ]): Check for iTerm2/Ghostty file drop
+        // Format: ESC ] 1337 ; File=name=<base64>;size=<bytes>:[<base64content>] BEL
+        if bytes.count >= 2 && bytes[0] == 0x1B && bytes[1] == 0x5D {
+            return parseOSCSequence(bytes)
+        }
+
         return KeyEvent.parse(bytes)
+    }
+
+    /// Parse OSC sequence for iTerm2/Ghostty file drop support.
+    private func parseOSCSequence(_ initialBytes: [UInt8]) -> KeyEvent? {
+        // OSC format: ESC ] <command> ; <params> BEL (or ESC \ for ST terminator)
+        // We've already read ESC ], now read until BEL (0x07) or ST (ESC \)
+        var content: [UInt8] = []
+        var prevByte: UInt8 = 0
+        let maxOSCBytes = 1024 * 1024  // 1MB max for file drops
+
+        while content.count < maxOSCBytes {
+            var byte = [UInt8](repeating: 0, count: 1)
+            let bytesRead = read(STDIN_FILENO, &byte, 1)
+            guard bytesRead > 0 else {
+                usleep(1_000)
+                continue
+            }
+
+            // BEL (0x07) terminates OSC
+            if byte[0] == 0x07 {
+                break
+            }
+
+            // ST (ESC \) terminates OSC
+            if prevByte == 0x1B && byte[0] == 0x5C {
+                content.removeLast()  // Remove the ESC
+                break
+            }
+
+            content.append(byte[0])
+            prevByte = byte[0]
+        }
+
+        // Parse OSC content
+        let oscString = String(bytes: content, encoding: .utf8) ?? ""
+
+        // Check for iTerm2 file drop: "1337;File=..."
+        if oscString.hasPrefix("1337;File=") {
+            return parseOSC1337File(oscString)
+        }
+
+        // Unknown OSC - return as paste with raw content
+        return KeyEvent(key: .paste(oscString))
+    }
+
+    /// Parse iTerm2 OSC 1337 File sequence.
+    /// Format: 1337;File=name=<base64name>;size=<bytes>:[<base64content>]
+    private func parseOSC1337File(_ oscContent: String) -> KeyEvent? {
+        // Remove "1337;File=" prefix
+        let params = oscContent.dropFirst(10)
+
+        // Parse parameters: name=...;size=...:content
+        var name: String?
+        var size: Int?
+        var base64Content: String?
+
+        // Split by ':' to separate params from content
+        let colonIndex = params.firstIndex(of: ":") ?? params.endIndex
+        let paramPart = params[..<colonIndex]
+        let contentPart = colonIndex < params.endIndex ? params[params.index(after: colonIndex)...] : ""
+
+        // Parse semicolon-separated parameters
+        for param in paramPart.split(separator: ";") {
+            let keyValue = param.split(separator: "=", maxSplits: 1)
+            if keyValue.count == 2 {
+                let key = String(keyValue[0])
+                let value = String(keyValue[1])
+                switch key {
+                case "name":
+                    // name is base64-encoded
+                    if let decodedData = Data(base64Encoded: value),
+                       let decodedName = String(data: decodedData, encoding: .utf8) {
+                        name = decodedName
+                    } else {
+                        name = value  // Fall back to raw value
+                    }
+                case "size":
+                    size = Int(value)
+                case "type":
+                    // MIME type provided directly
+                    // We'll use filename inference instead for simplicity
+                    break
+                default:
+                    break
+                }
+            }
+        }
+
+        // Content is after the colon
+        base64Content = String(contentPart)
+
+        guard let finalName = name, let finalData = base64Content, !finalData.isEmpty else {
+            return nil
+        }
+
+        // Encode as JSON for AgentTUIDroppedFile to parse
+        let mimeType = AgentTUIDroppedFile.mimeTypeForFilename(finalName)
+        let jsonPayload: [String: Any] = [
+            "name": finalName,
+            "mimeType": mimeType,
+            "data": finalData,
+            "size": size ?? 0
+        ]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: jsonPayload),
+              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            return nil
+        }
+
+        // Wrap in special marker for detection
+        return KeyEvent(key: .paste("{_osc1337:" + jsonString + "}"))
     }
 
     private func readBytes(maxBytes: Int = 8) -> [UInt8] {
@@ -1684,6 +1911,7 @@ private final class AgentTUINativeTerminal: @unchecked Sendable {
                 result.append(nextByte[0])
             }
         }
+        // Note: OSC (ESC ]) is handled separately in readKeyEvent()
 
         return result
     }
