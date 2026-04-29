@@ -78,7 +78,7 @@ func agentTUIMarkdownStyledLines(_ markdown: String, width: Int) -> [[AgentTUISt
 func agentTUIQuoteStyledLines(_ markdown: String, width: Int) -> [[AgentTUIStyledTextSpan]] {
     agentTUIMarkdownStyledLines(markdown, width: max(1, width - 2)).map { line in
         let text = agentTUIPlainText(line)
-        let quoted = text.isEmpty ? "│" : "│ \(text)"
+        let quoted = text.isEmpty ? "┃" : "┃ \(text)"
         return [AgentTUIStyledTextSpan(quoted, isItalic: true, tone: .quote, preservesLayout: true)]
     }
 }

@@ -128,9 +128,9 @@ private struct AgentTUIPalette: Palette {
     let foregroundQuaternary = Color.rgb(67, 64, 59)
 
     let accent = Color.rgb(214, 171, 93)
-    let success = Color.rgb(232, 226, 214)
+    let success = Color.rgb(134, 198, 134)  // Green for task success (✓)
     let warning = Color.rgb(201, 157, 74)
-    let error = Color.rgb(211, 109, 95)
+    let error = Color.rgb(219, 88, 88)       // Red for task failure (×)
     let info = Color.rgb(149, 168, 174)
 
     let border = Color.rgb(183, 170, 143)
