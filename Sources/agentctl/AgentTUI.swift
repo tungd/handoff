@@ -159,7 +159,6 @@ private struct AgentTUISnapshot: Sendable {
     var entries: [TUITranscriptEntry]
     var status: String
     var tokenUsage: TUITokenUsage?
-    var scrollOffset: Int
     var showRawEvents: Bool
     var isRunning: Bool
     var isTaskPersisted: Bool
@@ -191,10 +190,17 @@ private struct CodexModelMetadata: Sendable, Equatable {
     var contextWindowTokens: Int64?
 }
 
+private struct AgentTUIRunningOperation: Sendable {
+    var task: _Concurrency.Task<Void, Never>
+    var interruptHandle: AgentInterruptHandle?
+    var cancelTaskOnInterrupt: Bool
+}
+
 private final class AgentTUIModel: @unchecked Sendable {
     private let lock = NSLock()
     private var state: AgentTUISnapshot
     private var cacheClearedRevision = 0
+    private var runningOperation: AgentTUIRunningOperation?
 
     init(task: TaskRecord, isTaskPersisted: Bool = true, entries: [TUITranscriptEntry]) {
         state = AgentTUISnapshot(
@@ -202,7 +208,6 @@ private final class AgentTUIModel: @unchecked Sendable {
             entries: entries,
             status: "ready",
             tokenUsage: nil,
-            scrollOffset: 0,
             showRawEvents: false,
             isRunning: false,
             isTaskPersisted: isTaskPersisted,
@@ -284,6 +289,14 @@ private final class AgentTUIModel: @unchecked Sendable {
         }
     }
 
+    func interruptOperation() {
+        update { state in
+            state.status = "interrupted"
+            state.isRunning = false
+            append(.system, "Interrupted.", to: &state)
+        }
+    }
+
     func setStatus(_ status: String) {
         update { state in
             state.status = status
@@ -296,6 +309,57 @@ private final class AgentTUIModel: @unchecked Sendable {
             state.isRunning = false
             append(.error, agentctlErrorMessage(error), to: &state)
         }
+    }
+
+    func setRunningOperation(
+        _ operation: _Concurrency.Task<Void, Never>,
+        interruptHandle: AgentInterruptHandle? = nil,
+        cancelTaskOnInterrupt: Bool = true
+    ) {
+        lock.withLock {
+            if state.isRunning {
+                runningOperation = AgentTUIRunningOperation(
+                    task: operation,
+                    interruptHandle: interruptHandle,
+                    cancelTaskOnInterrupt: cancelTaskOnInterrupt
+                )
+            }
+        }
+    }
+
+    func clearRunningOperation() {
+        let interruptHandle = lock.withLock { () -> AgentInterruptHandle? in
+            let interruptHandle = runningOperation?.interruptHandle
+            runningOperation = nil
+            return interruptHandle
+        }
+        interruptHandle?.clearAction()
+    }
+
+    func interruptRunningOperation() -> Bool {
+        guard let operation = lock.withLock({ state.isRunning ? runningOperation : nil }) else {
+            return false
+        }
+
+        let accepted: Bool
+        if let interruptHandle = operation.interruptHandle {
+            accepted = interruptHandle.requestInterrupt()
+        } else if operation.cancelTaskOnInterrupt {
+            operation.task.cancel()
+            accepted = true
+        } else {
+            accepted = false
+        }
+
+        update { state in
+            if accepted, state.status != "interrupting..." {
+                state.status = "interrupting..."
+                append(.system, "Interrupt requested.", to: &state)
+            } else if !accepted {
+                append(.error, "Current operation does not expose an interrupt channel.", to: &state)
+            }
+        }
+        return accepted
     }
 
     func toggleRawEvents() -> Bool {
@@ -320,15 +384,8 @@ private final class AgentTUIModel: @unchecked Sendable {
             state.task = task
             state.isTaskPersisted = isTaskPersisted
             state.entries = entries
-            state.scrollOffset = 0
             append(.system, message, to: &state)
             state.status = "ready"
-        }
-    }
-
-    func adjustScroll(_ delta: Int, maxOffset: Int) {
-        update { state in
-            state.scrollOffset = min(max(0, state.scrollOffset + delta), max(0, maxOffset))
         }
     }
 
@@ -390,7 +447,6 @@ private final class AgentTUIModel: @unchecked Sendable {
             style: resolvedStyle,
             toolKey: toolKey
         ))
-        state.scrollOffset = 0
     }
 
     private func appendToolCall(
@@ -471,15 +527,12 @@ private struct AgentTUIView: View {
             maxRows: maxInputRows
         ).count
         let composerHeight = 6 + inputRows
-        let transcriptHeight = max(3, size.rows - 2 - composerHeight)
+        let transcriptHeight = max(3, size.rows - composerHeight)
         let lines = transcriptLines(snapshot.entries, width: max(40, size.columns - 4))
-        let maxScrollOffset = max(0, lines.count - transcriptHeight)
-        let scrollOffset = clampedScrollOffset(snapshot.scrollOffset, maxOffset: maxScrollOffset)
-        let visibleLines = visibleLines(lines, height: transcriptHeight, scrollOffset: scrollOffset)
+        // Show the most recent lines that fit in the transcript area
+        let visibleLines = lines.count <= transcriptHeight ? lines : Array(lines.dropFirst(lines.count - transcriptHeight))
 
         VStack(alignment: .leading, spacing: 0) {
-            header(snapshot)
-            dividerLine(label: nil, width: max(20, size.columns))
             VStack(alignment: .leading, spacing: 0) {
                 ViewArray(visibleLines.map(transcriptLine))
             }
@@ -495,18 +548,9 @@ private struct AgentTUIView: View {
         .palette(AgentTUIPalette())
         .appearance(.line)
         .onKeyPress { event in
-            handleKey(event, pageSize: transcriptHeight, maxScrollOffset: maxScrollOffset)
+            handleKey(event)
         }
         .agentStatusBarConfiguration()
-    }
-
-    private func header(_ snapshot: AgentTUISnapshot) -> some View {
-        HStack(spacing: 1) {
-            Text("agentctl").foregroundStyle(.palette.accent)
-            Text(snapshot.task.slug).foregroundStyle(.palette.foregroundTertiary)
-            Spacer()
-            Text(storeName).foregroundStyle(.palette.foregroundTertiary)
-        }
     }
 
     private func composer(
@@ -608,7 +652,7 @@ private struct AgentTUIView: View {
             return "Command failed."
         }
         if snapshot.isRunning {
-            return "Working..."
+            return snapshot.status == "ready" ? "Working..." : snapshot.status
         }
         return snapshot.status
     }
@@ -702,9 +746,14 @@ private struct AgentTUIView: View {
         }
 
         let model = model
-        _Concurrency.Task.detached {
+        let interruptHandle = AgentInterruptHandle()
+        let operation = _Concurrency.Task.detached {
+            defer {
+                model.clearRunningOperation()
+            }
             do {
                 let currentTask = turn.task
+                try _Concurrency.Task.checkCancellation()
                 if !turn.isTaskPersisted {
                     try await persistInteractiveTask(currentTask, store: runtime.store)
                     model.markTaskPersisted(currentTask)
@@ -719,16 +768,26 @@ private struct AgentTUIView: View {
                     fullAuto: runtime.fullAuto,
                     sandbox: runtime.sandbox,
                     backendRunOptions: runtime.backendRunOptions,
-                    showStatus: false
+                    showStatus: false,
+                    interruptHandle: interruptHandle
                 ) { update in
                     model.render(update)
                 }
+                try _Concurrency.Task.checkCancellation()
                 _ = try await refreshResumeClaimIfActive(task: currentTask, store: runtime.store)
+                try _Concurrency.Task.checkCancellation()
                 model.finishTurn()
+            } catch is CancellationError {
+                model.interruptOperation()
             } catch {
-                model.failTurn(error)
+                if _Concurrency.Task.isCancelled {
+                    model.interruptOperation()
+                } else {
+                    model.failTurn(error)
+                }
             }
         }
+        model.setRunningOperation(operation, interruptHandle: interruptHandle, cancelTaskOnInterrupt: false)
     }
 
     private func handle(_ command: SlashCommand) {
@@ -947,17 +1006,29 @@ private struct AgentTUIView: View {
             return
         }
         let model = model
-        _Concurrency.Task.detached {
+        let runningOperation = _Concurrency.Task.detached {
+            defer {
+                model.clearRunningOperation()
+            }
             do {
+                try _Concurrency.Task.checkCancellation()
                 try await operation()
+                try _Concurrency.Task.checkCancellation()
                 model.finishCommand()
+            } catch is CancellationError {
+                model.interruptOperation()
             } catch {
-                model.commandFailed(error)
+                if _Concurrency.Task.isCancelled {
+                    model.interruptOperation()
+                } else {
+                    model.commandFailed(error)
+                }
             }
         }
+        model.setRunningOperation(runningOperation)
     }
 
-    private func handleKey(_ event: KeyEvent, pageSize: Int, maxScrollOffset: Int) -> Bool {
+    private func handleKey(_ event: KeyEvent) -> Bool {
         switch event.key {
         case .enter where event.shift || event.alt:
             insertInput("\n")
@@ -966,6 +1037,9 @@ private struct AgentTUIView: View {
             submitInput()
             return true
         case .escape:
+            if model.interruptRunningOperation() {
+                return true
+            }
             releaseClaimThenExit()
             return true
         case .character("c") where event.ctrl:
@@ -1024,30 +1098,6 @@ private struct AgentTUIView: View {
             return true
         case .character(let character) where !event.ctrl && !event.alt:
             insertInput(String(character))
-            return true
-        case .up where event.ctrl:
-            model.adjustScroll(1, maxOffset: maxScrollOffset)
-            return true
-        case .down where event.ctrl:
-            model.adjustScroll(-1, maxOffset: maxScrollOffset)
-            return true
-        case .up:
-            model.adjustScroll(3, maxOffset: maxScrollOffset)
-            return true
-        case .down:
-            model.adjustScroll(-3, maxOffset: maxScrollOffset)
-            return true
-        case .pageUp:
-            model.adjustScroll(pageSize, maxOffset: maxScrollOffset)
-            return true
-        case .pageDown:
-            model.adjustScroll(-pageSize, maxOffset: maxScrollOffset)
-            return true
-        case .character("u") where event.ctrl:
-            model.adjustScroll(pageSize, maxOffset: maxScrollOffset)
-            return true
-        case .character("d") where event.ctrl:
-            model.adjustScroll(-pageSize, maxOffset: maxScrollOffset)
             return true
         default:
             return false
@@ -1209,20 +1259,6 @@ private struct AgentTUIView: View {
     private func resetPromptHistorySelectionForEdit() {
         promptHistoryIndex = nil
         promptHistoryDraft = ""
-    }
-
-    private func visibleLines(_ lines: [TUITranscriptLine], height: Int, scrollOffset: Int) -> [TUITranscriptLine] {
-        guard lines.count > height else {
-            return lines
-        }
-        let maxOffset = max(0, lines.count - height)
-        let offset = clampedScrollOffset(scrollOffset, maxOffset: maxOffset)
-        let start = max(0, lines.count - height - offset)
-        return Array(lines.dropFirst(start).prefix(height))
-    }
-
-    private func clampedScrollOffset(_ scrollOffset: Int, maxOffset: Int) -> Int {
-        min(max(0, scrollOffset), max(0, maxOffset))
     }
 }
 

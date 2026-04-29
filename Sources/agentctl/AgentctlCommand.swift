@@ -800,7 +800,7 @@ func runInteractiveAgent(
     let snapshot = try RepositoryInspector().inspect(path: repoURL)
 
     try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
-        var activeSnapshot = snapshot
+        let activeSnapshot = snapshot
         let taskResolution = try await resolveInitialInteractiveTask(
             identifier: taskIdentifier,
             title: title,
@@ -809,210 +809,21 @@ func runInteractiveAgent(
             repoURL: repoURL,
             store: store
         )
-        var task = taskResolution.task
-        var taskPersisted = taskResolution.isPersisted
+        let task = taskResolution.task
+        let taskPersisted = taskResolution.isPersisted
 
-        if TerminalCapability.isInteractive {
-            try await runTUIkitInteractiveLoop(
-                task: task,
-                taskPersisted: taskPersisted,
-                storeOptions: storeOptions,
-                repoURL: repoURL,
-                snapshot: activeSnapshot,
-                store: store,
-                defaultBackend: backend,
-                fullAuto: fullAuto,
-                sandbox: sandbox,
-                backendRunOptions: backendRunOptions
-            )
-            return
-        }
-
-        let renderer = TerminalRenderer()
-        var showRawEvents = false
-
-        renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
-
-        interactiveLoop: while true {
-            renderer.prompt(task: task)
-            guard let line = readLine() else {
-                writeStdout("\n")
-                break interactiveLoop
-            }
-
-            let input = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !input.isEmpty else {
-                continue
-            }
-
-            if let command = SlashCommand(input) {
-                switch command.name {
-                case "exit", "quit":
-                    if taskPersisted {
-                        _ = try? await releaseResumeClaim(task: task, store: store)
-                    }
-                    break interactiveLoop
-                case "help":
-                    renderer.help()
-                case "info", "task", "repo":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    let summary = try await store.summary(for: task)
-                    renderer.info(task: task, summary: summary, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
-                case "tasks":
-                    renderer.tasks(try await store.listTasks())
-                case "events":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    renderer.events(try await store.events(for: task.id))
-                case "checkpoints":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    printCheckpoints(try await store.listCheckpoints(taskID: task.id))
-                case "artifacts":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    printArtifacts(try await store.listArtifacts(taskID: task.id))
-                case "continue":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    let result = try await exportContinuationMarkdown(
-                        task: task,
-                        store: store,
-                        repoURL: repoURL,
-                        snapshot: activeSnapshot,
-                        destination: command.argument
-                    )
-                    renderer.status("Continuation bundle written to \(result.url.path).")
-                case "release":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    let result = try await releaseResumeClaim(task: task, store: store)
-                    renderer.status(result.released ? "Claim released." : "No active claim for this machine.")
-                case "export":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    let result = try await exportTranscriptMarkdown(
-                        task: task,
-                        store: store,
-                        repoURL: repoURL,
-                        snapshot: activeSnapshot,
-                        destination: command.argument
-                    )
-                    renderer.status("Exported \(result.eventCount) events to \(result.url.path).")
-                case "checkpoint":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    let options = try checkpointSlashOptions(command.argument)
-                    let result = try await createAndPersistCheckpoint(
-                        task: task,
-                        store: store,
-                        snapshot: activeSnapshot,
-                        repoURL: repoURL,
-                        options: options,
-                        onStatus: { status in renderer.status(status) }
-                    )
-                    activeSnapshot = try RepositoryInspector().inspect(path: repoURL)
-                    printCheckpointResult(result)
-                case "raw":
-                    showRawEvents.toggle()
-                    renderer.status(showRawEvents ? "Raw event rendering enabled." : "Raw event rendering disabled.")
-                case "new":
-                    task = try await resolveInteractiveTask(
-                        identifier: nil,
-                        title: command.argument?.isEmpty == false ? command.argument : nil,
-                        backend: backend,
-                        snapshot: activeSnapshot,
-                        repoURL: repoURL,
-                        store: store
-                    )
-                    taskPersisted = true
-                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
-                case "resume":
-                    let resume = try resumeSlashOptions(command.argument)
-                    guard !resume.taskIdentifier.isEmpty else {
-                        renderer.error("usage: /resume <task> [--checkpoint <id|latest>] [--force]")
-                        continue
-                    }
-                    task = try await store.findTask(resume.taskIdentifier)
-                    let handoff = try await prepareResumeHandoff(
-                        task: task,
-                        store: store,
-                        repoURL: repoURL,
-                        snapshot: activeSnapshot,
-                        checkpointSelector: resume.checkpointSelector,
-                        forceClaim: resume.forceClaim
-                    )
-                    if handoff.restore != nil {
-                        activeSnapshot = try RepositoryInspector().inspect(path: repoURL)
-                    }
-                    taskPersisted = true
-                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
-                    if let restore = handoff.restore {
-                        renderer.status(checkpointRestoreStatus(restore))
-                    } else {
-                        renderer.status(taskClaimStatus(handoff.claim))
-                    }
-                default:
-                    renderer.error("unknown command: /\(command.name)")
-                    renderer.help()
-                }
-                continue
-            }
-
-            do {
-                if !taskPersisted {
-                    try await persistInteractiveTask(task, store: store)
-                    taskPersisted = true
-                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
-                }
-                renderer.status("running \(task.backendPreference.rawValue) turn...")
-                _ = try await refreshResumeClaimIfActive(task: task, store: store)
-                let assistantRendered = SendableFlag()
-                let renderRawEvents = showRawEvents
-                let summary = try await runAgentTurn(
-                    task: task,
-                    prompt: input,
-                    repoURL: repoURL,
-                    snapshot: activeSnapshot,
-                    store: store,
-                    fullAuto: fullAuto,
-                    sandbox: sandbox,
-                    backendRunOptions: backendRunOptions,
-                    showStatus: false
-                ) { update in
-                    if renderer.render(update: update, showRawEvents: renderRawEvents) {
-                        assistantRendered.value = true
-                    }
-                }
-                if !assistantRendered.value {
-                    printRunSummary(summary)
-                }
-                _ = try await refreshResumeClaimIfActive(task: task, store: store)
-            } catch {
-                renderer.error("turn failed: \(agentctlErrorMessage(error))")
-            }
-        }
-
-        if taskPersisted {
-            _ = try? await releaseResumeClaim(task: task, store: store)
-        }
+        try await runTUIkitInteractiveLoop(
+            task: task,
+            taskPersisted: taskPersisted,
+            storeOptions: storeOptions,
+            repoURL: repoURL,
+            snapshot: activeSnapshot,
+            store: store,
+            defaultBackend: backend,
+            fullAuto: fullAuto,
+            sandbox: sandbox,
+            backendRunOptions: backendRunOptions
+        )
     }
 }
 
@@ -1518,6 +1329,7 @@ func runAgentTurn(
     sandbox: String?,
     backendRunOptions: BackendRunOptions,
     showStatus: Bool = true,
+    interruptHandle: AgentInterruptHandle? = nil,
     onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void = { _ in }
 ) async throws -> TaskRunSummary {
     if showStatus {
@@ -1542,6 +1354,7 @@ func runAgentTurn(
             tools: backendRunOptions.tools,
             noTools: backendRunOptions.noTools
         ),
+        interruptHandle: interruptHandle,
         onUpdate: onUpdate
     )
 }
