@@ -749,9 +749,10 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
     }
 
     private func renderComposerOnly() {
-        // Move cursor to composer start and redraw (overwrites old content)
-        moveCursorToComposerStart()
+        // Hide cursor during redraw, drawComposer uses absolute positioning
+        terminal.write("\u{1B}[?25l")
         drawComposer(snapshot: model.snapshot())
+        terminal.write("\u{1B}[?25h")
     }
 
     private func moveCursorToComposerStart() {
@@ -1376,27 +1377,27 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             return true
         case .left:
             inputCursor = max(0, inputCursor - 1)
-            requestRender()
+            renderComposerOnly()
             return true
         case .right:
             inputCursor = min(input.count, inputCursor + 1)
-            requestRender()
+            renderComposerOnly()
             return true
         case .up:
             inputCursor = agentTUIMoveCursorUp(lines: agentTUIInputLines(input), cursor: inputCursor)
-            requestRender()
+            renderComposerOnly()
             return true
         case .down:
             inputCursor = agentTUIMoveCursorDown(lines: agentTUIInputLines(input), cursor: inputCursor)
-            requestRender()
+            renderComposerOnly()
             return true
         case .home:
             inputCursor = 0
-            requestRender()
+            renderComposerOnly()
             return true
         case .end:
             inputCursor = input.count
-            requestRender()
+            renderComposerOnly()
             return true
         case .space where !event.ctrl && !event.alt:
             insertInput(" ")
@@ -1422,7 +1423,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         input.insert(contentsOf: safeText, at: index)
         inputCursor = cursor + safeText.count
         resetPromptHistorySelectionForEdit()
-        requestRender()
+        renderComposerOnly()  // Only redraw composer, not full transcript
     }
 
     private func deleteInputBackward() {
@@ -1434,7 +1435,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         input.remove(at: index)
         inputCursor = cursor - 1
         resetPromptHistorySelectionForEdit()
-        requestRender()
+        renderComposerOnly()
     }
 
     private func deleteInputForward() {
@@ -1446,7 +1447,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         input.remove(at: index)
         inputCursor = cursor
         resetPromptHistorySelectionForEdit()
-        requestRender()
+        renderComposerOnly()
     }
 
     private func moveInputCursorBackward() {
@@ -1463,14 +1464,14 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         let lines = agentTUIInputLines(input)
         let index = agentTUIInputLineIndex(lines: lines, cursor: inputCursor)
         inputCursor = lines[index].start
-        requestRender()
+        renderComposerOnly()
     }
 
     private func moveToEndOfInputLine() {
         let lines = agentTUIInputLines(input)
         let index = agentTUIInputLineIndex(lines: lines, cursor: inputCursor)
         inputCursor = lines[index].end
-        requestRender()
+        renderComposerOnly()
     }
 
     private func moveInputLineOrHistory(delta: Int) {
@@ -1489,7 +1490,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         let column = max(0, inputCursor - lines[lineIndex].start)
         let target = lines[targetIndex]
         inputCursor = target.start + min(column, target.end - target.start)
-        requestRender()
+        renderComposerOnly()
     }
 
     private func killInputWordBackward() {
@@ -1515,7 +1516,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         input = String(edited)
         inputCursor = start
         resetPromptHistorySelectionForEdit()
-        requestRender()
+        renderComposerOnly()
     }
 
     private func killInputLineForward() {
@@ -1526,7 +1527,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         input = result.input
         inputCursor = result.cursor
         resetPromptHistorySelectionForEdit()
-        requestRender()
+        renderComposerOnly()
     }
 
     private func appendPromptHistory(_ prompt: String) {
@@ -1563,7 +1564,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             input = promptHistoryDraft
             inputCursor = input.count
             promptHistoryDraft = ""
-            requestRender()
+            renderComposerOnly()
         }
     }
 
@@ -1573,7 +1574,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         }
         input = promptHistory[index]
         inputCursor = input.count
-        requestRender()
+        renderComposerOnly()
     }
 
     private func resetPromptHistorySelectionForEdit() {
