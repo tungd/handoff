@@ -28,12 +28,20 @@ private struct AgentTUIRuntime: @unchecked Sendable {
     var backendRunOptions: BackendRunOptions
 }
 
-@MainActor
 private enum AgentTUIRuntimeBox {
-    static var current: AgentTUIRuntime?
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var storage: AgentTUIRuntime?
+
+    static var current: AgentTUIRuntime? {
+        get {
+            lock.withLock { storage }
+        }
+        set {
+            lock.withLock { storage = newValue }
+        }
+    }
 }
 
-@MainActor
 private func updateAgentTUIRuntimeSnapshot(_ snapshot: RepositorySnapshot) {
     guard var runtime = AgentTUIRuntimeBox.current else {
         return
@@ -42,7 +50,6 @@ private func updateAgentTUIRuntimeSnapshot(_ snapshot: RepositorySnapshot) {
     AgentTUIRuntimeBox.current = runtime
 }
 
-@MainActor
 private func updateAgentTUIRuntimeTask(_ task: TaskRecord) {
     guard var runtime = AgentTUIRuntimeBox.current else {
         return
@@ -955,7 +962,7 @@ private struct AgentTUIView: View {
                     onStatus: { status in model.setStatus(status) }
                 )
                 let updatedSnapshot = try RepositoryInspector().inspect(path: runtime.repoURL)
-                await updateAgentTUIRuntimeSnapshot(updatedSnapshot)
+                updateAgentTUIRuntimeSnapshot(updatedSnapshot)
                 model.append(.system, checkpointCreatedStatus(result))
                 model.setStatus("ready")
             }
@@ -969,7 +976,7 @@ private struct AgentTUIView: View {
                     repoURL: runtime.repoURL,
                     store: runtime.store
                 )
-                await updateAgentTUIRuntimeTask(newTask)
+                updateAgentTUIRuntimeTask(newTask)
                 model.setTask(newTask, entries: [], message: "Created task \(newTask.slug).")
             }
         case "resume":
@@ -996,12 +1003,13 @@ private struct AgentTUIView: View {
                     onStatus: { status in model.setStatus(status) }
                 )
                 if handoff.restore != nil {
+                    model.setStatus("inspecting restored repo...")
                     let updatedSnapshot = try RepositoryInspector().inspect(path: runtime.repoURL)
-                    await updateAgentTUIRuntimeSnapshot(updatedSnapshot)
+                    updateAgentTUIRuntimeSnapshot(updatedSnapshot)
                 }
                 model.setStatus("loading recent transcript...")
                 let loadedEntries = try await tuiEntries(for: resumedTask.id, store: runtime.store)
-                await updateAgentTUIRuntimeTask(resumedTask)
+                updateAgentTUIRuntimeTask(resumedTask)
                 var message = "Resumed task \(resumedTask.slug)."
                 if let restore = handoff.restore {
                     message += "\n\(tuiCheckpointRestoreDetails(restore, claim: handoff.claim))"
