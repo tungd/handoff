@@ -1527,7 +1527,8 @@ func checkpointRestorePayload(_ result: GitCheckpointRestoreResult, claim: TaskC
         "remote": .string(result.checkpoint.remoteName),
         "fetched": .bool(result.fetched),
         "switched": .bool(result.switched),
-        "fastForwarded": .bool(result.fastForwarded)
+        "fastForwarded": .bool(result.fastForwarded),
+        "advancedBeyondCheckpoint": .bool(result.advancedBeyondCheckpoint)
     ]
 
     if let commitSHA = result.checkpoint.commitSHA {
@@ -1583,11 +1584,15 @@ func printCheckpointRestoreResult(_ result: GitCheckpointRestoreResult) {
     print("  commit: \(result.headSHA ?? result.checkpoint.commitSHA ?? "-")")
     print("  remote: \(result.fetched ? result.checkpoint.remoteName : "-")")
     print("  files:  \(checkpointChangedFileCount(result.checkpoint))")
+    if result.advancedBeyondCheckpoint {
+        print("  note:   branch is ahead of the checkpoint commit")
+    }
 }
 
 func checkpointRestoreStatus(_ result: GitCheckpointRestoreResult) -> String {
     let commit = shortCommit(result.headSHA ?? result.checkpoint.commitSHA)
-    return "Restored checkpoint \(result.checkpoint.branch) @ \(commit) (\(checkpointChangedFileCount(result.checkpoint)) files)."
+    let advanced = result.advancedBeyondCheckpoint ? ", branch ahead of checkpoint" : ""
+    return "Restored checkpoint \(result.checkpoint.branch) @ \(commit)\(advanced) (\(checkpointChangedFileCount(result.checkpoint)) files)."
 }
 
 func taskClaimStatus(_ claim: TaskClaimRecord) -> String {

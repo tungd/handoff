@@ -3,6 +3,8 @@ import Darwin
 import Foundation
 import TUIkit
 
+private let agentTUITranscriptEventLimit = 500
+
 private struct AgentTUIRuntime: @unchecked Sendable {
     var task: TaskRecord
     var storeOptions: StoreOptions
@@ -1481,7 +1483,11 @@ private extension View {
     }
 }
 
-private func tuiEntries(for taskID: UUID, store: any AgentTaskStore) async throws -> [TUITranscriptEntry] {
+private func tuiEntries(
+    for taskID: UUID,
+    store: any AgentTaskStore,
+    eventLimit: Int = agentTUITranscriptEventLimit
+) async throws -> [TUITranscriptEntry] {
     var entries: [TUITranscriptEntry] = []
 
     func append(
@@ -1498,7 +1504,7 @@ private func tuiEntries(for taskID: UUID, store: any AgentTaskStore) async throw
         ))
     }
 
-    for event in try await store.events(for: taskID) {
+    for event in try await store.recentEvents(for: taskID, limit: eventLimit) {
         switch event.kind {
         case .userMessage:
             if let text = event.payload["text"]?.stringValue {
@@ -1627,13 +1633,17 @@ private func tuiCheckpointRestoreDetails(
     _ restore: GitCheckpointRestoreResult,
     claim: TaskClaimRecord
 ) -> String {
-    [
+    var lines = [
         checkpointRestoreStatus(restore),
         "checkpoint: \(restore.checkpoint.id.uuidString)",
         "branch: \(restore.checkpoint.branch)",
         "commit: \(restore.headSHA ?? restore.checkpoint.commitSHA ?? "-")",
         "claim: \(claim.ownerName) until \(ISO8601DateFormatter().string(from: claim.expiresAt))"
-    ].joined(separator: "\n")
+    ]
+    if restore.advancedBeyondCheckpoint, let checkpointCommit = restore.checkpoint.commitSHA {
+        lines.insert("checkpoint commit: \(checkpointCommit)", at: 4)
+    }
+    return lines.joined(separator: "\n")
 }
 
 private func transcriptLines(_ entries: [TUITranscriptEntry], width: Int) -> [TUITranscriptLine] {

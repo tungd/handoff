@@ -24,7 +24,7 @@ public enum GitCheckpointError: Error, CustomStringConvertible, Sendable {
                 ? "checkpoint branch \(branch) diverged from \(remote)/\(branch); resolve it manually before resume"
                 : "checkpoint branch \(branch) diverged from \(remote)/\(branch): \(detail)"
         case let .checkpointCommitMismatch(expected, actual):
-            return "checkpoint restore ended at \(actual), expected \(expected)"
+            return "checkpoint restore ended at \(actual), which does not contain expected checkpoint \(expected)"
         case let .gitFailed(arguments, stderr):
             let command = (["git"] + arguments).joined(separator: " ")
             let detail = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -185,19 +185,22 @@ public struct GitCheckpointRestoreResult: Codable, Sendable, Equatable {
     public var switched: Bool
     public var fastForwarded: Bool
     public var headSHA: String?
+    public var advancedBeyondCheckpoint: Bool
 
     public init(
         checkpoint: CheckpointRecord,
         fetched: Bool,
         switched: Bool,
         fastForwarded: Bool,
-        headSHA: String?
+        headSHA: String?,
+        advancedBeyondCheckpoint: Bool = false
     ) {
         self.checkpoint = checkpoint
         self.fetched = fetched
         self.switched = switched
         self.fastForwarded = fastForwarded
         self.headSHA = headSHA
+        self.advancedBeyondCheckpoint = advancedBeyondCheckpoint
     }
 }
 
@@ -396,16 +399,19 @@ public struct GitCheckpointManager: Sendable {
         let head = try requiredOutput(["rev-parse", "HEAD"], workingDirectory: rootURL)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if let expected = checkpoint.commitSHA, !expected.isEmpty, head != expected {
-            throw GitCheckpointError.checkpointCommitMismatch(expected: expected, actual: head)
-        }
+        let advancedBeyondCheckpoint = try validateRestoredHead(
+            expected: checkpoint.commitSHA,
+            actual: head,
+            workingDirectory: rootURL
+        )
 
         return GitCheckpointRestoreResult(
             checkpoint: checkpoint,
             fetched: shouldFetch,
             switched: true,
             fastForwarded: shouldFetch,
-            headSHA: head.isEmpty ? nil : head
+            headSHA: head.isEmpty ? nil : head,
+            advancedBeyondCheckpoint: advancedBeyondCheckpoint
         )
     }
 
@@ -481,6 +487,23 @@ public struct GitCheckpointManager: Sendable {
         }
 
         throw GitCheckpointError.checkpointUnavailable(branch: branch, remote: nil, stderr: switched.stderr)
+    }
+
+    private func validateRestoredHead(
+        expected: String?,
+        actual: String,
+        workingDirectory: URL
+    ) throws -> Bool {
+        guard let expected, !expected.isEmpty, !actual.isEmpty, actual != expected else {
+            return false
+        }
+
+        let ancestor = try git.run(["merge-base", "--is-ancestor", expected, actual], workingDirectory: workingDirectory)
+        guard ancestor.succeeded else {
+            throw GitCheckpointError.checkpointCommitMismatch(expected: expected, actual: actual)
+        }
+
+        return true
     }
 
     private func requiredOutput(_ arguments: [String], workingDirectory: URL) throws -> String {

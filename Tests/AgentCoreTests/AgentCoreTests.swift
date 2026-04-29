@@ -702,6 +702,64 @@ func gitCheckpointManagerRestoresLocalCheckpointWithoutFetching() throws {
     #expect(result.fetched == false)
     #expect(result.fastForwarded == false)
     #expect(result.headSHA == "abc1234")
+    #expect(result.advancedBeyondCheckpoint == false)
+}
+
+@Test
+func gitCheckpointManagerAcceptsRestoredBranchAheadOfCheckpoint() throws {
+    let root = URL(fileURLWithPath: "/tmp/repo", isDirectory: true)
+    let checkpoint = CheckpointRecord(
+        taskID: UUID(),
+        branch: "agent/local",
+        commitSHA: "base123"
+    )
+    let manager = GitCheckpointManager(git: GitRunner(runner: FakeProcessRunner(responses: [
+        gitKey("status", "--porcelain=v1", "--", ".", ":!.agentctl"): ok(""),
+        gitKey("switch", "agent/local"): ok(""),
+        gitKey("rev-parse", "HEAD"): ok("child456\n"),
+        gitKey("merge-base", "--is-ancestor", "base123", "child456"): ok("")
+    ])))
+
+    let result = try manager.restoreCheckpoint(
+        checkpoint,
+        snapshot: RepositorySnapshot(isGitRepository: true, rootPath: root.path),
+        repoURL: root
+    )
+
+    #expect(result.headSHA == "child456")
+    #expect(result.advancedBeyondCheckpoint)
+}
+
+@Test
+func gitCheckpointManagerRejectsRestoredBranchMissingCheckpointCommit() throws {
+    let root = URL(fileURLWithPath: "/tmp/repo", isDirectory: true)
+    let checkpoint = CheckpointRecord(
+        taskID: UUID(),
+        branch: "agent/local",
+        commitSHA: "base123"
+    )
+    let manager = GitCheckpointManager(git: GitRunner(runner: FakeProcessRunner(responses: [
+        gitKey("status", "--porcelain=v1", "--", ".", ":!.agentctl"): ok(""),
+        gitKey("switch", "agent/local"): ok(""),
+        gitKey("rev-parse", "HEAD"): ok("other789\n"),
+        gitKey("merge-base", "--is-ancestor", "base123", "other789"): ProcessResult(
+            exitCode: 1,
+            stdout: "",
+            stderr: ""
+        )
+    ])))
+
+    do {
+        _ = try manager.restoreCheckpoint(
+            checkpoint,
+            snapshot: RepositorySnapshot(isGitRepository: true, rootPath: root.path),
+            repoURL: root
+        )
+        Issue.record("expected restore to reject a branch missing the checkpoint commit")
+    } catch let GitCheckpointError.checkpointCommitMismatch(expected, actual) {
+        #expect(expected == "base123")
+        #expect(actual == "other789")
+    }
 }
 
 @Test
