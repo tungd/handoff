@@ -145,6 +145,40 @@ public struct GitCheckpointResult: Codable, Sendable, Equatable {
     }
 }
 
+public struct GitCheckpointGitState: Sendable, Equatable {
+    public var branch: String
+    public var head: String
+    public var dirtyStatus: String
+    public var committed: Bool
+    public var pushed: Bool
+    public var pushedAt: Date?
+    public var changedFiles: [String]
+    public var generatedFiles: [String]
+    public var commandOutputs: [HandoffCommandOutput]
+
+    public init(
+        branch: String,
+        head: String,
+        dirtyStatus: String,
+        committed: Bool,
+        pushed: Bool,
+        pushedAt: Date?,
+        changedFiles: [String],
+        generatedFiles: [String],
+        commandOutputs: [HandoffCommandOutput]
+    ) {
+        self.branch = branch
+        self.head = head
+        self.dirtyStatus = dirtyStatus
+        self.committed = committed
+        self.pushed = pushed
+        self.pushedAt = pushedAt
+        self.changedFiles = changedFiles
+        self.generatedFiles = generatedFiles
+        self.commandOutputs = commandOutputs
+    }
+}
+
 public struct GitCheckpointRestoreResult: Codable, Sendable, Equatable {
     public var checkpoint: CheckpointRecord
     public var fetched: Bool
@@ -179,8 +213,32 @@ public struct GitCheckpointManager: Sendable {
         snapshot: RepositorySnapshot,
         repoURL: URL,
         options: GitCheckpointOptions = GitCheckpointOptions(),
-        manifestContext: HandoffManifest = HandoffManifest()
+        manifestContext: HandoffManifest = HandoffManifest(),
+        onProgress: (@Sendable (String) -> Void)? = nil
     ) throws -> GitCheckpointResult {
+        let gitState = try createGitCheckpoint(
+            task: task,
+            snapshot: snapshot,
+            repoURL: repoURL,
+            options: options,
+            onProgress: onProgress
+        )
+
+        return Self.makeCheckpointResult(
+            task: task,
+            options: options,
+            gitState: gitState,
+            manifestContext: manifestContext
+        )
+    }
+
+    public func createGitCheckpoint(
+        task: TaskRecord,
+        snapshot: RepositorySnapshot,
+        repoURL: URL,
+        options: GitCheckpointOptions = GitCheckpointOptions(),
+        onProgress: (@Sendable (String) -> Void)? = nil
+    ) throws -> GitCheckpointGitState {
         guard snapshot.isGitRepository else {
             throw GitCheckpointError.notGitRepository
         }
@@ -191,14 +249,17 @@ public struct GitCheckpointManager: Sendable {
         )
         let branch = options.branch?.isEmpty == false ? options.branch! : Self.defaultBranch(for: task)
 
+        onProgress?("switching checkpoint branch...")
         try switchToBranch(branch, workingDirectory: rootURL)
+        onProgress?("checking worktree...")
         let dirtyStatus = try workingTreeStatus(workingDirectory: rootURL)
         let hasChanges = !dirtyStatus.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let changedFiles = Self.unique(manifestContext.changedFiles + Self.changedFiles(from: dirtyStatus))
-        let generatedFiles = Self.unique(manifestContext.generatedFiles + Self.generatedFiles(from: dirtyStatus))
-        var commandOutputs: [HandoffCommandOutput] = manifestContext.commandOutputs
+        let changedFiles = Self.changedFiles(from: dirtyStatus)
+        let generatedFiles = Self.generatedFiles(from: dirtyStatus)
+        var commandOutputs: [HandoffCommandOutput] = []
 
         if hasChanges {
+            onProgress?("committing checkpoint...")
             try runRequired(["add", "-A", "--", ".", ":!.agentctl"], workingDirectory: rootURL)
             let output = try runRequiredCapture(
                 ["commit", "-m", options.message ?? Self.defaultMessage(for: task)],
@@ -211,11 +272,13 @@ public struct GitCheckpointManager: Sendable {
             ))
         }
 
+        onProgress?("resolving checkpoint commit...")
         let head = try requiredOutput(["rev-parse", "HEAD"], workingDirectory: rootURL)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         let pushedAt: Date?
         if options.push {
+            onProgress?("pushing checkpoint branch...")
             let output = try runRequiredCapture(["push", "-u", options.remoteName, branch], workingDirectory: rootURL)
             commandOutputs.append(HandoffCommandOutput(
                 command: "git push -u \(options.remoteName) \(branch)",
@@ -227,6 +290,28 @@ public struct GitCheckpointManager: Sendable {
             pushedAt = nil
         }
 
+        return GitCheckpointGitState(
+            branch: branch,
+            head: head,
+            dirtyStatus: dirtyStatus,
+            committed: hasChanges,
+            pushed: options.push,
+            pushedAt: pushedAt,
+            changedFiles: changedFiles,
+            generatedFiles: generatedFiles,
+            commandOutputs: commandOutputs
+        )
+    }
+
+    public static func makeCheckpointResult(
+        task: TaskRecord,
+        options: GitCheckpointOptions = GitCheckpointOptions(),
+        gitState: GitCheckpointGitState,
+        manifestContext: HandoffManifest = HandoffManifest()
+    ) -> GitCheckpointResult {
+        let changedFiles = Self.unique(manifestContext.changedFiles + gitState.changedFiles)
+        let generatedFiles = Self.unique(manifestContext.generatedFiles + gitState.generatedFiles)
+        let commandOutputs = manifestContext.commandOutputs + gitState.commandOutputs
         let manifest = HandoffManifest(
             changedFiles: changedFiles,
             generatedFiles: generatedFiles,
@@ -236,24 +321,24 @@ public struct GitCheckpointManager: Sendable {
         )
         let checkpoint = CheckpointRecord(
             taskID: task.id,
-            branch: branch,
-            commitSHA: head.isEmpty ? nil : head,
+            branch: gitState.branch,
+            commitSHA: gitState.head.isEmpty ? nil : gitState.head,
             remoteName: options.remoteName,
-            pushedAt: pushedAt,
+            pushedAt: gitState.pushedAt,
             metadata: [
                 "handoffManifest": manifest.jsonValue,
                 "changedFiles": .array(changedFiles.map { .string($0) }),
                 "generatedFiles": .array(generatedFiles.map { .string($0) }),
-                "pushed": .bool(options.push),
-                "dirtyStatus": .string(dirtyStatus)
+                "pushed": .bool(gitState.pushed),
+                "dirtyStatus": .string(gitState.dirtyStatus)
             ]
         )
 
         return GitCheckpointResult(
             checkpoint: checkpoint,
-            dirtyStatus: dirtyStatus,
-            committed: hasChanges,
-            pushed: options.push,
+            dirtyStatus: gitState.dirtyStatus,
+            committed: gitState.committed,
+            pushed: gitState.pushed,
             manifest: manifest
         )
     }
