@@ -962,9 +962,6 @@ func createAndPersistCheckpoint(
     options: GitCheckpointOptions = GitCheckpointOptions(),
     onStatus: (@Sendable (String) -> Void)? = nil
 ) async throws -> GitCheckpointResult {
-    onStatus?("collecting handoff context...")
-    async let manifestContextTask = handoffManifestContext(task: task, store: store)
-
     onStatus?("preparing git checkpoint...")
     let manager = GitCheckpointManager()
     let gitState = try manager.createGitCheckpoint(
@@ -975,19 +972,15 @@ func createAndPersistCheckpoint(
         onProgress: onStatus
     )
 
-    onStatus?("recording handoff metadata...")
-    let manifestContext = try await manifestContextTask
-    let result = GitCheckpointManager.makeCheckpointResult(
+    onStatus?("recording checkpoint cursor...")
+    let transcriptCursor = try await checkpointTranscriptCursor(task: task, store: store)
+    var result = GitCheckpointManager.makeCheckpointResult(
         task: task,
         options: options,
-        gitState: gitState,
-        manifestContext: manifestContext
+        gitState: gitState
     )
+    result.checkpoint.metadata["transcriptCursor"] = .object(transcriptCursor)
     try await store.saveCheckpoint(result.checkpoint)
-    let artifacts = checkpointArtifacts(from: result, task: task)
-    for artifact in artifacts {
-        try await store.saveArtifact(artifact)
-    }
     try await store.appendEvent(AgentEvent(
         taskID: task.id,
         kind: .checkpointCreated,
@@ -1002,6 +995,28 @@ func createAndPersistCheckpoint(
         ))
     }
     return result
+}
+
+func checkpointTranscriptCursor(task: TaskRecord, store: any AgentTaskStore) async throws -> [String: JSONValue] {
+    let latestEvent = try await store.recentEvents(for: task.id, limit: 1).last
+    var cursor: [String: JSONValue] = [
+        "taskID": .string(task.id.uuidString),
+        "capturedAt": .string(ISO8601DateFormatter().string(from: Date()))
+    ]
+
+    if let latestEvent {
+        cursor["eventID"] = .string(latestEvent.id.uuidString)
+        cursor["eventKind"] = .string(latestEvent.kind.rawValue)
+        cursor["eventOccurredAt"] = .string(ISO8601DateFormatter().string(from: latestEvent.occurredAt))
+        if let sequence = latestEvent.sequence {
+            cursor["eventSequence"] = .int(sequence)
+        }
+        if let sessionID = latestEvent.sessionID {
+            cursor["sessionID"] = .string(sessionID.uuidString)
+        }
+    }
+
+    return cursor
 }
 
 func checkpointArtifacts(from result: GitCheckpointResult, task: TaskRecord) -> [ArtifactRecord] {
@@ -1076,7 +1091,7 @@ func checkpointArtifacts(from result: GitCheckpointResult, task: TaskRecord) -> 
 }
 
 func handoffManifestContext(task: TaskRecord, store: any AgentTaskStore) async throws -> HandoffManifest {
-    let events = try await store.events(for: task.id)
+    let events = try await store.recentEvents(for: task.id, limit: 80)
     return handoffManifestContext(events: events)
 }
 
@@ -1488,7 +1503,8 @@ func checkpointPayload(_ result: GitCheckpointResult) -> [String: JSONValue] {
         "committed": .bool(result.committed),
         "pushed": .bool(result.pushed),
         "dirtyStatus": .string(result.dirtyStatus),
-        "handoffManifest": result.manifest.jsonValue
+        "changedFiles": .array(result.manifest.changedFiles.map { .string($0) }),
+        "generatedFiles": .array(result.manifest.generatedFiles.map { .string($0) })
     ]
 
     if let commitSHA = result.checkpoint.commitSHA {
@@ -1496,6 +1512,9 @@ func checkpointPayload(_ result: GitCheckpointResult) -> [String: JSONValue] {
     }
     if let pushedAt = result.checkpoint.pushedAt {
         payload["pushedAt"] = .string(ISO8601DateFormatter().string(from: pushedAt))
+    }
+    if let transcriptCursor = result.checkpoint.metadata["transcriptCursor"] {
+        payload["transcriptCursor"] = transcriptCursor
     }
     return payload
 }
@@ -1689,7 +1708,7 @@ func exportContinuationMarkdown(
     snapshot: RepositorySnapshot,
     destination: String?
 ) async throws -> ContinuationExportResult {
-    let events = try await store.events(for: task.id)
+    let events = try await store.recentEvents(for: task.id, limit: 120)
     let checkpoints = try await store.listCheckpoints(taskID: task.id)
     let artifacts = try await store.listArtifacts(taskID: task.id)
     let claim = try? await store.currentTaskClaim(taskID: task.id)
@@ -1918,9 +1937,12 @@ private func continuationCheckpointMarkdown(_ checkpoint: CheckpointRecord) -> S
         lines.append(contentsOf: generatedFiles.prefix(40).map { "- `\($0)`" })
     }
 
-    if let manifest = checkpoint.metadata["handoffManifest"]?.objectValue {
+    if let cursor = checkpoint.metadata["transcriptCursor"]?.objectValue {
         lines.append("")
-        lines.append("Handoff manifest: \(handoffManifestSummary(manifest))")
+        lines.append("Transcript cursor: \(checkpointTranscriptCursorSummary(cursor))")
+    } else if let manifest = checkpoint.metadata["handoffManifest"]?.objectValue {
+        lines.append("")
+        lines.append("Legacy handoff manifest: \(handoffManifestSummary(manifest))")
     }
 
     return lines.joined(separator: "\n")
@@ -2121,8 +2143,10 @@ private func checkpointTranscriptMarkdownBlock(title: String, payload: [String: 
     if let pushed = payload["pushed"] {
         lines.append("- Pushed: `\(pushed == .bool(true) ? "yes" : "no")`")
     }
-    if let manifest = payload["handoffManifest"]?.objectValue {
-        lines.append("- Handoff: \(handoffManifestSummary(manifest))")
+    if let cursor = payload["transcriptCursor"]?.objectValue {
+        lines.append("- Transcript cursor: \(checkpointTranscriptCursorSummary(cursor))")
+    } else if let manifest = payload["handoffManifest"]?.objectValue {
+        lines.append("- Legacy handoff: \(handoffManifestSummary(manifest))")
     }
     return lines.joined(separator: "\n")
 }
@@ -2150,6 +2174,18 @@ private func handoffManifestSummary(_ manifest: [String: JSONValue]) -> String {
     let commands = manifest["commandOutputs"]?.arrayValue?.count ?? 0
     let tests = manifest["testResults"]?.arrayValue?.count ?? 0
     return "`\(files)` files, `\(generated)` generated, `\(commands)` commands, `\(tests)` tests"
+}
+
+private func checkpointTranscriptCursorSummary(_ cursor: [String: JSONValue]) -> String {
+    let sequence: String
+    if case let .int(value) = cursor["eventSequence"] {
+        sequence = "#\(value)"
+    } else {
+        sequence = "-"
+    }
+    let kind = cursor["eventKind"]?.stringValue ?? "none"
+    let session = cursor["sessionID"]?.stringValue.map { String($0.prefix(8)) } ?? "-"
+    return "`\(sequence)` `\(kind)` session `\(session)`"
 }
 
 private func markdownQuote(_ text: String) -> String {

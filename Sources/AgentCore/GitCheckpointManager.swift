@@ -326,7 +326,6 @@ public struct GitCheckpointManager: Sendable {
             remoteName: options.remoteName,
             pushedAt: gitState.pushedAt,
             metadata: [
-                "handoffManifest": manifest.jsonValue,
                 "changedFiles": .array(changedFiles.map { .string($0) }),
                 "generatedFiles": .array(generatedFiles.map { .string($0) }),
                 "pushed": .bool(gitState.pushed),

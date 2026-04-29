@@ -619,7 +619,8 @@ func gitCheckpointManagerCreatesBranchCommitsChangesAndReturnsCheckpoint() throw
     #expect(result.pushed == false)
     #expect(result.dirtyStatus == " M Sources/file.swift\n")
     #expect(result.manifest.changedFiles == ["Sources/file.swift"])
-    #expect(result.checkpoint.metadata["handoffManifest"] != nil)
+    #expect(result.checkpoint.metadata["handoffManifest"] == nil)
+    #expect(result.checkpoint.metadata["changedFiles"] == .array([.string("Sources/file.swift")]))
 }
 
 @Test
