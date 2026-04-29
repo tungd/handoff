@@ -19,13 +19,30 @@ struct StoreOptions: ParsableArguments, @unchecked Sendable {
     var databaseURL: String?
 }
 
+struct BackendRunOptions: ParsableArguments, @unchecked Sendable {
+    @Option(help: "Backend model. Passed to Codex or Pi.")
+    var model: String?
+
+    @Option(help: "Pi provider name.")
+    var provider: String?
+
+    @Option(help: "Pi thinking level: off, minimal, low, medium, high, or xhigh.")
+    var thinking: String?
+
+    @Option(help: "Pi tool allowlist, comma-separated.")
+    var tools: String?
+
+    @Flag(help: "Disable Pi tools.")
+    var noTools: Bool = false
+}
+
 @available(macOS 10.15, macCatalyst 13, iOS 13, tvOS 13, watchOS 6, *)
 @main
 struct Agentctl: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "agentctl",
-        abstract: "Task/session manager for Codex-first coding workflows.",
-        discussion: "Run without a subcommand to start an interactive Codex session.",
+        abstract: "Task/session manager for coding-agent workflows.",
+        discussion: "Run without a subcommand to start an interactive agent session.",
         subcommands: [
             Repo.self,
             Task.self,
@@ -47,11 +64,17 @@ struct Agentctl: AsyncParsableCommand {
     @Option(help: "Title for a newly created interactive task.")
     var title: String?
 
+    @Option(help: "Preferred backend for a newly created interactive task.")
+    var backend: AgentBackend = .codex
+
     @Flag(help: "Pass --full-auto to Codex.")
     var fullAuto: Bool = false
 
     @Option(help: "Codex sandbox mode.")
     var sandbox: String?
+
+    @OptionGroup
+    var backendRunOptions: BackendRunOptions
 
     mutating func run() async throws {
         try await runInteractiveAgent(
@@ -59,8 +82,10 @@ struct Agentctl: AsyncParsableCommand {
             storeOptions: storeOptions,
             taskIdentifier: taskIdentifier,
             title: title,
+            backend: backend,
             fullAuto: fullAuto,
-            sandbox: sandbox
+            sandbox: sandbox,
+            backendRunOptions: backendRunOptions
         )
     }
 }
@@ -100,7 +125,7 @@ struct Task: ParsableCommand {
     struct New: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "new",
-            abstract: "Create a task record, optionally running the first Codex turn."
+            abstract: "Create a task record, optionally running the first backend turn."
         )
 
         @Argument(help: "Task title.")
@@ -124,6 +149,9 @@ struct Task: ParsableCommand {
         @Option(help: "Codex sandbox mode.")
         var sandbox: String?
 
+        @OptionGroup
+        var backendRunOptions: BackendRunOptions
+
         @Flag(name: .long, help: "Emit JSON.")
         var json: Bool = false
 
@@ -145,14 +173,15 @@ struct Task: ParsableCommand {
                 ]))
 
                 if let prompt {
-                    let summary = try await runCodexTurn(
+                    let summary = try await runAgentTurn(
                         task: task,
                         prompt: prompt,
                         repoURL: repoURL,
                         snapshot: snapshot,
                         store: store,
                         fullAuto: fullAuto,
-                        sandbox: sandbox
+                        sandbox: sandbox,
+                        backendRunOptions: backendRunOptions
                     )
 
                     if json {
@@ -285,6 +314,9 @@ struct Task: ParsableCommand {
         @Option(help: "Codex sandbox mode.")
         var sandbox: String?
 
+        @OptionGroup
+        var backendRunOptions: BackendRunOptions
+
         @Flag(name: .long, help: "Emit JSON.")
         var json: Bool = false
 
@@ -294,14 +326,15 @@ struct Task: ParsableCommand {
             try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
                 let task = try await store.findTask(task)
 
-                let summary = try await runCodexTurn(
+                let summary = try await runAgentTurn(
                     task: task,
                     prompt: prompt,
                     repoURL: repoURL,
                     snapshot: snapshot,
                     store: store,
                     fullAuto: fullAuto,
-                    sandbox: sandbox
+                    sandbox: sandbox,
+                    backendRunOptions: backendRunOptions
                 )
 
                 if json {
@@ -338,6 +371,9 @@ struct Task: ParsableCommand {
         @Option(help: "Codex sandbox mode.")
         var sandbox: String?
 
+        @OptionGroup
+        var backendRunOptions: BackendRunOptions
+
         @Option(help: "Checkpoint id prefix or latest to restore before resuming.")
         var checkpoint: String?
 
@@ -370,14 +406,15 @@ struct Task: ParsableCommand {
                             printCheckpointRestoreResult(restore)
                         }
 
-                        let summary = try await runCodexTurn(
+                        let summary = try await runAgentTurn(
                             task: task,
                             prompt: prompt,
                             repoURL: repoURL,
                             snapshot: activeSnapshot,
                             store: store,
                             fullAuto: fullAuto,
-                            sandbox: sandbox
+                            sandbox: sandbox,
+                            backendRunOptions: backendRunOptions
                         )
 
                         _ = try? await releaseResumeClaim(task: task, store: store)
@@ -687,6 +724,7 @@ struct Backend: ParsableCommand {
         mutating func run() throws {
             let descriptors = [
                 CodexBackendAdapter().descriptor,
+                PiBackendAdapter().descriptor,
                 ClaudeBackendAdapter().descriptor
             ]
 
@@ -753,8 +791,10 @@ func runInteractiveAgent(
     storeOptions: StoreOptions,
     taskIdentifier: String?,
     title: String?,
+    backend: AgentBackend,
     fullAuto: Bool,
-    sandbox: String?
+    sandbox: String?,
+    backendRunOptions: BackendRunOptions
 ) async throws {
     let repoURL = URL(fileURLWithPath: cwd)
     let snapshot = try RepositoryInspector().inspect(path: repoURL)
@@ -764,6 +804,7 @@ func runInteractiveAgent(
         let taskResolution = try await resolveInitialInteractiveTask(
             identifier: taskIdentifier,
             title: title,
+            backend: backend,
             snapshot: activeSnapshot,
             repoURL: repoURL,
             store: store
@@ -779,8 +820,10 @@ func runInteractiveAgent(
                 repoURL: repoURL,
                 snapshot: activeSnapshot,
                 store: store,
+                defaultBackend: backend,
                 fullAuto: fullAuto,
-                sandbox: sandbox
+                sandbox: sandbox,
+                backendRunOptions: backendRunOptions
             )
             return
         }
@@ -893,6 +936,7 @@ func runInteractiveAgent(
                     task = try await resolveInteractiveTask(
                         identifier: nil,
                         title: command.argument?.isEmpty == false ? command.argument : nil,
+                        backend: backend,
                         snapshot: activeSnapshot,
                         repoURL: repoURL,
                         store: store
@@ -937,11 +981,11 @@ func runInteractiveAgent(
                     taskPersisted = true
                     renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
                 }
-                renderer.status("running Codex turn...")
+                renderer.status("running \(task.backendPreference.rawValue) turn...")
                 _ = try await refreshResumeClaimIfActive(task: task, store: store)
                 let assistantRendered = SendableFlag()
                 let renderRawEvents = showRawEvents
-                let summary = try await runCodexTurn(
+                let summary = try await runAgentTurn(
                     task: task,
                     prompt: input,
                     repoURL: repoURL,
@@ -949,6 +993,7 @@ func runInteractiveAgent(
                     store: store,
                     fullAuto: fullAuto,
                     sandbox: sandbox,
+                    backendRunOptions: backendRunOptions,
                     showStatus: false
                 ) { update in
                     if renderer.render(update: update, showRawEvents: renderRawEvents) {
@@ -973,6 +1018,7 @@ func runInteractiveAgent(
 func resolveInitialInteractiveTask(
     identifier: String?,
     title: String?,
+    backend: AgentBackend = .codex,
     snapshot: RepositorySnapshot,
     repoURL: URL,
     store: any AgentTaskStore
@@ -985,7 +1031,7 @@ func resolveInitialInteractiveTask(
     }
 
     return InteractiveTaskResolution(
-        task: makeInteractiveTask(title: title, snapshot: snapshot, repoURL: repoURL),
+        task: makeInteractiveTask(title: title, backend: backend, snapshot: snapshot, repoURL: repoURL),
         isPersisted: false
     )
 }
@@ -993,6 +1039,7 @@ func resolveInitialInteractiveTask(
 func resolveInteractiveTask(
     identifier: String?,
     title: String?,
+    backend: AgentBackend = .codex,
     snapshot: RepositorySnapshot,
     repoURL: URL,
     store: any AgentTaskStore
@@ -1001,13 +1048,14 @@ func resolveInteractiveTask(
         return try await store.findTask(identifier)
     }
 
-    let task = makeInteractiveTask(title: title, snapshot: snapshot, repoURL: repoURL)
+    let task = makeInteractiveTask(title: title, backend: backend, snapshot: snapshot, repoURL: repoURL)
     try await persistInteractiveTask(task, store: store)
     return task
 }
 
 func makeInteractiveTask(
     title: String?,
+    backend: AgentBackend,
     snapshot: RepositorySnapshot,
     repoURL: URL
 ) -> TaskRecord {
@@ -1015,7 +1063,7 @@ func makeInteractiveTask(
     return TaskRecord(
         title: resolvedTitle,
         slug: Slug.make(resolvedTitle),
-        backendPreference: .codex
+        backendPreference: backend
     )
 }
 
@@ -1445,7 +1493,7 @@ func compactPayload(_ payload: [String: JSONValue]) -> String {
     return ""
 }
 
-func runCodexTurn(
+func runAgentTurn(
     task: TaskRecord,
     prompt: String,
     repoURL: URL,
@@ -1453,20 +1501,32 @@ func runCodexTurn(
     store: any AgentTaskStore,
     fullAuto: Bool,
     sandbox: String?,
+    backendRunOptions: BackendRunOptions,
     showStatus: Bool = true,
     onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void = { _ in }
 ) async throws -> TaskRunSummary {
     if showStatus {
-        printError("Running Codex turn for \(task.slug)...")
+        printError("Running \(task.backendPreference.rawValue) turn for \(task.slug)...")
     }
 
     let controller = AgentSessionController(store: store)
-    return try await controller.runCodexTurn(
+    return try await controller.runAgentTurn(
         task: task,
         prompt: prompt,
         repoURL: repoURL,
         snapshot: snapshot,
-        options: CodexExecOptions(fullAuto: fullAuto, sandbox: sandbox),
+        codexOptions: CodexExecOptions(
+            fullAuto: fullAuto,
+            sandbox: sandbox,
+            model: backendRunOptions.model
+        ),
+        piOptions: PiRPCOptions(
+            provider: backendRunOptions.provider,
+            model: backendRunOptions.model,
+            thinking: backendRunOptions.thinking,
+            tools: backendRunOptions.tools,
+            noTools: backendRunOptions.noTools
+        ),
         onUpdate: onUpdate
     )
 }

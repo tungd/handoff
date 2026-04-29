@@ -34,6 +34,22 @@ public protocol ProcessStreaming: Sendable {
     ) -> AsyncThrowingStream<ProcessStreamEvent, Error>
 }
 
+public protocol InteractiveProcess: Sendable {
+    var events: AsyncThrowingStream<ProcessStreamEvent, Error> { get }
+
+    func sendLine(_ line: String) throws
+    func closeStdin() throws
+    func terminate()
+}
+
+public protocol ProcessInteracting: Sendable {
+    func start(
+        _ executable: String,
+        arguments: [String],
+        workingDirectory: URL?
+    ) throws -> any InteractiveProcess
+}
+
 public enum ProcessRunnerError: Error, CustomStringConvertible, Sendable {
     case nonUTF8Output
 
@@ -105,6 +121,22 @@ public struct SubprocessStreamRunner: ProcessStreaming {
 
             state.start()
         }
+    }
+}
+
+public struct SubprocessInteractiveRunner: ProcessInteracting {
+    public init() {}
+
+    public func start(
+        _ executable: String,
+        arguments: [String] = [],
+        workingDirectory: URL? = nil
+    ) throws -> any InteractiveProcess {
+        try SubprocessInteractiveProcess(
+            executable: executable,
+            arguments: arguments,
+            workingDirectory: workingDirectory
+        )
     }
 }
 
@@ -180,6 +212,114 @@ private final class StreamingProcessState: @unchecked Sendable {
     }
 
     private func readLines(from handle: FileHandle, emit: (String) -> Void) {
+        var buffer = Data()
+        let newline = Data([0x0A])
+
+        while true {
+            let data = handle.availableData
+            if data.isEmpty {
+                break
+            }
+
+            buffer.append(data)
+
+            while let range = buffer.range(of: newline) {
+                let lineData = buffer.subdata(in: buffer.startIndex..<range.lowerBound)
+                emit(String(decoding: lineData, as: UTF8.self))
+                buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+            }
+        }
+
+        if !buffer.isEmpty {
+            emit(String(decoding: buffer, as: UTF8.self))
+        }
+    }
+}
+
+private final class SubprocessInteractiveProcess: InteractiveProcess, @unchecked Sendable {
+    let events: AsyncThrowingStream<ProcessStreamEvent, Error>
+
+    private let process = Process()
+    private let stdinPipe = Pipe()
+    private let group = DispatchGroup()
+    private let queue = DispatchQueue(label: "agentctl.interactive-process", attributes: .concurrent)
+    private let stdinLock = NSLock()
+    private var stdinClosed = false
+
+    init(
+        executable: String,
+        arguments: [String],
+        workingDirectory: URL?
+    ) throws {
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        let stream = AsyncThrowingStream.makeStream(of: ProcessStreamEvent.self)
+        events = stream.stream
+
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.currentDirectoryURL = workingDirectory
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        try process.run()
+
+        stream.continuation.onTermination = { @Sendable [weak self] _ in
+            self?.terminate()
+        }
+
+        group.enter()
+        queue.async {
+            Self.readLines(from: stdoutPipe.fileHandleForReading) { line in
+                stream.continuation.yield(.stdoutLine(line))
+            }
+            self.group.leave()
+        }
+
+        group.enter()
+        queue.async {
+            Self.readLines(from: stderrPipe.fileHandleForReading) { line in
+                stream.continuation.yield(.stderrLine(line))
+            }
+            self.group.leave()
+        }
+
+        queue.async {
+            self.process.waitUntilExit()
+            self.group.wait()
+            stream.continuation.yield(.exited(self.process.terminationStatus))
+            stream.continuation.finish()
+        }
+    }
+
+    func sendLine(_ line: String) throws {
+        let data = Data((line + "\n").utf8)
+        try stdinLock.withLock {
+            guard !stdinClosed else {
+                return
+            }
+            try stdinPipe.fileHandleForWriting.write(contentsOf: data)
+        }
+    }
+
+    func closeStdin() throws {
+        try stdinLock.withLock {
+            guard !stdinClosed else {
+                return
+            }
+            stdinClosed = true
+            try stdinPipe.fileHandleForWriting.close()
+        }
+    }
+
+    func terminate() {
+        if process.isRunning {
+            process.terminate()
+        }
+    }
+
+    private static func readLines(from handle: FileHandle, emit: (String) -> Void) {
         var buffer = Data()
         let newline = Data([0x0A])
 

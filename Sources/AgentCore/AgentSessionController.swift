@@ -9,7 +9,7 @@ public enum AgentSessionControllerError: Error, CustomStringConvertible, Sendabl
         case let .unsupportedBackend(backend):
             return "backend is not wired yet: \(backend.rawValue)"
         case let .backendFailed(exitCode, stderr):
-            return "Codex exited with \(exitCode): \(stderr)"
+            return "backend exited with \(exitCode): \(stderr)"
         }
     }
 }
@@ -22,13 +22,49 @@ public enum AgentSessionUpdate: Equatable, Sendable {
 public struct AgentSessionController: Sendable {
     private let store: any AgentTaskStore
     private let codexBackend: CodexStreamingBackend
+    private let piBackend: PiRPCBackend
 
     public init(
         store: any AgentTaskStore,
-        codexBackend: CodexStreamingBackend = CodexStreamingBackend()
+        codexBackend: CodexStreamingBackend = CodexStreamingBackend(),
+        piBackend: PiRPCBackend = PiRPCBackend()
     ) {
         self.store = store
         self.codexBackend = codexBackend
+        self.piBackend = piBackend
+    }
+
+    public func runAgentTurn(
+        task: TaskRecord,
+        prompt: String,
+        repoURL: URL,
+        snapshot: RepositorySnapshot,
+        codexOptions: CodexExecOptions = CodexExecOptions(),
+        piOptions: PiRPCOptions = PiRPCOptions(),
+        onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void = { _ in }
+    ) async throws -> TaskRunSummary {
+        switch task.backendPreference {
+        case .codex:
+            return try await runCodexTurn(
+                task: task,
+                prompt: prompt,
+                repoURL: repoURL,
+                snapshot: snapshot,
+                options: codexOptions,
+                onUpdate: onUpdate
+            )
+        case .pi:
+            return try await runPiTurn(
+                task: task,
+                prompt: prompt,
+                repoURL: repoURL,
+                snapshot: snapshot,
+                options: piOptions,
+                onUpdate: onUpdate
+            )
+        case .claude:
+            throw AgentSessionControllerError.unsupportedBackend(task.backendPreference)
+        }
     }
 
     public func runCodexTurn(
@@ -111,6 +147,94 @@ public struct AgentSessionController: Sendable {
         }
 
         return try await store.summary(for: task)
+    }
+
+    public func runPiTurn(
+        task: TaskRecord,
+        prompt: String,
+        repoURL: URL,
+        snapshot: RepositorySnapshot,
+        options: PiRPCOptions = PiRPCOptions(),
+        onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void = { _ in }
+    ) async throws -> TaskRunSummary {
+        guard task.backendPreference == .pi else {
+            throw AgentSessionControllerError.unsupportedBackend(task.backendPreference)
+        }
+
+        let cwd = snapshot.rootPath.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? repoURL
+        let previousSession = try await store.latestSession(for: task.id)
+        let sessionPath = previousSession?.backendSessionID.map { URL(fileURLWithPath: $0) }
+            ?? Self.piSessionPath(taskID: task.id, cwd: cwd)
+        var session = SessionRecord(
+            taskID: task.id,
+            backend: .pi,
+            backendSessionID: sessionPath.path,
+            cwd: cwd.path,
+            state: .running
+        )
+
+        try await store.saveSession(session)
+        try await onUpdate(.session(session))
+
+        try await appendAndEmit(AgentEvent(taskID: task.id, sessionID: session.id, kind: .sessionStarted, payload: [
+            "backend": .string(session.backend.rawValue),
+            "cwd": .string(session.cwd),
+            "sessionPath": .string(sessionPath.path)
+        ]), onUpdate: onUpdate)
+
+        try await appendAndEmit(AgentEvent(taskID: task.id, sessionID: session.id, kind: .userMessage, payload: [
+            "text": .string(prompt)
+        ]), onUpdate: onUpdate)
+
+        let result = try await piBackend.run(
+            prompt: prompt,
+            cwd: cwd,
+            sessionPath: sessionPath,
+            options: options
+        ) { update in
+            switch update {
+            case let .mappedLine(mapped):
+                if let newSessionPath = mapped.sessionPath {
+                    session.backendSessionID = newSessionPath
+                    try await store.saveSession(session)
+                    try await onUpdate(.session(session))
+                }
+
+                var event = mapped.event
+                event.taskID = task.id
+                event.sessionID = session.id
+                try await appendAndEmit(event, onUpdate: onUpdate)
+            case let .stderrLine(line):
+                try await appendAndEmit(AgentEvent(taskID: task.id, sessionID: session.id, kind: .backendEvent, payload: [
+                    "stderr": .string(line),
+                    "backend": .string("pi")
+                ]), onUpdate: onUpdate)
+            }
+        }
+
+        session.backendSessionID = result.sessionPath
+        session.state = result.exitCode == 0 ? .ended : .failed
+        session.endedAt = Date()
+
+        try await appendAndEmit(AgentEvent(taskID: task.id, sessionID: session.id, kind: .sessionEnded, payload: [
+            "exitCode": .int(Int64(result.exitCode)),
+            "sessionPath": .string(result.sessionPath)
+        ]), onUpdate: onUpdate)
+
+        try await store.saveSession(session)
+        try await onUpdate(.session(session))
+
+        if result.exitCode != 0 {
+            throw AgentSessionControllerError.backendFailed(exitCode: result.exitCode, stderr: result.stderr)
+        }
+
+        return try await store.summary(for: task)
+    }
+
+    public static func piSessionPath(taskID: UUID, cwd: URL) -> URL {
+        cwd.appendingPathComponent(".agentctl", isDirectory: true)
+            .appendingPathComponent("pi-sessions", isDirectory: true)
+            .appendingPathComponent("\(taskID.uuidString).jsonl")
     }
 
     @discardableResult

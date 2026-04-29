@@ -12,8 +12,10 @@ private struct AgentTUIRuntime: @unchecked Sendable {
     var model: AgentTUIModel
     var modelDisplayName: String
     var modelContextWindowTokens: Int64?
+    var defaultBackend: AgentBackend
     var fullAuto: Bool
     var sandbox: String?
+    var backendRunOptions: BackendRunOptions
 }
 
 @MainActor
@@ -30,6 +32,18 @@ private func updateAgentTUIRuntimeSnapshot(_ snapshot: RepositorySnapshot) {
     AgentTUIRuntimeBox.current = runtime
 }
 
+@MainActor
+private func updateAgentTUIRuntimeTask(_ task: TaskRecord) {
+    guard var runtime = AgentTUIRuntimeBox.current else {
+        return
+    }
+    let metadata = resolvedAgentModelMetadata(backend: task.backendPreference, options: runtime.backendRunOptions)
+    runtime.task = task
+    runtime.modelDisplayName = metadata.displayName
+    runtime.modelContextWindowTokens = metadata.contextWindowTokens
+    AgentTUIRuntimeBox.current = runtime
+}
+
 func runTUIkitInteractiveLoop(
     task: TaskRecord,
     taskPersisted: Bool,
@@ -37,11 +51,13 @@ func runTUIkitInteractiveLoop(
     repoURL: URL,
     snapshot: RepositorySnapshot,
     store: any AgentTaskStore,
+    defaultBackend: AgentBackend,
     fullAuto: Bool,
-    sandbox: String?
+    sandbox: String?,
+    backendRunOptions: BackendRunOptions
 ) async throws {
     let initialEntries = taskPersisted ? try await tuiEntries(for: task.id, store: store) : []
-    let modelMetadata = resolvedCodexModelMetadata()
+    let modelMetadata = resolvedAgentModelMetadata(backend: task.backendPreference, options: backendRunOptions)
     let runtime = AgentTUIRuntime(
         task: task,
         storeOptions: storeOptions,
@@ -53,8 +69,10 @@ func runTUIkitInteractiveLoop(
         ] : initialEntries),
         modelDisplayName: modelMetadata.displayName,
         modelContextWindowTokens: modelMetadata.contextWindowTokens,
+        defaultBackend: defaultBackend,
         fullAuto: fullAuto,
-        sandbox: sandbox
+        sandbox: sandbox,
+        backendRunOptions: backendRunOptions
     )
 
     await MainActor.run {
@@ -107,7 +125,7 @@ private struct AgentTUIPalette: Palette {
 
 private enum TUITranscriptRole: String, Sendable {
     case user
-    case codex
+    case assistant
     case tool
     case system
     case error
@@ -219,12 +237,12 @@ private final class AgentTUIModel: @unchecked Sendable {
         var turn: (task: TaskRecord, isTaskPersisted: Bool)?
         update { state in
             guard !state.isRunning else {
-                append(.error, "A Codex turn is already running.", to: &state)
+                append(.error, "An agent turn is already running.", to: &state)
                 return
             }
             append(.user, prompt, to: &state)
             state.isRunning = true
-            state.status = "running Codex turn..."
+            state.status = "running \(state.task.backendPreference.rawValue) turn..."
             turn = (state.task, state.isTaskPersisted)
         }
         return turn
@@ -303,7 +321,7 @@ private final class AgentTUIModel: @unchecked Sendable {
                 switch event.kind {
                 case .assistantDone:
                     if let text = event.payload["text"]?.stringValue {
-                        append(.codex, text, to: &state)
+                        append(.assistant, text, to: &state)
                     }
                 case .toolStarted:
                     appendToolCall(event.payload, status: .running, to: &state)
@@ -670,7 +688,7 @@ private struct AgentTUIView: View {
                     model.markTaskPersisted(currentTask)
                 }
                 _ = try await refreshResumeClaimIfActive(task: currentTask, store: runtime.store)
-                _ = try await runCodexTurn(
+                _ = try await runAgentTurn(
                     task: currentTask,
                     prompt: text,
                     repoURL: runtime.repoURL,
@@ -678,6 +696,7 @@ private struct AgentTUIView: View {
                     store: runtime.store,
                     fullAuto: runtime.fullAuto,
                     sandbox: runtime.sandbox,
+                    backendRunOptions: runtime.backendRunOptions,
                     showStatus: false
                 ) { update in
                     model.render(update)
@@ -831,10 +850,12 @@ private struct AgentTUIView: View {
                 let newTask = try await resolveInteractiveTask(
                     identifier: nil,
                     title: command.argument?.isEmpty == false ? command.argument : nil,
+                    backend: runtime.defaultBackend,
                     snapshot: runtime.snapshot,
                     repoURL: runtime.repoURL,
                     store: runtime.store
                 )
+                await updateAgentTUIRuntimeTask(newTask)
                 model.setTask(newTask, entries: [], message: "Created task \(newTask.slug).")
             }
         case "resume":
@@ -864,6 +885,7 @@ private struct AgentTUIView: View {
                     await updateAgentTUIRuntimeSnapshot(updatedSnapshot)
                 }
                 let loadedEntries = try await tuiEntries(for: resumedTask.id, store: runtime.store)
+                await updateAgentTUIRuntimeTask(resumedTask)
                 var message = "Resumed task \(resumedTask.slug)."
                 if let restore = handoff.restore {
                     message += "\n\(tuiCheckpointRestoreDetails(restore, claim: handoff.claim))"
@@ -1312,7 +1334,7 @@ private func agentTUISpanColor(_ tone: AgentTUIStyledTextTone, role: TUITranscri
 
 private func agentTUIFallbackColor(_ role: TUITranscriptRole) -> Color {
     switch role {
-    case .user, .codex:
+    case .user, .assistant:
         return .palette.foreground
     case .tool, .system:
         return .palette.foregroundSecondary
@@ -1325,7 +1347,7 @@ private func agentTUILabelColor(_ role: TUITranscriptRole) -> Color {
     switch role {
     case .user:
         return .palette.accent
-    case .codex, .system, .tool:
+    case .assistant, .system, .tool:
         return .palette.foregroundTertiary
     case .error:
         return .palette.error
@@ -1376,7 +1398,7 @@ private func tuiEntries(for taskID: UUID, store: any AgentTaskStore) async throw
             }
         case .assistantDone:
             if let text = event.payload["text"]?.stringValue {
-                append(.codex, text)
+                append(.assistant, text)
             }
         case .toolStarted:
             append(
@@ -1904,10 +1926,26 @@ func agentTUIStatusLine(repoBranchText: String, badges: [String], tokenStatus: S
     return left + String(repeating: " ", count: spaces) + tokenStatus
 }
 
-private func resolvedCodexModelMetadata() -> CodexModelMetadata {
+private func resolvedAgentModelMetadata(backend: AgentBackend, options: BackendRunOptions) -> CodexModelMetadata {
+    switch backend {
+    case .codex:
+        return resolvedCodexModelMetadata(modelOverride: options.model)
+    case .pi:
+        let model = nonEmpty(options.model) ?? "pi"
+        if let thinking = nonEmpty(options.thinking) {
+            return CodexModelMetadata(displayName: "\(model) (\(thinking))", contextWindowTokens: nil)
+        }
+        return CodexModelMetadata(displayName: model, contextWindowTokens: nil)
+    case .claude:
+        return CodexModelMetadata(displayName: nonEmpty(options.model) ?? "claude", contextWindowTokens: nil)
+    }
+}
+
+private func resolvedCodexModelMetadata(modelOverride: String? = nil) -> CodexModelMetadata {
     let environment = ProcessInfo.processInfo.environment
     let defaults = codexConfigDefaults()
-    let model = nonEmpty(environment["CODEX_MODEL"])
+    let model = nonEmpty(modelOverride)
+        ?? nonEmpty(environment["CODEX_MODEL"])
         ?? nonEmpty(defaults["model"])
         ?? "codex"
     let effort = nonEmpty(environment["CODEX_MODEL_REASONING_EFFORT"])

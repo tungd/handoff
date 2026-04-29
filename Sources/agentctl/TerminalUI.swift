@@ -98,7 +98,7 @@ struct TerminalRenderer {
             switch event.kind {
             case .assistantDone:
                 if let text = event.payload["text"]?.stringValue {
-                    block(label: "codex", text: text, colorCode: "32")
+                    block(label: "assistant", text: text, colorCode: "32")
                     return true
                 }
             case .toolStarted:

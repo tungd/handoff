@@ -78,6 +78,7 @@ func schemaLoaderFindsInitialMigration() throws {
 @Test
 func backendDescriptorsCaptureInitialBackendPriorities() {
     let codex = CodexBackendAdapter()
+    let pi = PiBackendAdapter()
     let claude = ClaudeBackendAdapter()
 
     #expect(codex.descriptor.backend == .codex)
@@ -86,6 +87,11 @@ func backendDescriptorsCaptureInitialBackendPriorities() {
     #expect(codex.descriptor.capabilities.contains(.resumeNativeSession))
     #expect(codex.appServerCommand == ["codex", "app-server", "--listen", "stdio://"])
     #expect(codex.execServerCommand == ["codex", "exec-server"])
+
+    #expect(pi.descriptor.backend == .pi)
+    #expect(pi.descriptor.capabilities.contains(.structuredOutput))
+    #expect(pi.descriptor.capabilities.contains(.resumeNativeSession))
+    #expect(pi.printCommand == ["pi", "--mode", "rpc"])
 
     #expect(claude.descriptor.backend == .claude)
     #expect(claude.descriptor.capabilities.contains(.structuredInput))
@@ -289,6 +295,83 @@ func codexExecArgumentsUseResumeShapeWithoutUnsupportedFlags() {
 }
 
 @Test
+func piRPCArgumentsUseSessionAndModelOptions() {
+    let backend = PiRPCBackend()
+    let args = backend.makeArguments(
+        sessionPath: URL(fileURLWithPath: "/tmp/repo/.agentctl/pi-sessions/task.jsonl"),
+        options: PiRPCOptions(
+            provider: "openai",
+            model: "gpt-4o-mini",
+            thinking: "low",
+            tools: "read,grep,edit"
+        )
+    )
+
+    #expect(args == [
+        "pi",
+        "--mode",
+        "rpc",
+        "--session",
+        "/tmp/repo/.agentctl/pi-sessions/task.jsonl",
+        "--provider",
+        "openai",
+        "--model",
+        "gpt-4o-mini",
+        "--thinking",
+        "low",
+        "--tools",
+        "read,grep,edit"
+    ])
+}
+
+@Test
+func piRPCArgumentsPreferNoToolsOverToolAllowlist() {
+    let backend = PiRPCBackend()
+    let args = backend.makeArguments(
+        sessionPath: URL(fileURLWithPath: "/tmp/session.jsonl"),
+        options: PiRPCOptions(tools: "read,grep", noTools: true)
+    )
+
+    #expect(args == [
+        "pi",
+        "--mode",
+        "rpc",
+        "--session",
+        "/tmp/session.jsonl",
+        "--no-tools"
+    ])
+}
+
+@Test
+func piRPCMapperMapsAgentEndToolEventsAndStats() {
+    let agentEnd = PiRPCMapper.mapLine("""
+    {"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}
+    """)
+    let toolStart = PiRPCMapper.mapLine("""
+    {"type":"tool_execution_start","toolCallId":"call-1","toolName":"bash","args":{"command":"swift test"}}
+    """)
+    let stats = PiRPCMapper.mapLine("""
+    {"id":"stats-1","type":"response","command":"get_session_stats","success":true,"data":{"sessionFile":"/tmp/session.jsonl","tokens":{"input":10,"output":3,"total":13},"contextUsage":{"tokens":13,"contextWindow":128000,"percent":0.1}}}
+    """)
+
+    #expect(agentEnd.isAgentEnd)
+    #expect(agentEnd.assistantText == "done")
+    #expect(agentEnd.event.kind == .assistantDone)
+    #expect(agentEnd.event.payload["text"] == .string("done"))
+
+    #expect(toolStart.event.kind == .toolStarted)
+    #expect(toolStart.event.payload["toolName"] == .string("bash"))
+    #expect(toolStart.event.payload["command"] == .string("swift test"))
+
+    #expect(stats.requestID == "stats-1")
+    #expect(stats.command == "get_session_stats")
+    #expect(stats.sessionPath == "/tmp/session.jsonl")
+    #expect(stats.event.kind == .backendEvent)
+    #expect(stats.event.payload["context_window"] == .int(128000))
+    #expect(stats.event.payload["usage"]?.objectValue?["input_tokens"] == .int(10))
+}
+
+@Test
 func localTaskStorePersistsTasksSessionsAndEvents() throws {
     let root = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("agentctl-tests-\(UUID().uuidString)", isDirectory: true)
@@ -392,6 +475,47 @@ func agentSessionControllerPersistsStreamingCodexTurn() async throws {
         }
         return false
     })
+}
+
+@Test
+func agentSessionControllerPersistsPiRPCTurn() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("agentctl-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let store: any AgentTaskStore = LocalTaskStore(root: root)
+    let task = TaskRecord(title: "Pi Turn", slug: "pi-turn", backendPreference: .pi)
+    try await store.saveTask(task)
+
+    let sentLines = SentLineRecorder()
+    let backend = PiRPCBackend(runner: FakeInteractiveProcessRunner(events: [
+        .stdoutLine(#"{"id":"prompt-1","type":"response","command":"prompt","success":true}"#),
+        .stdoutLine(#"{"type":"tool_execution_start","toolCallId":"call-1","toolName":"bash","args":{"command":"swift test"}}"#),
+        .stdoutLine(#"{"type":"tool_execution_end","toolCallId":"call-1","toolName":"bash","args":{"command":"swift test"},"result":{"content":[{"type":"text","text":"ok"}],"details":{"exitCode":0}},"isError":false}"#),
+        .stdoutLine(#"{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}"#),
+        .stdoutLine(#"{"id":"stats-1","type":"response","command":"get_session_stats","success":true,"data":{"sessionFile":"/tmp/pi-session.jsonl","tokens":{"input":10,"output":3,"total":13},"contextUsage":{"tokens":13,"contextWindow":128000,"percent":0.1}}}"#),
+        .exited(15)
+    ], sentLines: sentLines), executable: "/fake/env")
+    let controller = AgentSessionController(store: store, piBackend: backend)
+
+    let summary = try await controller.runAgentTurn(
+        task: task,
+        prompt: "polish this",
+        repoURL: root,
+        snapshot: RepositorySnapshot(isGitRepository: false)
+    )
+
+    let events = try await store.events(for: task.id)
+    let lines = sentLines.values()
+
+    #expect(summary.sessions.first?.backend == .pi)
+    #expect(summary.sessions.first?.backendSessionID == "/tmp/pi-session.jsonl")
+    #expect(events.map(\.kind).contains(.toolStarted))
+    #expect(events.map(\.kind).contains(.toolFinished))
+    #expect(events.map(\.kind).contains(.assistantDone))
+    #expect(events.last?.kind == .sessionEnded)
+    #expect(lines.contains { $0.contains(#""type":"prompt""#) && $0.contains(#""message":"polish this""#) })
+    #expect(lines.contains { $0.contains(#""type":"get_session_stats""#) })
 }
 
 @Test
@@ -545,6 +669,59 @@ private actor AgentSessionUpdateSink {
     func values() -> [AgentSessionUpdate] {
         updates
     }
+}
+
+private final class SentLineRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [String] = []
+
+    func append(_ line: String) {
+        lock.withLock {
+            lines.append(line)
+        }
+    }
+
+    func values() -> [String] {
+        lock.withLock {
+            lines
+        }
+    }
+}
+
+private struct FakeInteractiveProcessRunner: ProcessInteracting {
+    let events: [ProcessStreamEvent]
+    let sentLines: SentLineRecorder
+
+    func start(
+        _ executable: String,
+        arguments: [String],
+        workingDirectory: URL?
+    ) throws -> any InteractiveProcess {
+        FakeInteractiveProcess(events: events, sentLines: sentLines)
+    }
+}
+
+private final class FakeInteractiveProcess: InteractiveProcess, @unchecked Sendable {
+    let events: AsyncThrowingStream<ProcessStreamEvent, Error>
+    private let sentLines: SentLineRecorder
+
+    init(events: [ProcessStreamEvent], sentLines: SentLineRecorder) {
+        self.sentLines = sentLines
+        self.events = AsyncThrowingStream { continuation in
+            for event in events {
+                continuation.yield(event)
+            }
+            continuation.finish()
+        }
+    }
+
+    func sendLine(_ line: String) throws {
+        sentLines.append(line)
+    }
+
+    func closeStdin() throws {}
+
+    func terminate() {}
 }
 
 private struct FakeStreamingProcessRunner: ProcessStreaming {

@@ -2,8 +2,9 @@
 
 `agentctl` is a Swift single-binary task/session manager for coding agents.
 
-The durable workflow belongs to `agentctl`; Codex and Claude are backend executors.
-Codex is the first-class backend. Claude support comes after the Codex loop is stable.
+The durable workflow belongs to `agentctl`; Codex, Pi, and Claude are backend executors.
+Codex is the primary backend. Pi RPC support is available for lighter polishing
+turns, while Claude support remains deferred.
 
 ## Design
 
@@ -13,7 +14,8 @@ agentctl
   -> Postgres task/event/memory store
   -> local git/GitHub
   -> Codex exec --json/resume backend now
-  -> Codex app-server / exec-server backend next
+  -> Pi --mode rpc backend for lighter model turns
+  -> Codex app-server / exec-server backend later
   -> Claude stream-json backend later
   -> optional Hummingbird PWA/API mode later
 ```
@@ -33,7 +35,7 @@ Swift package
 Postgres schema
 repo detection
 task/session/event model
-Codex backend boundary
+backend runtime boundary
 memory MCP boundary
 basic CLI commands
 ```
@@ -46,11 +48,19 @@ swift run agentctl
 swift run agentctl repo inspect
 swift run agentctl task new "first task" --prompt "Reply briefly."
 swift run agentctl task send first-task "Continue."
+swift run agentctl task new "polish task" --backend pi --model openai/gpt-4o-mini --prompt "Tighten README wording."
 swift run agentctl task checkpoint first-task
 swift run agentctl db schema
 ```
 
-The root command starts the interactive Codex shell. It currently supports:
+The root command starts the interactive agent shell. Use `--backend pi` when
+creating a new interactive task with Pi instead of Codex:
+
+```bash
+swift run agentctl --backend pi --model openai/gpt-4o-mini --tools read,grep,edit
+```
+
+The interactive shell currently supports:
 
 ```text
 /help

@@ -5,6 +5,7 @@ public enum BackendCapability: String, Codable, CaseIterable, Sendable {
     case structuredOutput = "structured_output"
     case appServer = "app_server"
     case execJSON = "exec_json"
+    case execText = "exec_text"
     case resumeNativeSession = "resume_native_session"
     case cancel
 }
@@ -63,5 +64,20 @@ public struct ClaudeBackendAdapter: AgentBackendAdapter {
 
     public var streamJSONCommand: [String] {
         ["claude", "--output-format", "stream-json", "--input-format", "stream-json"]
+    }
+}
+
+public struct PiBackendAdapter: AgentBackendAdapter {
+    public let descriptor = BackendDescriptor(
+        backend: .pi,
+        displayName: "Pi Coding Agent",
+        capabilities: [.structuredInput, .structuredOutput, .execText, .resumeNativeSession, .cancel],
+        notes: "Lightweight coding backend. Uses pi --mode rpc with a deterministic agentctl session file."
+    )
+
+    public init() {}
+
+    public var printCommand: [String] {
+        ["pi", "--mode", "rpc"]
     }
 }

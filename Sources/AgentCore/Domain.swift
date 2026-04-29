@@ -3,6 +3,7 @@ import Foundation
 public enum AgentBackend: String, Codable, CaseIterable, Sendable {
     case codex
     case claude
+    case pi
 }
 
 public enum TaskState: String, Codable, CaseIterable, Sendable {
