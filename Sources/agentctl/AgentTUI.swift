@@ -266,7 +266,6 @@ private final class AgentTUIModel: @unchecked Sendable {
         var turn: (task: TaskRecord, isTaskPersisted: Bool)?
         update { state in
             guard !state.isRunning else {
-                append(.error, "Another operation is already running.", to: &state)
                 return
             }
             append(.user, prompt, to: &state)
@@ -288,7 +287,6 @@ private final class AgentTUIModel: @unchecked Sendable {
         var started = false
         update { state in
             guard !state.isRunning else {
-                append(.error, "Another operation is already running.", to: &state)
                 return
             }
             state.isRunning = true
@@ -533,15 +531,22 @@ private extension NSLock {
     }
 }
 
+private enum AgentTUIQueuedInput: Sendable {
+    case prompt(String)
+    case command(String)
+}
+
 private final class AgentTUINativeLoop: @unchecked Sendable {
     private let model: AgentTUIModel
     private let renderSignal = AgentTUIRenderSignal()
     private let terminal = AgentTUINativeTerminal()
+    private let queueLock = NSLock()
     private var input = ""
     private var inputCursor = 0
     private var promptHistory: [String] = []
     private var promptHistoryIndex: Int?
     private var promptHistoryDraft = ""
+    private var queuedInputs: [AgentTUIQueuedInput] = []
     private var printedEntryKeys = Set<String>()
     private var hasPrintedTranscript = false
     private var composerLineCount = 0
@@ -584,6 +589,8 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
                 _ = handleKey(event)
                 eventsProcessed += 1
             }
+
+            drainQueuedInputIfIdle()
 
             let now = Date()
             if renderSignal.consume() {
@@ -793,12 +800,25 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             return
         }
 
-        if let command = SlashCommand(text) {
+        switch agentTUISubmission(for: text, backend: model.snapshot().task.backendPreference) {
+        case let .agentctlCommand(command):
+            guard !model.snapshot().isRunning else {
+                enqueue(.command(text))
+                return
+            }
             handle(command)
-            return
+        case let .backendPrompt(prompt):
+            guard !model.snapshot().isRunning else {
+                enqueue(.prompt(prompt))
+                return
+            }
+            startPromptTurn(prompt)
         }
+    }
 
+    private func startPromptTurn(_ text: String) {
         guard let turn = model.startTurn(prompt: text) else {
+            enqueue(.prompt(text), atFront: true, announce: false)
             return
         }
         appendPromptHistory(text)
@@ -853,6 +873,60 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         model.setRunningOperation(operation, interruptHandle: interruptHandle, cancelTaskOnInterrupt: false)
     }
 
+    private func enqueue(
+        _ queuedInput: AgentTUIQueuedInput,
+        atFront: Bool = false,
+        announce: Bool = true
+    ) {
+        let pending = queueLock.withLock { () -> Int in
+            if atFront {
+                queuedInputs.insert(queuedInput, at: 0)
+            } else {
+                queuedInputs.append(queuedInput)
+            }
+            return queuedInputs.count
+        }
+
+        guard announce else {
+            return
+        }
+
+        switch queuedInput {
+        case .prompt:
+            model.append(.system, "Queued prompt (\(pending) pending).")
+        case let .command(text):
+            model.append(.system, "Queued \(queuedCommandLabel(text)) (\(pending) pending).")
+        }
+    }
+
+    private func drainQueuedInputIfIdle() {
+        guard !shouldExit, !model.snapshot().isRunning else {
+            return
+        }
+        guard let queuedInput = queueLock.withLock({ queuedInputs.isEmpty ? nil : queuedInputs.removeFirst() }) else {
+            return
+        }
+
+        switch queuedInput {
+        case let .prompt(text):
+            startPromptTurn(text)
+        case let .command(text):
+            switch agentTUISubmission(for: text, backend: model.snapshot().task.backendPreference) {
+            case let .agentctlCommand(command):
+                handle(command)
+            case let .backendPrompt(prompt):
+                startPromptTurn(prompt)
+            }
+        }
+    }
+
+    private func queuedCommandLabel(_ text: String) -> String {
+        guard let command = SlashCommand(text) else {
+            return "command"
+        }
+        return "/\(command.name)"
+    }
+
     private func handle(_ command: SlashCommand) {
         guard let runtime = AgentTUIRuntimeBox.current else {
             model.append(.error, "TUI runtime is not available.")
@@ -864,7 +938,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         case "exit", "quit":
             releaseClaimThenExit()
         case "help":
-            model.append(.system, "/help /info /tasks /new [title] /resume <task> [--checkpoint <id|latest>] [--force] /checkpoint [--push] /checkpoints /artifacts /continue [path] /release /export [path] /events /raw /exit")
+            model.append(.system, "/help /info /tasks /new [title] /resume <task> [--checkpoint <id|latest>] [--force] /checkpoint [--push] /checkpoints /artifacts /continue [path] /release /export [path] /events /raw /exit\nUnknown /... commands are sent to Codex for Codex-backed tasks. Use //... to send /... to the backend.")
         case "raw":
             _ = model.toggleRawEvents()
         case "info", "task", "repo":
@@ -1853,15 +1927,20 @@ private struct AgentTUIView: View {
             return
         }
 
-        if let command = SlashCommand(text) {
+        switch agentTUISubmission(for: text, backend: model.snapshot().task.backendPreference) {
+        case let .agentctlCommand(command):
             handle(command)
             return
+        case let .backendPrompt(prompt):
+            startPromptTurn(prompt)
         }
+    }
 
-        guard let turn = model.startTurn(prompt: text) else {
+    private func startPromptTurn(_ prompt: String) {
+        guard let turn = model.startTurn(prompt: prompt) else {
             return
         }
-        appendPromptHistory(text)
+        appendPromptHistory(prompt)
 
         guard let runtime = AgentTUIRuntimeBox.current else {
             model.failTurn(RuntimeError("TUI runtime is not available."))
@@ -1884,7 +1963,7 @@ private struct AgentTUIView: View {
                 _ = try await refreshResumeClaimIfActive(task: currentTask, store: runtime.store)
                 _ = try await runAgentTurn(
                     task: currentTask,
-                    prompt: text,
+                    prompt: prompt,
                     repoURL: runtime.repoURL,
                     snapshot: runtime.snapshot,
                     store: runtime.store,
@@ -1923,7 +2002,7 @@ private struct AgentTUIView: View {
         case "exit", "quit":
             releaseClaimThenExit()
         case "help":
-            model.append(.system, "/help /info /tasks /new [title] /resume <task> [--checkpoint <id|latest>] [--force] /checkpoint [--push] /checkpoints /artifacts /continue [path] /release /export [path] /events /raw /exit")
+            model.append(.system, "/help /info /tasks /new [title] /resume <task> [--checkpoint <id|latest>] [--force] /checkpoint [--push] /checkpoints /artifacts /continue [path] /release /export [path] /events /raw /exit\nUnknown /... commands are sent to Codex for Codex-backed tasks. Use //... to send /... to the backend.")
         case "raw":
             _ = model.toggleRawEvents()
         case "info", "task", "repo":
