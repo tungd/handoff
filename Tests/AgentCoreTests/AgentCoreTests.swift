@@ -246,6 +246,32 @@ func codexStreamingBackendEmitsUpdatesAsLinesArrive() async throws {
 }
 
 @Test
+func codexStreamingBackendForwardsInterruptEscape() async throws {
+    let sentData = SentDataRecorder()
+    let backend = CodexStreamingBackend(runner: FakeStreamingProcessRunner(events: [
+        .stdoutLine(#"{"type":"item.completed","item":{"type":"agent_message","text":"stopped"}}"#),
+        .exited(0)
+    ], control: ProcessStreamControl(sendData: { data in
+        sentData.append(data)
+    })), executable: "/fake/env")
+    let interruptHandle = AgentInterruptHandle()
+    var requestedInterrupt = false
+
+    _ = try await backend.run(
+        prompt: "hello",
+        cwd: URL(fileURLWithPath: "/tmp/repo"),
+        interruptHandle: interruptHandle
+    ) { _ in
+        if !requestedInterrupt {
+            requestedInterrupt = true
+            #expect(interruptHandle.requestInterrupt())
+        }
+    }
+
+    #expect(sentData.values() == [Data([0x1B])])
+}
+
+@Test
 func codexExecArgumentsUseFreshExecShape() {
     let backend = CodexExecBackend()
     let args = backend.makeArguments(
@@ -519,6 +545,35 @@ func agentSessionControllerPersistsPiRPCTurn() async throws {
 }
 
 @Test
+func piRPCBackendSendsAbortCommandWhenInterrupted() async throws {
+    let sentLines = SentLineRecorder()
+    let backend = PiRPCBackend(runner: FakeInteractiveProcessRunner(events: [
+        .stdoutLine(#"{"id":"prompt-1","type":"response","command":"prompt","success":true}"#),
+        .stdoutLine(#"{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"stopped"}]}]}"#),
+        .stdoutLine(#"{"id":"stats-1","type":"response","command":"get_session_stats","success":true,"data":{"sessionFile":"/tmp/pi-session.jsonl"}}"#),
+        .exited(0)
+    ], sentLines: sentLines), executable: "/fake/env")
+    let interruptHandle = AgentInterruptHandle()
+    var requestedInterrupt = false
+
+    _ = try await backend.run(
+        prompt: "polish",
+        cwd: URL(fileURLWithPath: "/tmp/repo"),
+        sessionPath: URL(fileURLWithPath: "/tmp/pi-session.jsonl"),
+        interruptHandle: interruptHandle
+    ) { _ in
+        if !requestedInterrupt {
+            requestedInterrupt = true
+            #expect(interruptHandle.requestInterrupt())
+        }
+    }
+
+    let lines = sentLines.values()
+    #expect(lines.contains { $0.contains(#""type":"prompt""#) })
+    #expect(lines.contains { $0.contains(#""type":"abort""#) })
+}
+
+@Test
 func gitCheckpointManagerCreatesBranchCommitsChangesAndReturnsCheckpoint() throws {
     let root = URL(fileURLWithPath: "/tmp/repo", isDirectory: true)
     let task = TaskRecord(title: "Cashout Race", slug: "cashout-race")
@@ -688,6 +743,23 @@ private final class SentLineRecorder: @unchecked Sendable {
     }
 }
 
+private final class SentDataRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data: [Data] = []
+
+    func append(_ value: Data) {
+        lock.withLock {
+            data.append(value)
+        }
+    }
+
+    func values() -> [Data] {
+        lock.withLock {
+            data
+        }
+    }
+}
+
 private struct FakeInteractiveProcessRunner: ProcessInteracting {
     let events: [ProcessStreamEvent]
     let sentLines: SentLineRecorder
@@ -726,6 +798,7 @@ private final class FakeInteractiveProcess: InteractiveProcess, @unchecked Senda
 
 private struct FakeStreamingProcessRunner: ProcessStreaming {
     let events: [ProcessStreamEvent]
+    var control: ProcessStreamControl?
 
     func stream(
         _ executable: String,
@@ -738,6 +811,17 @@ private struct FakeStreamingProcessRunner: ProcessStreaming {
             }
             continuation.finish()
         }
+    }
+
+    func controlledStream(
+        _ executable: String,
+        arguments: [String],
+        workingDirectory: URL?
+    ) -> ProcessStreamSession {
+        ProcessStreamSession(
+            events: stream(executable, arguments: arguments, workingDirectory: workingDirectory),
+            control: control
+        )
     }
 }
 

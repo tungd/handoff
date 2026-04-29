@@ -359,7 +359,7 @@ private final class AgentTUIModel: @unchecked Sendable {
                 append(.error, "Current operation does not expose an interrupt channel.", to: &state)
             }
         }
-        return accepted
+        return true
     }
 
     func toggleRawEvents() -> Bool {

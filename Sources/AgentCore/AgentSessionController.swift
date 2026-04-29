@@ -22,15 +22,18 @@ public enum AgentSessionUpdate: Equatable, Sendable {
 public struct AgentSessionController: Sendable {
     private let store: any AgentTaskStore
     private let codexBackend: CodexStreamingBackend
+    private let codexInterruptBackend: CodexStreamingBackend
     private let piBackend: PiRPCBackend
 
     public init(
         store: any AgentTaskStore,
         codexBackend: CodexStreamingBackend = CodexStreamingBackend(),
+        codexInterruptBackend: CodexStreamingBackend = CodexStreamingBackend(runner: SubprocessPTYStreamRunner()),
         piBackend: PiRPCBackend = PiRPCBackend()
     ) {
         self.store = store
         self.codexBackend = codexBackend
+        self.codexInterruptBackend = codexInterruptBackend
         self.piBackend = piBackend
     }
 
@@ -41,6 +44,7 @@ public struct AgentSessionController: Sendable {
         snapshot: RepositorySnapshot,
         codexOptions: CodexExecOptions = CodexExecOptions(),
         piOptions: PiRPCOptions = PiRPCOptions(),
+        interruptHandle: AgentInterruptHandle? = nil,
         onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void = { _ in }
     ) async throws -> TaskRunSummary {
         switch task.backendPreference {
@@ -51,6 +55,7 @@ public struct AgentSessionController: Sendable {
                 repoURL: repoURL,
                 snapshot: snapshot,
                 options: codexOptions,
+                interruptHandle: interruptHandle,
                 onUpdate: onUpdate
             )
         case .pi:
@@ -60,6 +65,7 @@ public struct AgentSessionController: Sendable {
                 repoURL: repoURL,
                 snapshot: snapshot,
                 options: piOptions,
+                interruptHandle: interruptHandle,
                 onUpdate: onUpdate
             )
         case .claude:
@@ -73,6 +79,7 @@ public struct AgentSessionController: Sendable {
         repoURL: URL,
         snapshot: RepositorySnapshot,
         options: CodexExecOptions = CodexExecOptions(),
+        interruptHandle: AgentInterruptHandle? = nil,
         onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void = { _ in }
     ) async throws -> TaskRunSummary {
         guard task.backendPreference == .codex else {
@@ -102,11 +109,13 @@ public struct AgentSessionController: Sendable {
             "text": .string(prompt)
         ]), onUpdate: onUpdate)
 
-        let result = try await codexBackend.run(
+        let activeCodexBackend = interruptHandle == nil ? codexBackend : codexInterruptBackend
+        let result = try await activeCodexBackend.run(
             prompt: prompt,
             cwd: cwd,
             resumeThreadID: session.backendSessionID,
-            options: options
+            options: options,
+            interruptHandle: interruptHandle
         ) { update in
             switch update {
             case let .mappedLine(mapped):
@@ -155,6 +164,7 @@ public struct AgentSessionController: Sendable {
         repoURL: URL,
         snapshot: RepositorySnapshot,
         options: PiRPCOptions = PiRPCOptions(),
+        interruptHandle: AgentInterruptHandle? = nil,
         onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void = { _ in }
     ) async throws -> TaskRunSummary {
         guard task.backendPreference == .pi else {
@@ -190,7 +200,8 @@ public struct AgentSessionController: Sendable {
             prompt: prompt,
             cwd: cwd,
             sessionPath: sessionPath,
-            options: options
+            options: options,
+            interruptHandle: interruptHandle
         ) { update in
             switch update {
             case let .mappedLine(mapped):

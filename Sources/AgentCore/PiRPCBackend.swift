@@ -83,6 +83,7 @@ public struct PiRPCBackend: Sendable {
         cwd: URL,
         sessionPath: URL,
         options: PiRPCOptions = PiRPCOptions(),
+        interruptHandle: AgentInterruptHandle? = nil,
         onUpdate: (PiRPCStreamUpdate) async throws -> Void
     ) async throws -> PiRPCResult {
         try FileManager.default.createDirectory(
@@ -103,6 +104,21 @@ public struct PiRPCBackend: Sendable {
             "type": "prompt",
             "message": prompt
         ]))
+
+        interruptHandle?.setAction {
+            do {
+                try process.sendLine(Self.encodeCommand([
+                    "id": "abort-\(UUID().uuidString)",
+                    "type": "abort"
+                ]))
+                return true
+            } catch {
+                return false
+            }
+        }
+        defer {
+            interruptHandle?.clearAction()
+        }
 
         var exitCode: Int32 = 0
         var stderrLines: [String] = []
