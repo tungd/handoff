@@ -5,17 +5,20 @@ public struct CodexExecOptions: Codable, Equatable, Sendable {
     public var sandbox: String?
     public var model: String?
     public var profile: String?
+    public var imagePaths: [String]?  // Paths to image files for -i/--image option
 
     public init(
         fullAuto: Bool = false,
         sandbox: String? = nil,
         model: String? = nil,
-        profile: String? = nil
+        profile: String? = nil,
+        imagePaths: [String]? = nil
     ) {
         self.fullAuto = fullAuto
         self.sandbox = sandbox
         self.model = model
         self.profile = profile
+        self.imagePaths = imagePaths
     }
 }
 
@@ -108,6 +111,13 @@ public struct CodexExecBackend: Sendable {
 
         if resumeThreadID == nil, let profile = options.profile {
             arguments += ["--profile", profile]
+        }
+
+        // Add image attachments (-i is repeatable for multiple images)
+        if resumeThreadID == nil, let imagePaths = options.imagePaths {
+            for imagePath in imagePaths {
+                arguments += ["-i", imagePath]
+            }
         }
 
         if let resumeThreadID {

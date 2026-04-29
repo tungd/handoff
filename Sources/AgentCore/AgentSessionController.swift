@@ -56,6 +56,7 @@ public struct AgentSessionController: Sendable {
                 repoURL: repoURL,
                 snapshot: snapshot,
                 options: codexOptions,
+                images: images,
                 interruptHandle: interruptHandle,
                 onUpdate: onUpdate
             )
@@ -81,11 +82,31 @@ public struct AgentSessionController: Sendable {
         repoURL: URL,
         snapshot: RepositorySnapshot,
         options: CodexExecOptions = CodexExecOptions(),
+        images: [PiRPCImage] = [],
         interruptHandle: AgentInterruptHandle? = nil,
         onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void = { _ in }
     ) async throws -> TaskRunSummary {
         guard task.backendPreference == .codex else {
             throw AgentSessionControllerError.unsupportedBackend(task.backendPreference)
+        }
+
+        // Save images to temp files for Codex CLI (-i option requires file paths)
+        var imageTempFiles: [URL] = []
+        var codexOptions = options
+        if !images.isEmpty {
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("agentctl-images")
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            for image in images {
+                // Decode base64 and write to temp file
+                guard let imageData = Data(base64Encoded: image.data) else {
+                    continue
+                }
+                let ext = mimeTypeExtension(image.mimeType)
+                let tempFile = tempDir.appendingPathComponent(UUID().uuidString + ext)
+                try imageData.write(to: tempFile)
+                imageTempFiles.append(tempFile)
+            }
+            codexOptions.imagePaths = imageTempFiles.map { $0.path }
         }
 
         let cwd = snapshot.rootPath.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? repoURL
@@ -104,19 +125,25 @@ public struct AgentSessionController: Sendable {
         try await appendAndEmit(AgentEvent(taskID: task.id, sessionID: session.id, kind: .sessionStarted, payload: [
             "backend": .string(session.backend.rawValue),
             "cwd": .string(session.cwd),
-            "resumeThreadID": session.backendSessionID.map { .string($0) } ?? .null
+            "resumeThreadID": session.backendSessionID.map { .string($0) } ?? .null,
+            "imageCount": .int(Int64(images.count))
         ]), onUpdate: onUpdate)
 
-        try await appendAndEmit(AgentEvent(taskID: task.id, sessionID: session.id, kind: .userMessage, payload: [
-            "text": .string(prompt)
-        ]), onUpdate: onUpdate)
+        // Include images in userMessage payload if present
+        var userMessagePayload: [String: JSONValue] = ["text": .string(prompt)]
+        if !images.isEmpty {
+            userMessagePayload["images"] = .array(images.map { img in
+                .object(["type": .string("image"), "data": .string(img.data), "mimeType": .string(img.mimeType)])
+            })
+        }
+        try await appendAndEmit(AgentEvent(taskID: task.id, sessionID: session.id, kind: .userMessage, payload: userMessagePayload), onUpdate: onUpdate)
 
         let activeCodexBackend = interruptHandle == nil ? codexBackend : codexInterruptBackend
         let result = try await activeCodexBackend.run(
             prompt: prompt,
             cwd: cwd,
             resumeThreadID: session.backendSessionID,
-            options: options,
+            options: codexOptions,
             interruptHandle: interruptHandle
         ) { update in
             switch update {
@@ -152,6 +179,11 @@ public struct AgentSessionController: Sendable {
 
         try await store.saveSession(session)
         try await onUpdate(.session(session))
+
+        // Clean up temp image files
+        for tempFile in imageTempFiles {
+            try? FileManager.default.removeItem(at: tempFile)
+        }
 
         if result.exitCode != 0 {
             throw AgentSessionControllerError.backendFailed(exitCode: result.exitCode, stderr: result.stderr)
@@ -265,5 +297,19 @@ public struct AgentSessionController: Sendable {
         let stored = try await store.appendEvent(event)
         try await onUpdate(.event(stored))
         return stored
+    }
+}
+
+/// Get file extension from MIME type for temp file creation.
+private func mimeTypeExtension(_ mimeType: String) -> String {
+    switch mimeType.lowercased() {
+    case "image/png": return ".png"
+    case "image/jpeg", "image/jpg": return ".jpg"
+    case "image/gif": return ".gif"
+    case "image/webp": return ".webp"
+    case "image/svg+xml": return ".svg"
+    case "application/pdf": return ".pdf"
+    case "text/plain": return ".txt"
+    default: return ".bin"
     }
 }
