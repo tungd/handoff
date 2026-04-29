@@ -1219,17 +1219,19 @@ func prepareResumeHandoff(
         _ = try? await store.releaseTaskClaim(taskID: task.id, ownerName: claim.ownerName)
         throw error
     }
-    onStatus?("recording resume metadata...")
+    onStatus?("recording claim metadata...")
     try await store.appendEvent(AgentEvent(
         taskID: task.id,
         kind: .taskClaimed,
         payload: taskClaimPayload(claim)
     ))
+    onStatus?("recording restore metadata...")
     try await store.appendEvent(AgentEvent(
         taskID: task.id,
         kind: .backendEvent,
         payload: checkpointRestorePayload(result, claim: claim)
     ))
+    onStatus?("resume metadata recorded")
     return ResumeHandoffResult(restore: result, claim: claim)
 }
 

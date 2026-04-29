@@ -170,6 +170,15 @@ struct AgentTUIMarkdownTests {
         #expect(rendered.first?.count == 1)
         #expect(rendered.first.map(agentTUIPlainText) == "$ pnpm test")
     }
+
+    @Test
+    func hydratedTranscriptTextKeepsRecentTail() {
+        let text = "abcdef"
+        let truncated = agentTUIHydratedTranscriptText(text, limit: 3)
+
+        #expect(truncated == "[... 3 chars truncated from earlier transcript ...]\ndef")
+        #expect(agentTUIHydratedTranscriptText(text, limit: 10) == text)
+    }
 }
 
 private func span(

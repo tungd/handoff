@@ -3,7 +3,9 @@ import Darwin
 import Foundation
 import TUIkit
 
-private let agentTUITranscriptEventLimit = 500
+private let agentTUITranscriptEventLimit = 80
+private let agentTUIHydratedUserTextLimit = 2_000
+private let agentTUIHydratedAssistantTextLimit = 8_000
 private let agentTUITranscriptEventKinds: [EventKind] = [
     .userMessage,
     .assistantDone,
@@ -1516,11 +1518,11 @@ private func tuiEntries(
         switch event.kind {
         case .userMessage:
             if let text = event.payload["text"]?.stringValue {
-                append(.user, text)
+                append(.user, agentTUIHydratedTranscriptText(text, limit: agentTUIHydratedUserTextLimit))
             }
         case .assistantDone:
             if let text = event.payload["text"]?.stringValue {
-                append(.assistant, text)
+                append(.assistant, agentTUIHydratedTranscriptText(text, limit: agentTUIHydratedAssistantTextLimit))
             }
         case .toolStarted:
             append(
@@ -1556,6 +1558,14 @@ private func tuiEntries(
     }
 
     return entries
+}
+
+func agentTUIHydratedTranscriptText(_ text: String, limit: Int) -> String {
+    guard text.count > limit else {
+        return text
+    }
+
+    return "[... \(text.count - limit) chars truncated from earlier transcript ...]\n\(text.suffix(limit))"
 }
 
 private func tuiInfo(task: TaskRecord, summary: TaskRunSummary, runtime: AgentTUIRuntime) -> String {
