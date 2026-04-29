@@ -159,6 +159,7 @@ private struct AgentTUISnapshot: Sendable {
     var entries: [TUITranscriptEntry]
     var status: String
     var tokenUsage: TUITokenUsage?
+    var scrollOffset: Int
     var showRawEvents: Bool
     var isRunning: Bool
     var isTaskPersisted: Bool
@@ -208,6 +209,7 @@ private final class AgentTUIModel: @unchecked Sendable {
             entries: entries,
             status: "ready",
             tokenUsage: nil,
+            scrollOffset: 0,
             showRawEvents: false,
             isRunning: false,
             isTaskPersisted: isTaskPersisted,
@@ -384,8 +386,15 @@ private final class AgentTUIModel: @unchecked Sendable {
             state.task = task
             state.isTaskPersisted = isTaskPersisted
             state.entries = entries
+            state.scrollOffset = 0
             append(.system, message, to: &state)
             state.status = "ready"
+        }
+    }
+
+    func adjustScroll(_ delta: Int, maxOffset: Int) {
+        update { state in
+            state.scrollOffset = min(max(0, state.scrollOffset + delta), max(0, maxOffset))
         }
     }
 
@@ -447,6 +456,7 @@ private final class AgentTUIModel: @unchecked Sendable {
             style: resolvedStyle,
             toolKey: toolKey
         ))
+        state.scrollOffset = 0
     }
 
     private func appendToolCall(
@@ -527,12 +537,15 @@ private struct AgentTUIView: View {
             maxRows: maxInputRows
         ).count
         let composerHeight = 6 + inputRows
-        let transcriptHeight = max(3, size.rows - composerHeight)
+        let transcriptHeight = max(3, size.rows - 2 - composerHeight)
         let lines = transcriptLines(snapshot.entries, width: max(40, size.columns - 4))
-        // Show the most recent lines that fit in the transcript area
-        let visibleLines = lines.count <= transcriptHeight ? lines : Array(lines.dropFirst(lines.count - transcriptHeight))
+        let maxScrollOffset = max(0, lines.count - transcriptHeight)
+        let scrollOffset = clampedScrollOffset(snapshot.scrollOffset, maxOffset: maxScrollOffset)
+        let visibleLines = visibleLines(lines, height: transcriptHeight, scrollOffset: scrollOffset)
 
         VStack(alignment: .leading, spacing: 0) {
+            header(snapshot)
+            dividerLine(label: nil, width: max(20, size.columns))
             VStack(alignment: .leading, spacing: 0) {
                 ViewArray(visibleLines.map(transcriptLine))
             }
@@ -548,9 +561,18 @@ private struct AgentTUIView: View {
         .palette(AgentTUIPalette())
         .appearance(.line)
         .onKeyPress { event in
-            handleKey(event)
+            handleKey(event, pageSize: transcriptHeight, maxScrollOffset: maxScrollOffset)
         }
         .agentStatusBarConfiguration()
+    }
+
+    private func header(_ snapshot: AgentTUISnapshot) -> some View {
+        HStack(spacing: 1) {
+            Text("agentctl").foregroundStyle(.palette.accent)
+            Text(snapshot.task.slug).foregroundStyle(.palette.foregroundTertiary)
+            Spacer()
+            Text(storeName).foregroundStyle(.palette.foregroundTertiary)
+        }
     }
 
     private func composer(
@@ -1028,7 +1050,7 @@ private struct AgentTUIView: View {
         model.setRunningOperation(runningOperation)
     }
 
-    private func handleKey(_ event: KeyEvent) -> Bool {
+    private func handleKey(_ event: KeyEvent, pageSize: Int, maxScrollOffset: Int) -> Bool {
         switch event.key {
         case .enter where event.shift || event.alt:
             insertInput("\n")
@@ -1069,6 +1091,12 @@ private struct AgentTUIView: View {
         case .character("n") where event.ctrl:
             moveInputLineOrHistory(delta: 1)
             return true
+        case .character("u") where event.ctrl:
+            model.adjustScroll(-pageSize, maxOffset: maxScrollOffset)
+            return true
+        case .character("d") where event.ctrl:
+            model.adjustScroll(pageSize, maxOffset: maxScrollOffset)
+            return true
         case .backspace where event.alt:
             killInputWordBackward()
             return true
@@ -1083,6 +1111,24 @@ private struct AgentTUIView: View {
             return true
         case .right:
             inputCursor = min(input.count, inputCursor + 1)
+            return true
+        case .up where event.ctrl:
+            model.adjustScroll(1, maxOffset: maxScrollOffset)
+            return true
+        case .down where event.ctrl:
+            model.adjustScroll(-1, maxOffset: maxScrollOffset)
+            return true
+        case .up:
+            inputCursor = agentTUIMoveCursorUp(lines: agentTUIInputLines(input), cursor: inputCursor)
+            return true
+        case .down:
+            inputCursor = agentTUIMoveCursorDown(lines: agentTUIInputLines(input), cursor: inputCursor)
+            return true
+        case .pageUp:
+            model.adjustScroll(-pageSize, maxOffset: maxScrollOffset)
+            return true
+        case .pageDown:
+            model.adjustScroll(pageSize, maxOffset: maxScrollOffset)
             return true
         case .home:
             inputCursor = 0
@@ -1828,6 +1874,48 @@ func agentTUIInputLineIndex(lines: [AgentTUIInputLine], cursor: Int) -> Int {
         return index
     }
     return clampedCursor < lines[0].start ? 0 : lines.count - 1
+}
+
+func agentTUIMoveCursorUp(lines: [AgentTUIInputLine], cursor: Int) -> Int {
+    guard !lines.isEmpty else {
+        return 0
+    }
+    let currentLineIndex = agentTUIInputLineIndex(lines: lines, cursor: cursor)
+    if currentLineIndex == 0 {
+        return cursor
+    }
+    let currentLine = lines[currentLineIndex]
+    let column = cursor - currentLine.start
+    let targetLine = lines[currentLineIndex - 1]
+    return targetLine.start + min(column, targetLine.end - targetLine.start)
+}
+
+func agentTUIMoveCursorDown(lines: [AgentTUIInputLine], cursor: Int) -> Int {
+    guard !lines.isEmpty else {
+        return 0
+    }
+    let currentLineIndex = agentTUIInputLineIndex(lines: lines, cursor: cursor)
+    if currentLineIndex == lines.count - 1 {
+        return cursor
+    }
+    let currentLine = lines[currentLineIndex]
+    let column = cursor - currentLine.start
+    let targetLine = lines[currentLineIndex + 1]
+    return targetLine.start + min(column, targetLine.end - targetLine.start)
+}
+
+private func clampedScrollOffset(_ offset: Int, maxOffset: Int) -> Int {
+    min(max(0, offset), maxOffset)
+}
+
+private func visibleLines(_ lines: [TUITranscriptLine], height: Int, scrollOffset: Int) -> [TUITranscriptLine] {
+    guard lines.count > height else {
+        return lines
+    }
+    // scrollOffset is from the bottom: 0 = show most recent content
+    // When scrollOffset > 0, we're scrolling up into older content
+    let start = max(0, lines.count - height - scrollOffset)
+    return Array(lines[start..<start + height])
 }
 
 func agentTUIKillToEndOfLine(input: String, cursor: Int) -> (input: String, cursor: Int) {
