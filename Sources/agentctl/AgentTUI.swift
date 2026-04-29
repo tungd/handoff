@@ -723,7 +723,8 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
     private func renderTranscriptAndComposer(forceTranscript: Bool = false) {
         let snapshot = model.snapshot()
         let width = max(40, terminalSize().columns)
-        clearComposer()
+        // Hide cursor during redraw to prevent flicker
+        terminal.write("\u{1B}[?25l")
 
         for entry in snapshot.entries {
             let key = transcriptRenderKey(entry)
@@ -742,7 +743,9 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             }
         }
 
+        // Cursor is now at start of line below transcript - that's where composer starts
         drawComposer(snapshot: snapshot)
+        terminal.write("\u{1B}[?25h")
     }
 
     private func renderComposerOnly() {
@@ -773,17 +776,23 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
     }
 
     private func drawComposer(snapshot: AgentTUISnapshot) {
-        let width = max(20, terminalSize().columns)
-        let maxInputRows = max(1, min(8, terminalSize().rows / 3))
+        let size = terminalSize()
+        let width = max(20, size.columns)
+        let maxInputRows = max(1, min(8, size.rows / 3))
         let rows = agentTUIComposerRows(input: input, cursor: inputCursor, width: width, maxRows: maxInputRows)
         let palette = AgentTUIPalette()
         let lines = nativeComposerLines(snapshot: snapshot, rows: rows, width: width, palette: palette)
 
+        // Position cursor at bottom of terminal where composer should start
+        let composerStartRow = size.rows - lines.count + 1  // +1 because terminal rows are 1-indexed
+        terminal.write("\u{1B}[\(composerStartRow);1H")  // Move to absolute row, column 1
+
+        // Draw each line: newline between lines, padded content erases old trailing content
         for (index, line) in lines.enumerated() {
-            terminal.write(paddedANSI(line, width: width))
-            if index < lines.count - 1 {
+            if index > 0 {
                 terminal.write("\r\n")
             }
+            terminal.write(paddedANSI(line, width: width))
         }
         composerLineCount = lines.count
     }
