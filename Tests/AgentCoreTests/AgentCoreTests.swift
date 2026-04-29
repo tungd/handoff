@@ -680,6 +680,35 @@ func gitCheckpointManagerRestoresPushedCheckpointFromRemote() throws {
 }
 
 @Test
+func gitCheckpointManagerSkipsFetchWhenLocalBranchAlreadyContainsPushedCheckpoint() throws {
+    let root = URL(fileURLWithPath: "/tmp/repo", isDirectory: true)
+    let checkpoint = CheckpointRecord(
+        taskID: UUID(),
+        branch: "agent/handoff",
+        commitSHA: "feedface",
+        remoteName: "origin",
+        pushedAt: Date(timeIntervalSince1970: 0)
+    )
+    let manager = GitCheckpointManager(git: GitRunner(runner: FakeProcessRunner(responses: [
+        gitKey("status", "--porcelain=v1", "--", ".", ":!.agentctl"): ok(""),
+        gitKey("show-ref", "--verify", "--quiet", "refs/heads/agent/handoff"): ok(""),
+        gitKey("merge-base", "--is-ancestor", "feedface", "agent/handoff"): ok(""),
+        gitKey("switch", "agent/handoff"): ok(""),
+        gitKey("rev-parse", "HEAD"): ok("feedface\n")
+    ])))
+
+    let result = try manager.restoreCheckpoint(
+        checkpoint,
+        snapshot: RepositorySnapshot(isGitRepository: true, rootPath: root.path),
+        repoURL: root
+    )
+
+    #expect(result.fetched == false)
+    #expect(result.fastForwarded == false)
+    #expect(result.headSHA == "feedface")
+}
+
+@Test
 func gitCheckpointManagerRestoresLocalCheckpointWithoutFetching() throws {
     let root = URL(fileURLWithPath: "/tmp/repo", isDirectory: true)
     let checkpoint = CheckpointRecord(

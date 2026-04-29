@@ -4,6 +4,12 @@ import Foundation
 import TUIkit
 
 private let agentTUITranscriptEventLimit = 500
+private let agentTUITranscriptEventKinds: [EventKind] = [
+    .userMessage,
+    .assistantDone,
+    .toolStarted,
+    .toolFinished
+]
 
 private struct AgentTUIRuntime: @unchecked Sendable {
     var task: TaskRecord
@@ -984,12 +990,14 @@ private struct AgentTUIView: View {
                     repoURL: runtime.repoURL,
                     snapshot: runtime.snapshot,
                     checkpointSelector: resume.checkpointSelector,
-                    forceClaim: resume.forceClaim
+                    forceClaim: resume.forceClaim,
+                    onStatus: { status in model.setStatus(status) }
                 )
                 if handoff.restore != nil {
                     let updatedSnapshot = try RepositoryInspector().inspect(path: runtime.repoURL)
                     await updateAgentTUIRuntimeSnapshot(updatedSnapshot)
                 }
+                model.setStatus("loading recent transcript...")
                 let loadedEntries = try await tuiEntries(for: resumedTask.id, store: runtime.store)
                 await updateAgentTUIRuntimeTask(resumedTask)
                 var message = "Resumed task \(resumedTask.slug)."
@@ -1504,7 +1512,7 @@ private func tuiEntries(
         ))
     }
 
-    for event in try await store.recentEvents(for: taskID, limit: eventLimit) {
+    for event in try await store.recentEvents(for: taskID, limit: eventLimit, kinds: agentTUITranscriptEventKinds) {
         switch event.kind {
         case .userMessage:
             if let text = event.payload["text"]?.stringValue {

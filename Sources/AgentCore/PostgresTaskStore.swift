@@ -90,6 +90,51 @@ public struct PostgresTaskStore: AgentTaskStore {
             ORDER BY updated_at DESC
             """)
 
+        return try await decodeTasks(rows)
+    }
+
+    public func findTask(_ identifier: String) async throws -> TaskRecord {
+        let identifier = identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let uuid = UUID(uuidString: identifier) {
+            let rows = try await client.query("""
+                SELECT id, repo_id, title, slug, backend_preference, state, created_at, updated_at
+                FROM tasks
+                WHERE id = \(uuid)
+                LIMIT 1
+                """)
+            if let task = try await decodeTasks(rows).first {
+                return task
+            }
+        }
+
+        let slugRows = try await client.query("""
+            SELECT id, repo_id, title, slug, backend_preference, state, created_at, updated_at
+            FROM tasks
+            WHERE slug = \(identifier)
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """)
+        if let task = try await decodeTasks(slugRows).first {
+            return task
+        }
+
+        let idPrefix = "\(identifier.lowercased())%"
+        let prefixRows = try await client.query("""
+            SELECT id, repo_id, title, slug, backend_preference, state, created_at, updated_at
+            FROM tasks
+            WHERE lower(id::text) LIKE \(idPrefix)
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """)
+        if let task = try await decodeTasks(prefixRows).first {
+            return task
+        }
+
+        throw LocalTaskStoreError.taskNotFound(identifier)
+    }
+
+    private func decodeTasks(_ rows: PostgresRowSequence) async throws -> [TaskRecord] {
         var tasks: [TaskRecord] = []
         for try await (id, repoID, title, slug, backend, state, createdAt, updatedAt) in rows.decode((
             UUID,
@@ -113,25 +158,6 @@ public struct PostgresTaskStore: AgentTaskStore {
             ))
         }
         return tasks
-    }
-
-    public func findTask(_ identifier: String) async throws -> TaskRecord {
-        let tasks = try await listTasks()
-
-        if let uuid = UUID(uuidString: identifier),
-           let task = tasks.first(where: { $0.id == uuid }) {
-            return task
-        }
-
-        if let task = tasks.first(where: { $0.slug == identifier }) {
-            return task
-        }
-
-        if let task = tasks.first(where: { $0.id.uuidString.lowercased().hasPrefix(identifier.lowercased()) }) {
-            return task
-        }
-
-        throw LocalTaskStoreError.taskNotFound(identifier)
     }
 
     public func saveSession(_ session: SessionRecord) async throws {
@@ -533,6 +559,48 @@ public struct PostgresTaskStore: AgentTaskStore {
             ORDER BY seq DESC
             LIMIT \(boundedLimit)
             """)
+
+        var events: [AgentEvent] = []
+        for try await (id, taskID, sessionID, sequence, kind, occurredAt, payloadText) in rows.decode((
+            UUID,
+            UUID?,
+            UUID?,
+            Int64?,
+            String,
+            Date,
+            String
+        ).self) {
+            let payloadData = Data(payloadText.utf8)
+            let payload = try decoder.decode([String: JSONValue].self, from: payloadData)
+            events.append(AgentEvent(
+                id: id,
+                taskID: taskID,
+                sessionID: sessionID,
+                sequence: sequence,
+                kind: EventKind(rawValue: kind) ?? .backendEvent,
+                occurredAt: occurredAt,
+                payload: payload
+            ))
+        }
+        return events.sorted { ($0.sequence ?? 0) < ($1.sequence ?? 0) }
+    }
+
+    public func recentEvents(for taskID: UUID, limit: Int, kinds: [EventKind]) async throws -> [AgentEvent] {
+        guard limit > 0, !kinds.isEmpty else {
+            return []
+        }
+        let boundedLimit = min(limit, 500)
+        let kindList = kinds
+            .map { "'\($0.rawValue.replacingOccurrences(of: "'", with: "''"))'" }
+            .joined(separator: ", ")
+        let rows = try await client.query(PostgresQuery(unsafeSQL: """
+            SELECT id, task_id, session_id, seq, kind, occurred_at, payload::text
+            FROM events
+            WHERE task_id = '\(taskID.uuidString)'::uuid
+              AND kind IN (\(kindList))
+            ORDER BY seq DESC
+            LIMIT \(boundedLimit)
+            """))
 
         var events: [AgentEvent] = []
         for try await (id, taskID, sessionID, sequence, kind, occurredAt, payloadText) in rows.decode((

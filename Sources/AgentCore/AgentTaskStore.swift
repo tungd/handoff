@@ -30,6 +30,7 @@ public protocol AgentTaskStore: Sendable {
     func appendEvent(_ event: AgentEvent) async throws -> AgentEvent
     func events(for taskID: UUID) async throws -> [AgentEvent]
     func recentEvents(for taskID: UUID, limit: Int) async throws -> [AgentEvent]
+    func recentEvents(for taskID: UUID, limit: Int, kinds: [EventKind]) async throws -> [AgentEvent]
     func summary(for task: TaskRecord, eventLimit: Int) async throws -> TaskRunSummary
 }
 
@@ -139,6 +140,14 @@ extension LocalTaskStore: AgentTaskStore {
             return []
         }
         return Array(try await events(for: taskID).suffix(limit))
+    }
+
+    public func recentEvents(for taskID: UUID, limit: Int, kinds: [EventKind]) async throws -> [AgentEvent] {
+        guard limit > 0, !kinds.isEmpty else {
+            return []
+        }
+        let allowed = Set(kinds)
+        return Array(try await events(for: taskID).filter { allowed.contains($0.kind) }.suffix(limit))
     }
 
     public func summary(for task: TaskRecord, eventLimit: Int) async throws -> TaskRunSummary {

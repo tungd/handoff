@@ -348,7 +348,8 @@ public struct GitCheckpointManager: Sendable {
     public func restoreCheckpoint(
         _ checkpoint: CheckpointRecord,
         snapshot: RepositorySnapshot,
-        repoURL: URL
+        repoURL: URL,
+        onProgress: (@Sendable (String) -> Void)? = nil
     ) throws -> GitCheckpointRestoreResult {
         guard snapshot.isGitRepository else {
             throw GitCheckpointError.notGitRepository
@@ -358,14 +359,17 @@ public struct GitCheckpointManager: Sendable {
             fileURLWithPath: snapshot.rootPath ?? repoURL.path,
             isDirectory: true
         )
-        let shouldFetch = checkpoint.pushedAt != nil
         let remoteBranch = "\(checkpoint.remoteName)/\(checkpoint.branch)"
+        onProgress?("checking worktree...")
         let dirtyStatus = try workingTreeStatus(workingDirectory: rootURL)
         if !dirtyStatus.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             throw GitCheckpointError.dirtyWorktree(status: dirtyStatus)
         }
 
+        let hasLocalCheckpoint = try localBranchContainsCheckpoint(checkpoint, workingDirectory: rootURL)
+        let shouldFetch = checkpoint.pushedAt != nil && !hasLocalCheckpoint
         if shouldFetch {
+            onProgress?("fetching checkpoint branch...")
             let fetch = try git.run(
                 ["fetch", checkpoint.remoteName, "\(checkpoint.branch):refs/remotes/\(checkpoint.remoteName)/\(checkpoint.branch)"],
                 workingDirectory: rootURL
@@ -377,8 +381,11 @@ public struct GitCheckpointManager: Sendable {
                     stderr: fetch.stderr
                 )
             }
+        } else if checkpoint.pushedAt != nil {
+            onProgress?("using local checkpoint branch...")
         }
 
+        onProgress?("switching checkpoint branch...")
         try switchToRestoredBranch(
             checkpoint.branch,
             remoteBranch: shouldFetch ? remoteBranch : nil,
@@ -386,6 +393,7 @@ public struct GitCheckpointManager: Sendable {
         )
 
         if shouldFetch {
+            onProgress?("fast-forwarding checkpoint branch...")
             let merge = try git.run(["merge", "--ff-only", remoteBranch], workingDirectory: rootURL)
             guard merge.succeeded else {
                 throw GitCheckpointError.divergentCheckpointBranch(
@@ -396,6 +404,7 @@ public struct GitCheckpointManager: Sendable {
             }
         }
 
+        onProgress?("verifying checkpoint commit...")
         let head = try requiredOutput(["rev-parse", "HEAD"], workingDirectory: rootURL)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -487,6 +496,24 @@ public struct GitCheckpointManager: Sendable {
         }
 
         throw GitCheckpointError.checkpointUnavailable(branch: branch, remote: nil, stderr: switched.stderr)
+    }
+
+    private func localBranchContainsCheckpoint(
+        _ checkpoint: CheckpointRecord,
+        workingDirectory: URL
+    ) throws -> Bool {
+        guard let expected = checkpoint.commitSHA, !expected.isEmpty else {
+            return false
+        }
+
+        let localRef = "refs/heads/\(checkpoint.branch)"
+        let exists = try git.run(["show-ref", "--verify", "--quiet", localRef], workingDirectory: workingDirectory)
+        guard exists.succeeded else {
+            return false
+        }
+
+        let ancestor = try git.run(["merge-base", "--is-ancestor", expected, checkpoint.branch], workingDirectory: workingDirectory)
+        return ancestor.succeeded
     }
 
     private func validateRestoredHead(

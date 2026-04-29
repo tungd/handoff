@@ -1182,10 +1182,13 @@ func prepareResumeHandoff(
     repoURL: URL,
     snapshot: RepositorySnapshot,
     checkpointSelector: String?,
-    forceClaim: Bool = false
+    forceClaim: Bool = false,
+    onStatus: (@Sendable (String) -> Void)? = nil
 ) async throws -> ResumeHandoffResult {
+    onStatus?("loading checkpoints...")
     let checkpoints = try await store.listCheckpoints(taskID: task.id)
     let checkpoint = try selectCheckpoint(checkpoints, selector: checkpointSelector)
+    onStatus?("claiming task...")
     let claim = try await store.claimTask(
         taskID: task.id,
         checkpointID: checkpoint?.id,
@@ -1205,15 +1208,18 @@ func prepareResumeHandoff(
 
     let result: GitCheckpointRestoreResult
     do {
+        onStatus?("restoring checkpoint...")
         result = try GitCheckpointManager().restoreCheckpoint(
             checkpoint,
             snapshot: snapshot,
-            repoURL: repoURL
+            repoURL: repoURL,
+            onProgress: onStatus
         )
     } catch {
         _ = try? await store.releaseTaskClaim(taskID: task.id, ownerName: claim.ownerName)
         throw error
     }
+    onStatus?("recording resume metadata...")
     try await store.appendEvent(AgentEvent(
         taskID: task.id,
         kind: .taskClaimed,
