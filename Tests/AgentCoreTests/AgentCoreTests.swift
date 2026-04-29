@@ -442,6 +442,21 @@ func localTaskStorePersistsTasksSessionsAndEvents() throws {
 }
 
 @Test
+func localTaskStoreRecentEventsUsesLatestEvents() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("agentctl-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let store: any AgentTaskStore = LocalTaskStore(root: root)
+    let task = TaskRecord(title: "Test Task", slug: "test-task")
+    try await store.saveTask(task)
+    try await store.appendEvent(AgentEvent(taskID: task.id, kind: .userMessage))
+    try await store.appendEvent(AgentEvent(taskID: task.id, kind: .assistantDone))
+
+    #expect(try await store.recentEvents(for: task.id, limit: 1).map(\.kind) == [.assistantDone])
+}
+
+@Test
 func localTaskStoreConformsToAsyncStoreProtocol() async throws {
     let root = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("agentctl-tests-\(UUID().uuidString)", isDirectory: true)

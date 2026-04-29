@@ -521,14 +521,52 @@ public struct PostgresTaskStore: AgentTaskStore {
         return events
     }
 
+    public func recentEvents(for taskID: UUID, limit: Int) async throws -> [AgentEvent] {
+        guard limit > 0 else {
+            return []
+        }
+        let boundedLimit = min(limit, 500)
+        let rows = try await client.query("""
+            SELECT id, task_id, session_id, seq, kind, occurred_at, payload::text
+            FROM events
+            WHERE task_id = \(taskID)
+            ORDER BY seq DESC
+            LIMIT \(boundedLimit)
+            """)
+
+        var events: [AgentEvent] = []
+        for try await (id, taskID, sessionID, sequence, kind, occurredAt, payloadText) in rows.decode((
+            UUID,
+            UUID?,
+            UUID?,
+            Int64?,
+            String,
+            Date,
+            String
+        ).self) {
+            let payloadData = Data(payloadText.utf8)
+            let payload = try decoder.decode([String: JSONValue].self, from: payloadData)
+            events.append(AgentEvent(
+                id: id,
+                taskID: taskID,
+                sessionID: sessionID,
+                sequence: sequence,
+                kind: EventKind(rawValue: kind) ?? .backendEvent,
+                occurredAt: occurredAt,
+                payload: payload
+            ))
+        }
+        return events.sorted { ($0.sequence ?? 0) < ($1.sequence ?? 0) }
+    }
+
     public func summary(for task: TaskRecord, eventLimit: Int = 12) async throws -> TaskRunSummary {
         let sessions = try await listSessions(taskID: task.id)
-        let events = try await events(for: task.id)
+        let events = try await recentEvents(for: task.id, limit: eventLimit)
         let claim = try? await currentTaskClaim(taskID: task.id)
         return TaskRunSummary(
             task: task,
             sessions: sessions,
-            latestEvents: Array(events.suffix(eventLimit)),
+            latestEvents: events,
             currentClaim: claim
         )
     }
