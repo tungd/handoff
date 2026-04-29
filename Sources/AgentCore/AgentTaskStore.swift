@@ -24,6 +24,9 @@ public protocol AgentTaskStore: Sendable {
 
     func listSkills() async throws -> [SkillRecord]
 
+    @discardableResult
+    func writeSkill(_ skill: SkillRecord) async throws -> SkillRecord
+
     func claimTask(
         taskID: UUID,
         checkpointID: UUID?,
@@ -184,5 +187,11 @@ extension LocalTaskStore: AgentTaskStore {
     public func listSkills() async throws -> [SkillRecord] {
         // Skills require Postgres store
         return []
+    }
+
+    @discardableResult
+    public func writeSkill(_ skill: SkillRecord) async throws -> SkillRecord {
+        // Skills require Postgres store - return unchanged
+        return skill
     }
 }

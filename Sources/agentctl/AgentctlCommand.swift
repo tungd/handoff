@@ -1278,6 +1278,19 @@ func createAndPersistCheckpoint(
         onProgress: onStatus
     )
 
+    // Persist local skills to Postgres as part of checkpoint
+    onStatus?("persisting skills...")
+    let repoRoot = URL(fileURLWithPath: snapshot.rootPath ?? repoURL.path, isDirectory: true)
+    let localSkills = try SkillSync.readLocalSkills(repoRoot: repoRoot)
+    var persistedSkillNames: [String] = []
+    for skill in localSkills {
+        let persisted = try await store.writeSkill(skill)
+        persistedSkillNames.append(persisted.name)
+    }
+    if !persistedSkillNames.isEmpty {
+        onStatus?("persisted \(persistedSkillNames.count) skill(s): \(persistedSkillNames.joined(separator: ", "))")
+    }
+
     onStatus?("recording checkpoint cursor...")
     let transcriptCursor = try await checkpointTranscriptCursor(task: task, store: store)
     var result = GitCheckpointManager.makeCheckpointResult(
@@ -1286,6 +1299,10 @@ func createAndPersistCheckpoint(
         gitState: gitState
     )
     result.checkpoint.metadata["transcriptCursor"] = .object(transcriptCursor)
+    // Record persisted skills in checkpoint metadata
+    if !persistedSkillNames.isEmpty {
+        result.checkpoint.metadata["skills"] = .array(persistedSkillNames.map { .string($0) })
+    }
     try await store.saveCheckpoint(result.checkpoint)
     try await store.appendEvent(AgentEvent(
         taskID: task.id,

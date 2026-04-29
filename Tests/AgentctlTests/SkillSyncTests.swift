@@ -197,4 +197,40 @@ Old content.
         XCTAssertTrue(agentsMdContent.contains("## skill-b"))
         XCTAssertTrue(agentsMdContent.contains("## skill-c"))
     }
+
+    func testReadLocalSkills() throws {
+        // Create local skill files
+        let skillsDir = tempDir
+            .appendingPathComponent(".agentctl", isDirectory: true)
+            .appendingPathComponent("skills", isDirectory: true)
+
+        let skill1Dir = skillsDir.appendingPathComponent("local-skill-1", isDirectory: true)
+        try FileManager.default.createDirectory(at: skill1Dir, withIntermediateDirectories: true)
+        try "Local skill 1 content".write(to: skill1Dir.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+
+        let skill2Dir = skillsDir.appendingPathComponent("local-skill-2", isDirectory: true)
+        try FileManager.default.createDirectory(at: skill2Dir, withIntermediateDirectories: true)
+        try "---\ndescription: A skill with frontmatter\ntags: [test, local]\n---\nLocal skill 2 content with frontmatter".write(to: skill2Dir.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+
+        let readSkills = try SkillSync.readLocalSkills(repoRoot: tempDir)
+
+        XCTAssertEqual(readSkills.count, 2)
+
+        let skill1 = readSkills.first { $0.name == "local-skill-1" }
+        XCTAssertNotNil(skill1)
+        XCTAssertEqual(skill1?.content, "Local skill 1 content")
+        XCTAssertNil(skill1?.description)
+        XCTAssertEqual(skill1?.tags, [])
+
+        let skill2 = readSkills.first { $0.name == "local-skill-2" }
+        XCTAssertNotNil(skill2)
+        XCTAssertEqual(skill2?.content, "Local skill 2 content with frontmatter")
+        XCTAssertEqual(skill2?.description, "A skill with frontmatter")
+        XCTAssertEqual(skill2?.tags, ["test", "local"])
+    }
+
+    func testReadLocalSkillsReturnsEmptyWhenNoSkills() throws {
+        let readSkills = try SkillSync.readLocalSkills(repoRoot: tempDir)
+        XCTAssertEqual(readSkills.count, 0)
+    }
 }

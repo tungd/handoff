@@ -30,6 +30,7 @@ public struct SkillSyncResult: Equatable, Sendable {
 }
 
 public enum SkillSync: Sendable {
+    /// Sync skills FROM Postgres TO local .agentctl/skills/ directory
     public static func syncSkills(
         skills: [SkillRecord],
         repoRoot: URL
@@ -147,5 +148,66 @@ public enum SkillSync: Sendable {
                 .appendingPathComponent(skill.name, isDirectory: true)
                 .appendingPathComponent("SKILL.md")
         }
+    }
+
+    /// Read local skills FROM .agentctl/skills/ directory for checkpoint persistence
+    public static func readLocalSkills(repoRoot: URL) throws -> [SkillRecord] {
+        let skillsDir = repoRoot
+            .appendingPathComponent(".agentctl", isDirectory: true)
+            .appendingPathComponent("skills", isDirectory: true)
+
+        guard FileManager.default.fileExists(atPath: skillsDir.path) else {
+            return []
+        }
+
+        var skills: [SkillRecord] = []
+        let skillDirs = try FileManager.default.contentsOfDirectory(at: skillsDir, includingPropertiesForKeys: [.isDirectoryKey])
+
+        for skillDir in skillDirs where skillDir.hasDirectoryPath {
+            let skillFile = skillDir.appendingPathComponent("SKILL.md")
+            guard FileManager.default.fileExists(atPath: skillFile.path) else {
+                continue
+            }
+
+            let content = try String(contentsOf: skillFile, encoding: .utf8)
+            let name = skillDir.lastPathComponent
+
+            // Parse YAML frontmatter if present
+            var description: String? = nil
+            var tags: [String] = []
+            var skillContent = content
+
+            if content.hasPrefix("---") {
+                let parts = content.split(separator: "---", maxSplits: 2, omittingEmptySubsequences: true)
+                if parts.count >= 2 {
+                    let frontmatter = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+                    skillContent = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespacesAndNewlines) : content
+
+                    // Parse simple frontmatter fields
+                    for line in frontmatter.split(separator: "\n") {
+                        let lineStr = String(line)
+                        if lineStr.hasPrefix("description:") {
+                            description = lineStr.dropFirst("description:".count).trimmingCharacters(in: .whitespacesAndNewlines)
+                        } else if lineStr.hasPrefix("tags:") {
+                            let tagsStr = lineStr.dropFirst("tags:".count).trimmingCharacters(in: .whitespacesAndNewlines)
+                            if tagsStr.hasPrefix("[") {
+                                // Parse array format [a, b, c]
+                                let inner = tagsStr.dropFirst().dropLast()
+                                tags = inner.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                            }
+                        }
+                    }
+                }
+            }
+
+            skills.append(SkillRecord(
+                name: name,
+                description: description,
+                content: skillContent,
+                tags: tags
+            ))
+        }
+
+        return skills
     }
 }

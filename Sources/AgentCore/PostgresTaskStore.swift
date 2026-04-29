@@ -1081,4 +1081,52 @@ public struct PostgresTaskStore: AgentTaskStore {
 
         return skills
     }
+
+    @discardableResult
+    public func writeSkill(_ skill: SkillRecord) async throws -> SkillRecord {
+        let now = Date()
+        let tagsJSON = try jsonString(skill.tags)
+
+        let rows = try await client.query("""
+            INSERT INTO skills (id, name, description, content, tags, created_at, updated_at)
+            VALUES (
+                \(skill.id),
+                \(skill.name),
+                \(skill.description),
+                \(skill.content),
+                \(tagsJSON)::text,
+                \(skill.createdAt),
+                \(now)
+            )
+            ON CONFLICT (name) DO UPDATE SET
+                description = EXCLUDED.description,
+                content = EXCLUDED.content,
+                tags = EXCLUDED.tags,
+                updated_at = EXCLUDED.updated_at
+            RETURNING id, name, description, content, to_json(tags)::text, created_at, updated_at
+            """)
+
+        for try await (id, name, description, content, tagsText, createdAt, updatedAt) in rows.decode((
+            UUID,
+            String,
+            String?,
+            String,
+            String,
+            Date,
+            Date
+        ).self) {
+            let tags = try decoder.decode([String].self, from: Data(tagsText.utf8))
+            return SkillRecord(
+                id: id,
+                name: name,
+                description: description,
+                content: content,
+                tags: tags,
+                createdAt: createdAt,
+                updatedAt: updatedAt
+            )
+        }
+
+        return skill
+    }
 }
