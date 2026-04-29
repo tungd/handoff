@@ -68,8 +68,8 @@ struct AgentTUIComposerTests {
         )
 
         #expect(rows == [
-            AgentTUIComposerRow(id: 0, before: "first", after: "", hasCursor: false),
-            AgentTUIComposerRow(id: 1, before: "se", after: "cond", hasCursor: true)
+            AgentTUIComposerRow(id: 0, before: "first", cursorText: nil, after: "", hasCursor: false),
+            AgentTUIComposerRow(id: 1, before: "se", cursorText: "c", after: "ond", hasCursor: true)
         ])
     }
 
@@ -83,8 +83,22 @@ struct AgentTUIComposerTests {
         )
 
         #expect(rows == [
-            AgentTUIComposerRow(id: 0, before: "three", after: "", hasCursor: false),
-            AgentTUIComposerRow(id: 1, before: "fo", after: "ur", hasCursor: true)
+            AgentTUIComposerRow(id: 0, before: "three", cursorText: nil, after: "", hasCursor: false),
+            AgentTUIComposerRow(id: 1, before: "fo", cursorText: "u", after: "r", hasCursor: true)
+        ])
+    }
+
+    @Test
+    func composerRowsUseCursorCellInsteadOfInsertingGlyph() {
+        let rows = agentTUIComposerRows(
+            input: "like",
+            cursor: 2,
+            width: 20,
+            maxRows: 4
+        )
+
+        #expect(rows == [
+            AgentTUIComposerRow(id: 0, before: "li", cursorText: "k", after: "e", hasCursor: true)
         ])
     }
 

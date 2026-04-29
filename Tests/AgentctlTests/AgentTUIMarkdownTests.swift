@@ -110,10 +110,10 @@ struct AgentTUIMarkdownTests {
         let lines = agentTUIQuoteStyledLines("How **far** is it?", width: 80)
 
         #expect(lines.map(agentTUIPlainText) == [
-            "│ How far is it?"
+            "┃ How far is it?"
         ])
         #expect(lines[0].count == 1)
-        #expect(lines[0].first?.text == "│ How far is it?")
+        #expect(lines[0].first?.text == "┃ How far is it?")
         #expect(lines[0].first?.tone == .quote)
         #expect(lines[0].first?.isItalic == true)
         #expect(lines[0].first?.preservesLayout == true)

@@ -197,6 +197,7 @@ struct AgentTUIInputLine: Equatable, Sendable {
 struct AgentTUIComposerRow: Identifiable, Equatable, Sendable {
     var id: Int
     var before: String
+    var cursorText: String?
     var after: String
     var hasCursor: Bool
 }
@@ -788,7 +789,15 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             )
         }
         if row.hasCursor {
-            line += "█"
+            line += agentTUIANSIStyled(
+                row.cursorText ?? " ",
+                color: .palette.foreground,
+                isBold: false,
+                isItalic: false,
+                isUnderlined: false,
+                isReversed: true,
+                palette: palette
+            )
         }
         if !row.after.isEmpty {
             line += agentTUIANSIStyled(
@@ -1833,7 +1842,9 @@ private struct AgentTUIView: View {
                     Text(row.before).foregroundStyle(.palette.foreground)
                 }
                 if row.hasCursor {
-                    Text("█").foregroundStyle(.default)
+                    Text(row.cursorText ?? " ")
+                        .foregroundStyle(.palette.background)
+                        .background(.palette.foreground)
                 }
                 if !row.after.isEmpty {
                     Text(row.after).foregroundStyle(.palette.foreground)
@@ -2594,6 +2605,7 @@ private func agentTUIANSIStyled(
     isBold: Bool,
     isItalic: Bool,
     isUnderlined: Bool,
+    isReversed: Bool = false,
     palette: any Palette
 ) -> String {
     var codes: [String] = []
@@ -2605,6 +2617,9 @@ private func agentTUIANSIStyled(
     }
     if isUnderlined {
         codes.append("4")
+    }
+    if isReversed {
+        codes.append("7")
     }
     codes.append(contentsOf: agentTUIForegroundCodes(for: color.resolve(with: palette)))
 
@@ -3186,6 +3201,7 @@ func agentTUIComposerRows(
             rows.append(AgentTUIComposerRow(
                 id: rows.count,
                 before: "",
+                cursorText: hasCursor ? " " : nil,
                 after: "",
                 hasCursor: hasCursor
             ))
@@ -3204,10 +3220,30 @@ func agentTUIComposerRows(
                 cursorRowIndex = rows.count
             }
 
+            let cursorText: String?
+            let before: String
+            let after: String
+            if hasCursor {
+                before = offset < split ? String(characters[offset..<split]) : ""
+                if split < chunkEnd {
+                    cursorText = String(characters[split])
+                    let afterStart = split + 1
+                    after = afterStart < chunkEnd ? String(characters[afterStart..<chunkEnd]) : ""
+                } else {
+                    cursorText = " "
+                    after = ""
+                }
+            } else {
+                before = String(characters[offset..<chunkEnd])
+                cursorText = nil
+                after = ""
+            }
+
             rows.append(AgentTUIComposerRow(
                 id: rows.count,
-                before: offset < split ? String(characters[offset..<split]) : "",
-                after: hasCursor && split < chunkEnd ? String(characters[split..<chunkEnd]) : "",
+                before: before,
+                cursorText: cursorText,
+                after: after,
                 hasCursor: hasCursor
             ))
             offset = chunkEnd
@@ -3225,6 +3261,7 @@ func agentTUIComposerRows(
         AgentTUIComposerRow(
             id: index,
             before: row.before,
+            cursorText: row.cursorText,
             after: row.after,
             hasCursor: row.hasCursor
         )
