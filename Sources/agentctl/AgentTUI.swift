@@ -513,7 +513,9 @@ private final class AgentTUIModel: @unchecked Sendable {
                 case .toolFinished:
                     finishToolCall(event.payload, to: &state)
                 case .userMessage:
-                    break
+                    if let text = event.payload["text"]?.stringValue {
+                        append(.user, text, to: &state)
+                    }
                 case .backendSessionUpdated, .backendEvent:
                     if state.showRawEvents {
                         append(.system, "\(event.kind.rawValue) \(compactPayload(event.payload))", to: &state)
