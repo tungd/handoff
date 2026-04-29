@@ -32,7 +32,7 @@ struct TerminalRenderer {
     }
 
     func help() {
-        print(dim("/help /info /tasks /new [title] /resume <task> /checkpoint [--push] /events /raw /exit"))
+        print(dim("/help /info /tasks /new [title] /resume <task> [--checkpoint <id|latest>] [--force] /checkpoint [--push] /checkpoints /release /export [path] /events /raw /exit"))
     }
 
     func prompt(task: TaskRecord) {

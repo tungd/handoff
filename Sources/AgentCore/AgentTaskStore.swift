@@ -12,6 +12,17 @@ public protocol AgentTaskStore: Sendable {
     func saveCheckpoint(_ checkpoint: CheckpointRecord) async throws
     func listCheckpoints(taskID: UUID?) async throws -> [CheckpointRecord]
 
+    func claimTask(
+        taskID: UUID,
+        checkpointID: UUID?,
+        ownerName: String,
+        ttl: TimeInterval,
+        force: Bool
+    ) async throws -> TaskClaimRecord
+    func currentTaskClaim(taskID: UUID) async throws -> TaskClaimRecord?
+    func refreshTaskClaim(taskID: UUID, ownerName: String, ttl: TimeInterval) async throws -> TaskClaimRecord?
+    func releaseTaskClaim(taskID: UUID, ownerName: String) async throws -> Bool
+
     @discardableResult
     func appendEvent(_ event: AgentEvent) async throws -> AgentEvent
     func events(for taskID: UUID) async throws -> [AgentEvent]
@@ -21,6 +32,21 @@ public protocol AgentTaskStore: Sendable {
 public extension AgentTaskStore {
     func summary(for task: TaskRecord) async throws -> TaskRunSummary {
         try await summary(for: task, eventLimit: 12)
+    }
+
+    func claimTask(
+        taskID: UUID,
+        checkpointID: UUID?,
+        ownerName: String,
+        ttl: TimeInterval
+    ) async throws -> TaskClaimRecord {
+        try await claimTask(
+            taskID: taskID,
+            checkpointID: checkpointID,
+            ownerName: ownerName,
+            ttl: ttl,
+            force: false
+        )
     }
 }
 
@@ -55,6 +81,37 @@ extension LocalTaskStore: AgentTaskStore {
 
     public func listCheckpoints(taskID: UUID?) async throws -> [CheckpointRecord] {
         try listCheckpointsSync(taskID: taskID)
+    }
+
+    public func claimTask(
+        taskID: UUID,
+        checkpointID: UUID?,
+        ownerName: String,
+        ttl: TimeInterval,
+        force: Bool
+    ) async throws -> TaskClaimRecord {
+        TaskClaimRecord(
+            taskID: taskID,
+            checkpointID: checkpointID,
+            ownerName: ownerName,
+            expiresAt: Date().addingTimeInterval(ttl),
+            metadata: [
+                "store": .string("local"),
+                "forced": .bool(force)
+            ]
+        )
+    }
+
+    public func currentTaskClaim(taskID: UUID) async throws -> TaskClaimRecord? {
+        nil
+    }
+
+    public func refreshTaskClaim(taskID: UUID, ownerName: String, ttl: TimeInterval) async throws -> TaskClaimRecord? {
+        nil
+    }
+
+    public func releaseTaskClaim(taskID: UUID, ownerName: String) async throws -> Bool {
+        false
     }
 
     public func appendEvent(_ event: AgentEvent) async throws -> AgentEvent {

@@ -57,8 +57,11 @@ The root command starts the interactive Codex shell. It currently supports:
 /info
 /tasks
 /new [title]
-/resume <task>
+/resume <task> [--checkpoint <id|latest>] [--force]
 /checkpoint [--push]
+/checkpoints
+/release
+/export [path]
 /events
 /raw
 /exit
@@ -85,15 +88,28 @@ to require Postgres even when the environment variable is not set.
 
 ## Git Checkpoints
 
-`task checkpoint` creates or reuses `agent/<task-slug>`, commits current git
-changes when the worktree is dirty, and records the checkpoint in the task
-store. Push is explicit. `task resume` and interactive `/resume` restore the
-latest checkpoint automatically when one exists, fetching pushed checkpoint
-branches on another machine before switching:
+`task checkpoint` and `/checkpoint` create or reuse `agent/<task-slug>`, commit
+current git changes when the worktree is dirty, and record the checkpoint in
+the task store. Checkpoints include a lightweight handoff manifest in metadata:
+changed files, generated files, command output snippets, test result slots, and
+what to inspect next.
+
+Push is explicit. `task resume` and interactive `/resume` restore the latest
+checkpoint automatically when one exists, fetching pushed checkpoint branches on
+another machine before switching. `--checkpoint` targets a specific checkpoint
+id prefix or `latest`. Postgres-backed resume claims the task with a short lease
+so another machine cannot resume the same task in parallel. `/release` releases
+this machine's claim; `--force` steals a stale or intentionally transferred
+claim:
 
 ```bash
 swift run agentctl task checkpoint first-task
 swift run agentctl task checkpoint first-task --push
 swift run agentctl task resume first-task
+swift run agentctl task resume first-task --checkpoint latest
+swift run agentctl task release first-task
 swift run agentctl task checkpoints first-task
 ```
+
+`/export [path]` writes the current task transcript as Markdown. Without a path
+it writes to `.agentctl/exports/<task>-transcript-<timestamp>.md` in the repo.

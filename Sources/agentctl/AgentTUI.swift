@@ -241,7 +241,7 @@ private final class AgentTUIModel: @unchecked Sendable {
         update { state in
             state.status = "turn failed"
             state.isRunning = false
-            append(.error, String(describing: error), to: &state)
+            append(.error, agentctlErrorMessage(error), to: &state)
         }
     }
 
@@ -254,7 +254,7 @@ private final class AgentTUIModel: @unchecked Sendable {
     func commandFailed(_ error: Error) {
         update { state in
             state.status = "command failed"
-            append(.error, String(describing: error), to: &state)
+            append(.error, agentctlErrorMessage(error), to: &state)
         }
     }
 
@@ -669,6 +669,7 @@ private struct AgentTUIView: View {
                     try await persistInteractiveTask(currentTask, store: runtime.store)
                     model.markTaskPersisted(currentTask)
                 }
+                _ = try await refreshResumeClaimIfActive(task: currentTask, store: runtime.store)
                 _ = try await runCodexTurn(
                     task: currentTask,
                     prompt: text,
@@ -681,6 +682,7 @@ private struct AgentTUIView: View {
                 ) { update in
                     model.render(update)
                 }
+                _ = try await refreshResumeClaimIfActive(task: currentTask, store: runtime.store)
                 model.finishTurn()
             } catch {
                 model.failTurn(error)
@@ -696,9 +698,9 @@ private struct AgentTUIView: View {
 
         switch command.name {
         case "exit", "quit":
-            Darwin.raise(SIGINT)
+            releaseClaimThenExit()
         case "help":
-            model.append(.system, "/help /info /tasks /new [title] /resume <task> /checkpoint [--push] /events /raw /exit")
+            model.append(.system, "/help /info /tasks /new [title] /resume <task> [--checkpoint <id|latest>] [--force] /checkpoint [--push] /checkpoints /release /export [path] /events /raw /exit")
         case "raw":
             _ = model.toggleRawEvents()
         case "info", "task", "repo":
@@ -729,6 +731,48 @@ private struct AgentTUIView: View {
             runCommand(status: "loading events...") {
                 let events = try await runtime.store.events(for: task.id)
                 model.append(.system, tuiEvents(events))
+                model.setStatus("ready")
+            }
+        case "checkpoints":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
+            runCommand(status: "loading checkpoints...") {
+                let checkpoints = try await runtime.store.listCheckpoints(taskID: task.id)
+                model.append(.system, tuiCheckpoints(checkpoints))
+                model.setStatus("ready")
+            }
+        case "release":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
+            runCommand(status: "releasing claim...") {
+                let result = try await releaseResumeClaim(task: task, store: runtime.store)
+                model.append(.system, result.released ? "Claim released." : "No active claim for this machine.")
+                model.setStatus("ready")
+            }
+        case "export":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
+            runCommand(status: "exporting transcript...") {
+                let result = try await exportTranscriptMarkdown(
+                    task: task,
+                    store: runtime.store,
+                    repoURL: runtime.repoURL,
+                    snapshot: runtime.snapshot,
+                    destination: command.argument
+                )
+                model.append(.system, "Exported \(result.eventCount) events to \(result.url.path).")
                 model.setStatus("ready")
             }
         case "checkpoint":
@@ -764,31 +808,62 @@ private struct AgentTUIView: View {
                 model.setTask(newTask, entries: [], message: "Created task \(newTask.slug).")
             }
         case "resume":
-            guard let identifier = command.argument, !identifier.isEmpty else {
-                model.append(.error, "usage: /resume <task>")
+            let resume: ResumeSlashOptions
+            do {
+                resume = try resumeSlashOptions(command.argument)
+            } catch {
+                model.append(.error, String(describing: error))
+                return
+            }
+            guard !resume.taskIdentifier.isEmpty else {
+                model.append(.error, "usage: /resume <task> [--checkpoint <id|latest>] [--force]")
                 return
             }
             runCommand(status: "resuming task...") {
-                let resumedTask = try await runtime.store.findTask(identifier)
-                let restore = try await restoreLatestCheckpointIfAvailable(
+                let resumedTask = try await runtime.store.findTask(resume.taskIdentifier)
+                let handoff = try await prepareResumeHandoff(
                     task: resumedTask,
                     store: runtime.store,
                     repoURL: runtime.repoURL,
-                    snapshot: runtime.snapshot
+                    snapshot: runtime.snapshot,
+                    checkpointSelector: resume.checkpointSelector,
+                    forceClaim: resume.forceClaim
                 )
-                if restore != nil {
+                if handoff.restore != nil {
                     let updatedSnapshot = try RepositoryInspector().inspect(path: runtime.repoURL)
                     await updateAgentTUIRuntimeSnapshot(updatedSnapshot)
                 }
                 let loadedEntries = try await tuiEntries(for: resumedTask.id, store: runtime.store)
                 var message = "Resumed task \(resumedTask.slug)."
-                if let restore {
-                    message += " \(checkpointRestoreStatus(restore))"
+                if let restore = handoff.restore {
+                    message += "\n\(tuiCheckpointRestoreDetails(restore, claim: handoff.claim))"
+                } else {
+                    message += "\n\(taskClaimStatus(handoff.claim))"
                 }
                 model.setTask(resumedTask, entries: loadedEntries, message: message)
+                model.setStatus(handoff.restore.map(checkpointRestoreStatus) ?? taskClaimStatus(handoff.claim))
             }
         default:
             model.append(.error, "unknown command: /\(command.name)")
+        }
+    }
+
+    private func releaseClaimThenExit() {
+        guard let runtime = AgentTUIRuntimeBox.current else {
+            Darwin.raise(SIGINT)
+            return
+        }
+        let snapshot = model.snapshot()
+        guard snapshot.isTaskPersisted else {
+            Darwin.raise(SIGINT)
+            return
+        }
+
+        let task = snapshot.task
+        model.setStatus("releasing claim...")
+        _Concurrency.Task.detached {
+            _ = try? await releaseResumeClaim(task: task, store: runtime.store)
+            Darwin.raise(SIGINT)
         }
     }
 
@@ -813,10 +888,10 @@ private struct AgentTUIView: View {
             submitInput()
             return true
         case .escape:
-            Darwin.raise(SIGINT)
+            releaseClaimThenExit()
             return true
         case .character("c") where event.ctrl:
-            Darwin.raise(SIGINT)
+            releaseClaimThenExit()
             return true
         case .character("a") where event.ctrl:
             moveToBeginningOfInputLine()
@@ -1348,6 +1423,36 @@ private func tuiEvents(_ events: [AgentEvent]) -> String {
         return "\(sequence) \(event.kind.rawValue) \(compactPayload(event.payload))"
     }
     .joined(separator: "\n")
+}
+
+private func tuiCheckpoints(_ checkpoints: [CheckpointRecord]) -> String {
+    if checkpoints.isEmpty {
+        return "No checkpoints found."
+    }
+
+    return checkpoints.map { checkpoint in
+        let pushed = checkpoint.pushedAt.map { ISO8601DateFormatter().string(from: $0) } ?? "-"
+        return [
+            "\(checkpoint.id.uuidString.prefix(8))  \(checkpoint.branch)",
+            "commit: \(checkpoint.commitSHA ?? "-")",
+            "remote: \(checkpoint.remoteName)",
+            "pushed: \(pushed)",
+            "files: \(checkpointChangedFileCount(checkpoint))"
+        ].joined(separator: "\n")
+    }.joined(separator: "\n\n")
+}
+
+private func tuiCheckpointRestoreDetails(
+    _ restore: GitCheckpointRestoreResult,
+    claim: TaskClaimRecord
+) -> String {
+    [
+        checkpointRestoreStatus(restore),
+        "checkpoint: \(restore.checkpoint.id.uuidString)",
+        "branch: \(restore.checkpoint.branch)",
+        "commit: \(restore.headSHA ?? restore.checkpoint.commitSHA ?? "-")",
+        "claim: \(claim.ownerName) until \(ISO8601DateFormatter().string(from: claim.expiresAt))"
+    ].joined(separator: "\n")
 }
 
 private func transcriptLines(_ entries: [TUITranscriptEntry], width: Int) -> [TUITranscriptLine] {

@@ -96,6 +96,17 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 CREATE INDEX IF NOT EXISTS checkpoints_task_id_idx ON checkpoints(task_id);
 CREATE INDEX IF NOT EXISTS checkpoints_branch_idx ON checkpoints(branch);
 
+CREATE TABLE IF NOT EXISTS task_claims (
+    task_id uuid PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    checkpoint_id uuid REFERENCES checkpoints(id) ON DELETE SET NULL,
+    owner_name text NOT NULL,
+    claimed_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS task_claims_expires_at_idx ON task_claims(expires_at);
+
 CREATE TABLE IF NOT EXISTS artifacts (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id uuid REFERENCES tasks(id) ON DELETE CASCADE,

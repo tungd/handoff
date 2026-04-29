@@ -94,7 +94,7 @@ struct Task: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "task",
         abstract: "Create, list, and resume agentctl tasks.",
-        subcommands: [New.self, List.self, Show.self, Send.self, Resume.self, Checkpoint.self, Checkpoints.self]
+        subcommands: [New.self, List.self, Show.self, Send.self, Resume.self, Release.self, Checkpoint.self, Checkpoints.self]
     )
 
     struct New: AsyncParsableCommand {
@@ -338,6 +338,12 @@ struct Task: ParsableCommand {
         @Option(help: "Codex sandbox mode.")
         var sandbox: String?
 
+        @Option(help: "Checkpoint id prefix or latest to restore before resuming.")
+        var checkpoint: String?
+
+        @Flag(name: .customLong("force"), help: "Steal an active remote claim before resuming.")
+        var forceClaim: Bool = false
+
         @Flag(name: .long, help: "Emit JSON.")
         var json: Bool = false
 
@@ -346,52 +352,97 @@ struct Task: ParsableCommand {
             let snapshot = try RepositoryInspector().inspect(path: repoURL)
             try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
                 let task = try await store.findTask(task)
-                let restore = try await restoreLatestCheckpointIfAvailable(
+                let handoff = try await prepareResumeHandoff(
                     task: task,
                     store: store,
                     repoURL: repoURL,
-                    snapshot: snapshot
+                    snapshot: snapshot,
+                    checkpointSelector: checkpoint,
+                    forceClaim: forceClaim
                 )
-                let activeSnapshot = restore == nil
+                let activeSnapshot = handoff.restore == nil
                     ? snapshot
                     : try RepositoryInspector().inspect(path: repoURL)
 
-                if let prompt {
-                    if !json, let restore {
-                        printCheckpointRestoreResult(restore)
+                do {
+                    if let prompt {
+                        if !json, let restore = handoff.restore {
+                            printCheckpointRestoreResult(restore)
+                        }
+
+                        let summary = try await runCodexTurn(
+                            task: task,
+                            prompt: prompt,
+                            repoURL: repoURL,
+                            snapshot: activeSnapshot,
+                            store: store,
+                            fullAuto: fullAuto,
+                            sandbox: sandbox
+                        )
+
+                        _ = try? await releaseResumeClaim(task: task, store: store)
+                        if json {
+                            try printJSON(summary)
+                            return
+                        }
+
+                        printRunSummary(summary)
+                        return
                     }
 
-                    let summary = try await runCodexTurn(
-                        task: task,
-                        prompt: prompt,
-                        repoURL: repoURL,
-                        snapshot: activeSnapshot,
-                        store: store,
-                        fullAuto: fullAuto,
-                        sandbox: sandbox
-                    )
+                    let summary = try await store.summary(for: task)
+                    _ = try? await releaseResumeClaim(task: task, store: store)
 
                     if json {
                         try printJSON(summary)
                         return
                     }
 
-                    printRunSummary(summary)
-                    return
+                    if let restore = handoff.restore {
+                        printCheckpointRestoreResult(restore)
+                        print("")
+                    }
+                    printTaskSummary(summary)
+                } catch {
+                    _ = try? await releaseResumeClaim(task: task, store: store)
+                    throw error
                 }
+            }
+        }
+    }
 
-                let summary = try await store.summary(for: task)
+    struct Release: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "release",
+            abstract: "Release this machine's active claim on a task."
+        )
+
+        @Argument(help: "Task id, id prefix, or slug.")
+        var task: String
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        @Flag(name: .long, help: "Emit JSON.")
+        var json: Bool = false
+
+        mutating func run() async throws {
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let task = try await store.findTask(task)
+                let result = try await releaseResumeClaim(task: task, store: store)
 
                 if json {
-                    try printJSON(summary)
+                    try printJSON(result)
                     return
                 }
 
-                if let restore {
-                    printCheckpointRestoreResult(restore)
-                    print("")
-                }
-                printTaskSummary(summary)
+                print(result.released ? "Claim released." : "No active claim for this machine.")
             }
         }
     }
@@ -670,6 +721,9 @@ func runInteractiveAgent(
             if let command = SlashCommand(input) {
                 switch command.name {
                 case "exit", "quit":
+                    if taskPersisted {
+                        _ = try? await releaseResumeClaim(task: task, store: store)
+                    }
                     break interactiveLoop
                 case "help":
                     renderer.help()
@@ -688,6 +742,32 @@ func runInteractiveAgent(
                         continue
                     }
                     renderer.events(try await store.events(for: task.id))
+                case "checkpoints":
+                    guard taskPersisted else {
+                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                        continue
+                    }
+                    printCheckpoints(try await store.listCheckpoints(taskID: task.id))
+                case "release":
+                    guard taskPersisted else {
+                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                        continue
+                    }
+                    let result = try await releaseResumeClaim(task: task, store: store)
+                    renderer.status(result.released ? "Claim released." : "No active claim for this machine.")
+                case "export":
+                    guard taskPersisted else {
+                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                        continue
+                    }
+                    let result = try await exportTranscriptMarkdown(
+                        task: task,
+                        store: store,
+                        repoURL: repoURL,
+                        snapshot: activeSnapshot,
+                        destination: command.argument
+                    )
+                    renderer.status("Exported \(result.eventCount) events to \(result.url.path).")
                 case "checkpoint":
                     guard taskPersisted else {
                         renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
@@ -717,24 +797,29 @@ func runInteractiveAgent(
                     taskPersisted = true
                     renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
                 case "resume":
-                    guard let identifier = command.argument, !identifier.isEmpty else {
-                        renderer.error("usage: /resume <task>")
+                    let resume = try resumeSlashOptions(command.argument)
+                    guard !resume.taskIdentifier.isEmpty else {
+                        renderer.error("usage: /resume <task> [--checkpoint <id|latest>] [--force]")
                         continue
                     }
-                    task = try await store.findTask(identifier)
-                    let restore = try await restoreLatestCheckpointIfAvailable(
+                    task = try await store.findTask(resume.taskIdentifier)
+                    let handoff = try await prepareResumeHandoff(
                         task: task,
                         store: store,
                         repoURL: repoURL,
-                        snapshot: activeSnapshot
+                        snapshot: activeSnapshot,
+                        checkpointSelector: resume.checkpointSelector,
+                        forceClaim: resume.forceClaim
                     )
-                    if restore != nil {
+                    if handoff.restore != nil {
                         activeSnapshot = try RepositoryInspector().inspect(path: repoURL)
                     }
                     taskPersisted = true
                     renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
-                    if let restore {
+                    if let restore = handoff.restore {
                         renderer.status(checkpointRestoreStatus(restore))
+                    } else {
+                        renderer.status(taskClaimStatus(handoff.claim))
                     }
                 default:
                     renderer.error("unknown command: /\(command.name)")
@@ -750,6 +835,7 @@ func runInteractiveAgent(
                     renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
                 }
                 renderer.status("running Codex turn...")
+                _ = try await refreshResumeClaimIfActive(task: task, store: store)
                 let assistantRendered = SendableFlag()
                 let renderRawEvents = showRawEvents
                 let summary = try await runCodexTurn(
@@ -769,9 +855,14 @@ func runInteractiveAgent(
                 if !assistantRendered.value {
                     printRunSummary(summary)
                 }
+                _ = try await refreshResumeClaimIfActive(task: task, store: store)
             } catch {
-                renderer.error("turn failed: \(error)")
+                renderer.error("turn failed: \(agentctlErrorMessage(error))")
             }
+        }
+
+        if taskPersisted {
+            _ = try? await releaseResumeClaim(task: task, store: store)
         }
     }
 }
@@ -849,6 +940,57 @@ func checkpointSlashOptions(_ argument: String?) throws -> GitCheckpointOptions 
     throw RuntimeError("usage: /checkpoint [--push]")
 }
 
+struct ResumeSlashOptions: Equatable {
+    var taskIdentifier: String
+    var checkpointSelector: String?
+    var forceClaim: Bool
+}
+
+struct ResumeHandoffResult {
+    var restore: GitCheckpointRestoreResult?
+    var claim: TaskClaimRecord
+}
+
+let taskClaimTTL: TimeInterval = 2 * 60 * 60
+
+struct ClaimReleaseResult: Codable, Equatable, Sendable {
+    var taskID: UUID
+    var ownerName: String
+    var released: Bool
+    var releasedAt: Date
+}
+
+func resumeSlashOptions(_ argument: String?) throws -> ResumeSlashOptions {
+    let parts = (argument ?? "")
+        .split(separator: " ", omittingEmptySubsequences: true)
+        .map(String.init)
+
+    guard let taskIdentifier = parts.first else {
+        return ResumeSlashOptions(taskIdentifier: "", checkpointSelector: nil, forceClaim: false)
+    }
+
+    var checkpointSelector: String?
+    var forceClaim = false
+    var index = 1
+    while index < parts.count {
+        switch parts[index] {
+        case "--checkpoint":
+            guard index + 1 < parts.count else {
+                throw RuntimeError("usage: /resume <task> [--checkpoint <id|latest>] [--force]")
+            }
+            checkpointSelector = parts[index + 1]
+            index += 2
+        case "--force", "--steal":
+            forceClaim = true
+            index += 1
+        default:
+            throw RuntimeError("usage: /resume <task> [--checkpoint <id|latest>] [--force]")
+        }
+    }
+
+    return ResumeSlashOptions(taskIdentifier: taskIdentifier, checkpointSelector: checkpointSelector, forceClaim: forceClaim)
+}
+
 func createAndPersistCheckpoint(
     task: TaskRecord,
     store: any AgentTaskStore,
@@ -856,11 +998,13 @@ func createAndPersistCheckpoint(
     repoURL: URL,
     options: GitCheckpointOptions = GitCheckpointOptions()
 ) async throws -> GitCheckpointResult {
+    let manifestContext = try await handoffManifestContext(task: task, store: store)
     let result = try GitCheckpointManager().createCheckpoint(
         task: task,
         snapshot: snapshot,
         repoURL: repoURL,
-        options: options
+        options: options,
+        manifestContext: manifestContext
     )
     try await store.saveCheckpoint(result.checkpoint)
     try await store.appendEvent(AgentEvent(
@@ -879,6 +1023,75 @@ func createAndPersistCheckpoint(
     return result
 }
 
+func handoffManifestContext(task: TaskRecord, store: any AgentTaskStore) async throws -> HandoffManifest {
+    let events = try await store.events(for: task.id)
+    return handoffManifestContext(events: events)
+}
+
+func handoffManifestContext(events: [AgentEvent]) -> HandoffManifest {
+    var commandOutputs: [HandoffCommandOutput] = []
+    var testResults: [HandoffTestResult] = []
+    var inspectNext: [String] = []
+
+    for event in events.suffix(80) where event.kind == .toolFinished {
+        guard let command = event.payload["command"]?.stringValue else {
+            continue
+        }
+        let exitCode: Int32
+        if case let .int(value) = event.payload["exitCode"] {
+            exitCode = Int32(clamping: value)
+        } else {
+            exitCode = 0
+        }
+        let output = truncateHandoffText(event.payload["output"]?.stringValue ?? "")
+        commandOutputs.append(HandoffCommandOutput(
+            command: command,
+            exitCode: exitCode,
+            output: output
+        ))
+
+        if commandLooksLikeTest(command) {
+            let status = exitCode == 0 ? "passed" : "failed"
+            testResults.append(HandoffTestResult(
+                command: command,
+                status: status,
+                output: output.isEmpty ? nil : output
+            ))
+            if exitCode != 0 {
+                inspectNext.append("Inspect failed test command: \(command)")
+            }
+        } else if exitCode != 0 {
+            inspectNext.append("Inspect failed command: \(command)")
+        }
+    }
+
+    return HandoffManifest(
+        commandOutputs: Array(commandOutputs.suffix(8)),
+        testResults: Array(testResults.suffix(8)),
+        inspectNext: Array(inspectNext.suffix(8))
+    )
+}
+
+private func commandLooksLikeTest(_ command: String) -> Bool {
+    let lowered = command.lowercased()
+    return lowered.contains(" test")
+        || lowered.hasSuffix("test")
+        || lowered.contains("swift test")
+        || lowered.contains("pnpm test")
+        || lowered.contains("npm test")
+        || lowered.contains("pytest")
+        || lowered.contains("cargo test")
+        || lowered.contains("go test")
+        || lowered.contains("xcodebuild test")
+}
+
+private func truncateHandoffText(_ text: String, limit: Int = 4_000) -> String {
+    guard text.count > limit else {
+        return text
+    }
+    return String(text.suffix(limit))
+}
+
 @discardableResult
 func restoreLatestCheckpointIfAvailable(
     task: TaskRecord,
@@ -886,21 +1099,127 @@ func restoreLatestCheckpointIfAvailable(
     repoURL: URL,
     snapshot: RepositorySnapshot
 ) async throws -> GitCheckpointRestoreResult? {
-    guard let checkpoint = try await store.listCheckpoints(taskID: task.id).first else {
-        return nil
+    try await prepareResumeHandoff(
+        task: task,
+        store: store,
+        repoURL: repoURL,
+        snapshot: snapshot,
+        checkpointSelector: nil,
+        forceClaim: false
+    ).restore
+}
+
+func prepareResumeHandoff(
+    task: TaskRecord,
+    store: any AgentTaskStore,
+    repoURL: URL,
+    snapshot: RepositorySnapshot,
+    checkpointSelector: String?,
+    forceClaim: Bool = false
+) async throws -> ResumeHandoffResult {
+    let checkpoints = try await store.listCheckpoints(taskID: task.id)
+    let checkpoint = try selectCheckpoint(checkpoints, selector: checkpointSelector)
+    let claim = try await store.claimTask(
+        taskID: task.id,
+        checkpointID: checkpoint?.id,
+        ownerName: currentClaimOwnerName(),
+        ttl: taskClaimTTL,
+        force: forceClaim
+    )
+
+    guard let checkpoint else {
+        try await store.appendEvent(AgentEvent(
+            taskID: task.id,
+            kind: .taskClaimed,
+            payload: taskClaimPayload(claim)
+        ))
+        return ResumeHandoffResult(restore: nil, claim: claim)
     }
 
-    let result = try GitCheckpointManager().restoreCheckpoint(
-        checkpoint,
-        snapshot: snapshot,
-        repoURL: repoURL
-    )
+    let result: GitCheckpointRestoreResult
+    do {
+        result = try GitCheckpointManager().restoreCheckpoint(
+            checkpoint,
+            snapshot: snapshot,
+            repoURL: repoURL
+        )
+    } catch {
+        _ = try? await store.releaseTaskClaim(taskID: task.id, ownerName: claim.ownerName)
+        throw error
+    }
+    try await store.appendEvent(AgentEvent(
+        taskID: task.id,
+        kind: .taskClaimed,
+        payload: taskClaimPayload(claim)
+    ))
     try await store.appendEvent(AgentEvent(
         taskID: task.id,
         kind: .backendEvent,
-        payload: checkpointRestorePayload(result)
+        payload: checkpointRestorePayload(result, claim: claim)
     ))
+    return ResumeHandoffResult(restore: result, claim: claim)
+}
+
+@discardableResult
+func refreshResumeClaimIfActive(task: TaskRecord, store: any AgentTaskStore) async throws -> TaskClaimRecord? {
+    try await store.refreshTaskClaim(
+        taskID: task.id,
+        ownerName: currentClaimOwnerName(),
+        ttl: taskClaimTTL
+    )
+}
+
+@discardableResult
+func releaseResumeClaim(task: TaskRecord, store: any AgentTaskStore) async throws -> ClaimReleaseResult {
+    let ownerName = currentClaimOwnerName()
+    let releasedAt = Date()
+    let released = try await store.releaseTaskClaim(taskID: task.id, ownerName: ownerName)
+    let result = ClaimReleaseResult(
+        taskID: task.id,
+        ownerName: ownerName,
+        released: released,
+        releasedAt: releasedAt
+    )
+
+    if released {
+        try await store.appendEvent(AgentEvent(
+            taskID: task.id,
+            kind: .taskClaimReleased,
+            payload: taskClaimReleasePayload(result)
+        ))
+    }
     return result
+}
+
+func selectCheckpoint(_ checkpoints: [CheckpointRecord], selector: String?) throws -> CheckpointRecord? {
+    let selector = selector?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if checkpoints.isEmpty, selector?.isEmpty == false {
+        throw RuntimeError("no checkpoints found for this task")
+    }
+    guard let selector, !selector.isEmpty, selector != "latest" else {
+        return checkpoints.first
+    }
+
+    let normalized = selector.lowercased()
+    if let match = checkpoints.first(where: { checkpoint in
+        checkpoint.id.uuidString.lowercased().hasPrefix(normalized)
+    }) {
+        return match
+    }
+
+    throw RuntimeError("checkpoint \(selector) was not found for this task")
+}
+
+func currentClaimOwnerName() -> String {
+    var buffer = [CChar](repeating: 0, count: 256)
+    let hostname: String
+    if gethostname(&buffer, buffer.count) == 0 {
+        let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        hostname = String(decoding: bytes, as: UTF8.self)
+    } else {
+        hostname = "unknown-host"
+    }
+    return "\(NSUserName())@\(hostname)"
 }
 
 func defaultInteractiveTaskTitle(snapshot: RepositorySnapshot, repoURL: URL) -> String {
@@ -1099,7 +1418,8 @@ func checkpointPayload(_ result: GitCheckpointResult) -> [String: JSONValue] {
         "remote": .string(result.checkpoint.remoteName),
         "committed": .bool(result.committed),
         "pushed": .bool(result.pushed),
-        "dirtyStatus": .string(result.dirtyStatus)
+        "dirtyStatus": .string(result.dirtyStatus),
+        "handoffManifest": result.manifest.jsonValue
     ]
 
     if let commitSHA = result.checkpoint.commitSHA {
@@ -1111,7 +1431,7 @@ func checkpointPayload(_ result: GitCheckpointResult) -> [String: JSONValue] {
     return payload
 }
 
-func checkpointRestorePayload(_ result: GitCheckpointRestoreResult) -> [String: JSONValue] {
+func checkpointRestorePayload(_ result: GitCheckpointRestoreResult, claim: TaskClaimRecord? = nil) -> [String: JSONValue] {
     var payload: [String: JSONValue] = [
         "type": .string("checkpoint.restored"),
         "checkpointID": .string(result.checkpoint.id.uuidString),
@@ -1128,7 +1448,32 @@ func checkpointRestorePayload(_ result: GitCheckpointRestoreResult) -> [String: 
     if let headSHA = result.headSHA {
         payload["headSHA"] = .string(headSHA)
     }
+    if let claim {
+        payload["claim"] = .object(taskClaimPayload(claim))
+    }
     return payload
+}
+
+func taskClaimPayload(_ claim: TaskClaimRecord) -> [String: JSONValue] {
+    var payload: [String: JSONValue] = [
+        "taskID": .string(claim.taskID.uuidString),
+        "owner": .string(claim.ownerName),
+        "claimedAt": .string(ISO8601DateFormatter().string(from: claim.claimedAt)),
+        "expiresAt": .string(ISO8601DateFormatter().string(from: claim.expiresAt))
+    ]
+    if let checkpointID = claim.checkpointID {
+        payload["checkpointID"] = .string(checkpointID.uuidString)
+    }
+    return payload
+}
+
+func taskClaimReleasePayload(_ release: ClaimReleaseResult) -> [String: JSONValue] {
+    [
+        "taskID": .string(release.taskID.uuidString),
+        "owner": .string(release.ownerName),
+        "released": .bool(release.released),
+        "releasedAt": .string(ISO8601DateFormatter().string(from: release.releasedAt))
+    ]
 }
 
 func printCheckpointResult(_ result: GitCheckpointResult) {
@@ -1145,14 +1490,20 @@ func printCheckpointResult(_ result: GitCheckpointResult) {
 
 func printCheckpointRestoreResult(_ result: GitCheckpointRestoreResult) {
     print("Checkpoint restored")
+    print("  id:     \(result.checkpoint.id.uuidString)")
     print("  branch: \(result.checkpoint.branch)")
     print("  commit: \(result.headSHA ?? result.checkpoint.commitSHA ?? "-")")
     print("  remote: \(result.fetched ? result.checkpoint.remoteName : "-")")
+    print("  files:  \(checkpointChangedFileCount(result.checkpoint))")
 }
 
 func checkpointRestoreStatus(_ result: GitCheckpointRestoreResult) -> String {
     let commit = shortCommit(result.headSHA ?? result.checkpoint.commitSHA)
-    return "Restored checkpoint \(result.checkpoint.branch) @ \(commit)."
+    return "Restored checkpoint \(result.checkpoint.branch) @ \(commit) (\(checkpointChangedFileCount(result.checkpoint)) files)."
+}
+
+func taskClaimStatus(_ claim: TaskClaimRecord) -> String {
+    "Claimed task for \(claim.ownerName) until \(ISO8601DateFormatter().string(from: claim.expiresAt))."
 }
 
 func checkpointCreatedStatus(_ result: GitCheckpointResult) -> String {
@@ -1180,7 +1531,222 @@ func printCheckpoints(_ checkpoints: [CheckpointRecord]) {
         print("  commit:  \(checkpoint.commitSHA ?? "-")")
         print("  remote:  \(checkpoint.remoteName)")
         print("  pushed:  \(checkpoint.pushedAt.map { ISO8601DateFormatter().string(from: $0) } ?? "-")")
+        print("  files:   \(checkpointChangedFileCount(checkpoint))")
     }
+}
+
+func checkpointChangedFileCount(_ checkpoint: CheckpointRecord) -> Int {
+    guard let values = checkpoint.metadata["changedFiles"]?.arrayValue else {
+        return 0
+    }
+    return values.count
+}
+
+struct TranscriptExportResult: Equatable, Sendable {
+    var url: URL
+    var eventCount: Int
+}
+
+func exportTranscriptMarkdown(
+    task: TaskRecord,
+    store: any AgentTaskStore,
+    repoURL: URL,
+    snapshot: RepositorySnapshot,
+    destination: String?
+) async throws -> TranscriptExportResult {
+    let events = try await store.events(for: task.id)
+    let url = transcriptExportURL(
+        task: task,
+        repoURL: repoURL,
+        snapshot: snapshot,
+        destination: destination
+    )
+    try FileManager.default.createDirectory(
+        at: url.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    let markdown = transcriptMarkdown(task: task, events: events, exportedAt: Date())
+    try markdown.write(to: url, atomically: true, encoding: .utf8)
+    return TranscriptExportResult(url: url, eventCount: events.count)
+}
+
+func transcriptExportURL(
+    task: TaskRecord,
+    repoURL: URL,
+    snapshot: RepositorySnapshot,
+    destination: String?,
+    now: Date = Date()
+) -> URL {
+    let baseURL = snapshot.rootPath.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? repoURL
+    let filename = defaultTranscriptExportFilename(task: task, now: now)
+    let rawDestination = destination?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !rawDestination.isEmpty else {
+        return baseURL
+            .appendingPathComponent(".agentctl", isDirectory: true)
+            .appendingPathComponent("exports", isDirectory: true)
+            .appendingPathComponent(filename)
+    }
+
+    let expandedDestination: String
+    if rawDestination == "~" {
+        expandedDestination = FileManager.default.homeDirectoryForCurrentUser.path
+    } else if rawDestination.hasPrefix("~/") {
+        expandedDestination = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(String(rawDestination.dropFirst(2)))
+            .path
+    } else {
+        expandedDestination = rawDestination
+    }
+
+    var url = expandedDestination.hasPrefix("/")
+        ? URL(fileURLWithPath: expandedDestination)
+        : baseURL.appendingPathComponent(expandedDestination)
+    if rawDestination.hasSuffix("/") {
+        url.appendPathComponent(filename)
+    } else if url.pathExtension.isEmpty {
+        url.appendPathExtension("md")
+    }
+    return url
+}
+
+func defaultTranscriptExportFilename(task: TaskRecord, now: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "yyyyMMdd-HHmmss"
+    return "\(task.slug)-transcript-\(formatter.string(from: now)).md"
+}
+
+func transcriptMarkdown(task: TaskRecord, events: [AgentEvent], exportedAt: Date) -> String {
+    var blocks: [String] = [
+        "# \(task.title)",
+        [
+            "- Task: `\(task.slug)`",
+            "- Task ID: `\(task.id.uuidString)`",
+            "- Exported: `\(ISO8601DateFormatter().string(from: exportedAt))`"
+        ].joined(separator: "\n")
+    ]
+
+    var renderedCount = 0
+    for event in events {
+        guard let block = transcriptMarkdownBlock(for: event) else {
+            continue
+        }
+        renderedCount += 1
+        blocks.append(block)
+    }
+
+    if renderedCount == 0 {
+        blocks.append("_No transcript events found._")
+    }
+
+    return blocks.joined(separator: "\n\n") + "\n"
+}
+
+private func transcriptMarkdownBlock(for event: AgentEvent) -> String? {
+    switch event.kind {
+    case .userMessage:
+        guard let text = event.payload["text"]?.stringValue else {
+            return nil
+        }
+        return "## User\n\n\(markdownQuote(text))"
+    case .assistantDone:
+        guard let text = event.payload["text"]?.stringValue else {
+            return nil
+        }
+        return "## Codex\n\n\(text)"
+    case .toolFinished:
+        return toolTranscriptMarkdownBlock(event.payload)
+    case .checkpointCreated:
+        return checkpointTranscriptMarkdownBlock(title: "Checkpoint", payload: event.payload)
+    case .handoffCreated:
+        return checkpointTranscriptMarkdownBlock(title: "Handoff", payload: event.payload)
+    case .taskClaimed:
+        return claimTranscriptMarkdownBlock(title: "Claimed", payload: event.payload)
+    case .taskClaimRefreshed:
+        return claimTranscriptMarkdownBlock(title: "Claim Refreshed", payload: event.payload)
+    case .taskClaimReleased:
+        return claimTranscriptMarkdownBlock(title: "Claim Released", payload: event.payload)
+    default:
+        return nil
+    }
+}
+
+private func toolTranscriptMarkdownBlock(_ payload: [String: JSONValue]) -> String? {
+    guard let command = payload["command"]?.stringValue else {
+        return nil
+    }
+
+    var lines = ["## Tool", markdownFence(language: "sh", text: "$ \(command)")]
+    if case let .int(exitCode) = payload["exitCode"] {
+        lines.append("Exit code: `\(exitCode)`")
+    }
+    if let output = payload["output"]?.stringValue,
+       !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        lines.append(markdownFence(language: "text", text: output))
+    }
+    return lines.joined(separator: "\n\n")
+}
+
+private func checkpointTranscriptMarkdownBlock(title: String, payload: [String: JSONValue]) -> String {
+    var lines = ["## \(title)"]
+    if let checkpointID = payload["checkpointID"]?.stringValue {
+        lines.append("- Checkpoint: `\(checkpointID)`")
+    }
+    if let branch = payload["branch"]?.stringValue {
+        lines.append("- Branch: `\(branch)`")
+    }
+    if let commit = payload["commitSHA"]?.stringValue {
+        lines.append("- Commit: `\(commit)`")
+    }
+    if let pushed = payload["pushed"] {
+        lines.append("- Pushed: `\(pushed == .bool(true) ? "yes" : "no")`")
+    }
+    if let manifest = payload["handoffManifest"]?.objectValue {
+        lines.append("- Handoff: \(handoffManifestSummary(manifest))")
+    }
+    return lines.joined(separator: "\n")
+}
+
+private func claimTranscriptMarkdownBlock(title: String, payload: [String: JSONValue]) -> String {
+    var lines = ["## \(title)"]
+    if let owner = payload["owner"]?.stringValue {
+        lines.append("- Owner: `\(owner)`")
+    }
+    if let checkpointID = payload["checkpointID"]?.stringValue {
+        lines.append("- Checkpoint: `\(checkpointID)`")
+    }
+    if let expiresAt = payload["expiresAt"]?.stringValue {
+        lines.append("- Expires: `\(expiresAt)`")
+    }
+    if let releasedAt = payload["releasedAt"]?.stringValue {
+        lines.append("- Released: `\(releasedAt)`")
+    }
+    return lines.joined(separator: "\n")
+}
+
+private func handoffManifestSummary(_ manifest: [String: JSONValue]) -> String {
+    let files = manifest["changedFiles"]?.arrayValue?.count ?? 0
+    let generated = manifest["generatedFiles"]?.arrayValue?.count ?? 0
+    let commands = manifest["commandOutputs"]?.arrayValue?.count ?? 0
+    let tests = manifest["testResults"]?.arrayValue?.count ?? 0
+    return "`\(files)` files, `\(generated)` generated, `\(commands)` commands, `\(tests)` tests"
+}
+
+private func markdownQuote(_ text: String) -> String {
+    text.split(separator: "\n", omittingEmptySubsequences: false)
+        .map { line in
+            line.isEmpty ? ">" : "> \(line)"
+        }
+        .joined(separator: "\n")
+}
+
+private func markdownFence(language: String, text: String) -> String {
+    let longestBacktickRun = text.split(whereSeparator: { $0 != "`" })
+        .map(\.count)
+        .max() ?? 0
+    let fence = String(repeating: "`", count: max(3, longestBacktickRun + 1))
+    return "\(fence)\(language)\n\(text)\n\(fence)"
 }
 
 func printRunSummary(_ summary: TaskRunSummary) {
@@ -1221,6 +1787,21 @@ struct RuntimeError: Error, CustomStringConvertible {
     init(_ description: String) {
         self.description = description
     }
+}
+
+func agentctlErrorMessage(_ error: Error) -> String {
+    let described = String(describing: error)
+    let message: String
+    if described.contains("Generic description to prevent accidental leakage") {
+        message = String(reflecting: error)
+    } else {
+        message = described
+    }
+
+    if message.contains("task_claims") || message.contains("schema is out of date") {
+        return "\(message)\nRun `swift run agentctl db migrate` with the same `AGENTCTL_DATABASE_URL`, then try again."
+    }
+    return message
 }
 
 func printError(_ text: String) {

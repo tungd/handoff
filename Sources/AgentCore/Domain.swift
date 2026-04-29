@@ -35,6 +35,9 @@ public enum EventKind: String, Codable, CaseIterable, Sendable {
     case permissionResolved = "permission.resolved"
     case checkpointCreated = "checkpoint.created"
     case handoffCreated = "handoff.created"
+    case taskClaimed = "task.claimed"
+    case taskClaimRefreshed = "task.claim.refreshed"
+    case taskClaimReleased = "task.claim.released"
     case memoryWritten = "memory.written"
     case backendSessionUpdated = "backend.session.updated"
     case backendEvent = "backend.event"
@@ -167,6 +170,7 @@ public struct CheckpointRecord: Codable, Equatable, Sendable, Identifiable {
     public var remoteName: String
     public var pushedAt: Date?
     public var createdAt: Date
+    public var metadata: [String: JSONValue]
 
     public init(
         id: UUID = UUID(),
@@ -177,7 +181,8 @@ public struct CheckpointRecord: Codable, Equatable, Sendable, Identifiable {
         commitSHA: String? = nil,
         remoteName: String = "origin",
         pushedAt: Date? = nil,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        metadata: [String: JSONValue] = [:]
     ) {
         self.id = id
         self.taskID = taskID
@@ -188,6 +193,71 @@ public struct CheckpointRecord: Codable, Equatable, Sendable, Identifiable {
         self.remoteName = remoteName
         self.pushedAt = pushedAt
         self.createdAt = createdAt
+        self.metadata = metadata
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case taskID
+        case repoID
+        case machineID
+        case branch
+        case commitSHA
+        case remoteName
+        case pushedAt
+        case createdAt
+        case metadata
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        taskID = try container.decode(UUID.self, forKey: .taskID)
+        repoID = try container.decodeIfPresent(UUID.self, forKey: .repoID)
+        machineID = try container.decodeIfPresent(UUID.self, forKey: .machineID)
+        branch = try container.decode(String.self, forKey: .branch)
+        commitSHA = try container.decodeIfPresent(String.self, forKey: .commitSHA)
+        remoteName = try container.decode(String.self, forKey: .remoteName)
+        pushedAt = try container.decodeIfPresent(Date.self, forKey: .pushedAt)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        metadata = try container.decodeIfPresent([String: JSONValue].self, forKey: .metadata) ?? [:]
+    }
+}
+
+public struct TaskClaimRecord: Codable, Equatable, Sendable {
+    public var taskID: UUID
+    public var checkpointID: UUID?
+    public var ownerName: String
+    public var claimedAt: Date
+    public var expiresAt: Date
+    public var metadata: [String: JSONValue]
+
+    public init(
+        taskID: UUID,
+        checkpointID: UUID? = nil,
+        ownerName: String,
+        claimedAt: Date = Date(),
+        expiresAt: Date,
+        metadata: [String: JSONValue] = [:]
+    ) {
+        self.taskID = taskID
+        self.checkpointID = checkpointID
+        self.ownerName = ownerName
+        self.claimedAt = claimedAt
+        self.expiresAt = expiresAt
+        self.metadata = metadata
+    }
+}
+
+public enum TaskClaimError: Error, CustomStringConvertible, Sendable {
+    case alreadyClaimed(TaskClaimRecord)
+
+    public var description: String {
+        switch self {
+        case let .alreadyClaimed(claim):
+            let expiry = ISO8601DateFormatter().string(from: claim.expiresAt)
+            return "task is already claimed by \(claim.ownerName) until \(expiry)"
+        }
     }
 }
 

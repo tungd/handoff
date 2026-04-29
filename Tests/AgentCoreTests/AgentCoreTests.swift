@@ -392,7 +392,7 @@ func gitCheckpointManagerCreatesBranchCommitsChangesAndReturnsCheckpoint() throw
     let manager = GitCheckpointManager(git: GitRunner(runner: FakeProcessRunner(responses: [
         gitKey("switch", "agent/cashout-race"): ProcessResult(exitCode: 1, stdout: "", stderr: "missing branch"),
         gitKey("switch", "-c", "agent/cashout-race"): ok(""),
-        gitKey("status", "--porcelain=v1"): ok(" M Sources/file.swift\n"),
+        gitKey("status", "--porcelain=v1", "--", ".", ":!.agentctl"): ok(" M Sources/file.swift\n"),
         gitKey("add", "-A", "--", ".", ":!.agentctl"): ok(""),
         gitKey("commit", "-m", "agentctl checkpoint: cashout-race"): ok("[agent/cashout-race abcdef1] checkpoint\n"),
         gitKey("rev-parse", "HEAD"): ok("abcdef123\n")
@@ -415,6 +415,8 @@ func gitCheckpointManagerCreatesBranchCommitsChangesAndReturnsCheckpoint() throw
     #expect(result.committed)
     #expect(result.pushed == false)
     #expect(result.dirtyStatus == " M Sources/file.swift\n")
+    #expect(result.manifest.changedFiles == ["Sources/file.swift"])
+    #expect(result.checkpoint.metadata["handoffManifest"] != nil)
 }
 
 @Test
@@ -423,7 +425,7 @@ func gitCheckpointManagerPushesWhenRequested() throws {
     let task = TaskRecord(title: "Handoff", slug: "handoff")
     let manager = GitCheckpointManager(git: GitRunner(runner: FakeProcessRunner(responses: [
         gitKey("switch", "agent/handoff"): ok(""),
-        gitKey("status", "--porcelain=v1"): ok(""),
+        gitKey("status", "--porcelain=v1", "--", ".", ":!.agentctl"): ok(""),
         gitKey("rev-parse", "HEAD"): ok("feedface\n"),
         gitKey("push", "-u", "origin", "agent/handoff"): ok("")
     ])))
@@ -452,6 +454,7 @@ func gitCheckpointManagerRestoresPushedCheckpointFromRemote() throws {
         pushedAt: Date(timeIntervalSince1970: 0)
     )
     let manager = GitCheckpointManager(git: GitRunner(runner: FakeProcessRunner(responses: [
+        gitKey("status", "--porcelain=v1", "--", ".", ":!.agentctl"): ok(""),
         gitKey("fetch", "origin", "agent/handoff:refs/remotes/origin/agent/handoff"): ok(""),
         gitKey("switch", "agent/handoff"): ProcessResult(exitCode: 1, stdout: "", stderr: "missing branch"),
         gitKey("switch", "--track", "-c", "agent/handoff", "origin/agent/handoff"): ok(""),
@@ -481,6 +484,7 @@ func gitCheckpointManagerRestoresLocalCheckpointWithoutFetching() throws {
         commitSHA: "abc1234"
     )
     let manager = GitCheckpointManager(git: GitRunner(runner: FakeProcessRunner(responses: [
+        gitKey("status", "--porcelain=v1", "--", ".", ":!.agentctl"): ok(""),
         gitKey("switch", "agent/local"): ok(""),
         gitKey("rev-parse", "HEAD"): ok("abc1234\n")
     ])))

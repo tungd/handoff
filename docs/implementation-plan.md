@@ -34,18 +34,30 @@
 - List tasks by repo.
 - Resume a task from `task_id`.
 - Share task/session/event state through Postgres.
-- Create checkpoint branch. (initial command implemented)
-- Commit and push handoff branch. (initial command implemented)
-- Recreate or switch local worktree on another machine. (initial `/resume` restore implemented)
+- Create checkpoint branch. (implemented)
+- Commit and push handoff branch. (implemented)
+- Recreate or switch local worktree on another machine. (implemented)
+- Claim resumed tasks with a Postgres lease to prevent parallel remote work. (implemented)
+- Refresh and release task claims from CLI/TUI lifecycle. (implemented)
+- Persist lightweight handoff manifests with checkpoint metadata. (implemented)
+- Include recent command/test output in checkpoint handoff manifests. (implemented)
+- List and target checkpoint history from chat. (implemented)
+- Export task transcripts as Markdown from chat. (implemented)
 
-## Phase 4: Memory
+## Phase 4: Skills Sync
+
+- Track skills/tooling available per machine.
+- Surface missing skills during remote resume.
+- Sync capability metadata without syncing secrets.
+
+## Phase 5: Memory
 
 - Store memory in Postgres.
 - Add full-text search.
 - Expose `agentctl mcp memory` for agent self-retrieval.
 - Keep durable writes reviewable by default.
 
-## Phase 5: PWA/API
+## Phase 6: PWA/API
 
 - Add `agentctl serve` with Hummingbird.
 - Expose task/session APIs.

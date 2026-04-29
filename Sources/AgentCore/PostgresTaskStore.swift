@@ -3,11 +3,14 @@ import PostgresNIO
 
 public enum PostgresTaskStoreError: Error, CustomStringConvertible, Sendable {
     case missingTaskID
+    case schemaOutOfDate(String)
 
     public var description: String {
         switch self {
         case .missingTaskID:
             return "events persisted to Postgres must have a task id"
+        case let .schemaOutOfDate(detail):
+            return "Postgres schema is out of date: \(detail). Run `swift run agentctl db migrate` against this database."
         }
     }
 }
@@ -204,6 +207,7 @@ public struct PostgresTaskStore: AgentTaskStore {
     }
 
     public func saveCheckpoint(_ checkpoint: CheckpointRecord) async throws {
+        let metadataJSON = try jsonString(checkpoint.metadata)
         try await drain(client.query("""
             INSERT INTO checkpoints (id, task_id, repo_id, machine_id, branch, commit_sha, remote_name, pushed_at, created_at, dirty_summary, metadata)
             VALUES (
@@ -217,7 +221,7 @@ public struct PostgresTaskStore: AgentTaskStore {
                 \(checkpoint.pushedAt),
                 \(checkpoint.createdAt),
                 '{}'::jsonb,
-                '{}'::jsonb
+                \(metadataJSON)::jsonb
             )
             ON CONFLICT (id) DO UPDATE SET
                 repo_id = EXCLUDED.repo_id,
@@ -225,7 +229,8 @@ public struct PostgresTaskStore: AgentTaskStore {
                 branch = EXCLUDED.branch,
                 commit_sha = EXCLUDED.commit_sha,
                 remote_name = EXCLUDED.remote_name,
-                pushed_at = EXCLUDED.pushed_at
+                pushed_at = EXCLUDED.pushed_at,
+                metadata = EXCLUDED.metadata
             """))
     }
 
@@ -233,21 +238,21 @@ public struct PostgresTaskStore: AgentTaskStore {
         let rows: PostgresRowSequence
         if let taskID {
             rows = try await client.query("""
-                SELECT id, task_id, repo_id, machine_id, branch, commit_sha, remote_name, pushed_at, created_at
+                SELECT id, task_id, repo_id, machine_id, branch, commit_sha, remote_name, pushed_at, created_at, metadata::text
                 FROM checkpoints
                 WHERE task_id = \(taskID)
                 ORDER BY created_at DESC
                 """)
         } else {
             rows = try await client.query("""
-                SELECT id, task_id, repo_id, machine_id, branch, commit_sha, remote_name, pushed_at, created_at
+                SELECT id, task_id, repo_id, machine_id, branch, commit_sha, remote_name, pushed_at, created_at, metadata::text
                 FROM checkpoints
                 ORDER BY created_at DESC
                 """)
         }
 
         var checkpoints: [CheckpointRecord] = []
-        for try await (id, taskID, repoID, machineID, branch, commitSHA, remoteName, pushedAt, createdAt) in rows.decode((
+        for try await (id, taskID, repoID, machineID, branch, commitSHA, remoteName, pushedAt, createdAt, metadataText) in rows.decode((
             UUID,
             UUID,
             UUID?,
@@ -256,8 +261,10 @@ public struct PostgresTaskStore: AgentTaskStore {
             String?,
             String,
             Date?,
-            Date
+            Date,
+            String
         ).self) {
+            let metadata = try decoder.decode([String: JSONValue].self, from: Data(metadataText.utf8))
             checkpoints.append(CheckpointRecord(
                 id: id,
                 taskID: taskID,
@@ -267,10 +274,114 @@ public struct PostgresTaskStore: AgentTaskStore {
                 commitSHA: commitSHA,
                 remoteName: remoteName,
                 pushedAt: pushedAt,
-                createdAt: createdAt
+                createdAt: createdAt,
+                metadata: metadata
             ))
         }
         return checkpoints
+    }
+
+    public func claimTask(
+        taskID: UUID,
+        checkpointID: UUID?,
+        ownerName: String,
+        ttl: TimeInterval,
+        force: Bool
+    ) async throws -> TaskClaimRecord {
+        try await ensureTaskClaimsSchema()
+        let now = Date()
+        let expiresAt = now.addingTimeInterval(ttl)
+        let metadata: [String: JSONValue] = [
+            "store": .string("postgres"),
+            "forced": .bool(force)
+        ]
+        let metadataJSON = try jsonString(metadata)
+        let rows = try await client.query("""
+            INSERT INTO task_claims (task_id, checkpoint_id, owner_name, claimed_at, expires_at, metadata)
+            VALUES (
+                \(taskID),
+                \(checkpointID),
+                \(ownerName),
+                \(now),
+                \(expiresAt),
+                \(metadataJSON)::jsonb
+            )
+            ON CONFLICT (task_id) DO UPDATE SET
+                checkpoint_id = EXCLUDED.checkpoint_id,
+                owner_name = EXCLUDED.owner_name,
+                claimed_at = EXCLUDED.claimed_at,
+                expires_at = EXCLUDED.expires_at,
+                metadata = EXCLUDED.metadata
+            WHERE task_claims.expires_at < now()
+               OR task_claims.owner_name = EXCLUDED.owner_name
+               OR \(force)
+            RETURNING task_id, checkpoint_id, owner_name, claimed_at, expires_at, metadata::text
+            """)
+
+        if let claim = try await decodeTaskClaims(rows).first {
+            return claim
+        }
+
+        if let existing = try await currentTaskClaim(taskID: taskID) {
+            throw TaskClaimError.alreadyClaimed(existing)
+        }
+
+        throw TaskClaimError.alreadyClaimed(TaskClaimRecord(
+            taskID: taskID,
+            checkpointID: checkpointID,
+            ownerName: "unknown",
+            expiresAt: expiresAt
+        ))
+    }
+
+    public func currentTaskClaim(taskID: UUID) async throws -> TaskClaimRecord? {
+        try await ensureTaskClaimsSchema()
+        let rows = try await client.query("""
+            SELECT task_id, checkpoint_id, owner_name, claimed_at, expires_at, metadata::text
+            FROM task_claims
+            WHERE task_id = \(taskID)
+            """)
+
+        return try await decodeTaskClaims(rows).first
+    }
+
+    public func refreshTaskClaim(taskID: UUID, ownerName: String, ttl: TimeInterval) async throws -> TaskClaimRecord? {
+        try await ensureTaskClaimsSchema()
+        let expiresAt = Date().addingTimeInterval(ttl)
+        let rows = try await client.query("""
+            UPDATE task_claims
+            SET expires_at = \(expiresAt),
+                metadata = metadata || '{"refreshed": true}'::jsonb
+            WHERE task_id = \(taskID)
+              AND owner_name = \(ownerName)
+            RETURNING task_id, checkpoint_id, owner_name, claimed_at, expires_at, metadata::text
+            """)
+
+        if let claim = try await decodeTaskClaims(rows).first {
+            return claim
+        }
+
+        if let existing = try await currentTaskClaim(taskID: taskID),
+           existing.ownerName != ownerName,
+           existing.expiresAt > Date() {
+            throw TaskClaimError.alreadyClaimed(existing)
+        }
+        return nil
+    }
+
+    public func releaseTaskClaim(taskID: UUID, ownerName: String) async throws -> Bool {
+        try await ensureTaskClaimsSchema()
+        let rows = try await client.query("""
+            DELETE FROM task_claims
+            WHERE task_id = \(taskID)
+              AND owner_name = \(ownerName)
+            RETURNING task_id
+            """)
+
+        for try await _ in rows.decode(UUID.self) {
+            return true
+        }
+        return false
     }
 
     @discardableResult
@@ -348,6 +459,49 @@ public struct PostgresTaskStore: AgentTaskStore {
             sessions: sessions,
             latestEvents: Array(events.suffix(eventLimit))
         )
+    }
+
+    private func decodeTaskClaims(_ rows: PostgresRowSequence) async throws -> [TaskClaimRecord] {
+        var claims: [TaskClaimRecord] = []
+        for try await (taskID, checkpointID, ownerName, claimedAt, expiresAt, metadataText) in rows.decode((
+            UUID,
+            UUID?,
+            String,
+            Date,
+            Date,
+            String
+        ).self) {
+            let metadata = try decoder.decode([String: JSONValue].self, from: Data(metadataText.utf8))
+            claims.append(TaskClaimRecord(
+                taskID: taskID,
+                checkpointID: checkpointID,
+                ownerName: ownerName,
+                claimedAt: claimedAt,
+                expiresAt: expiresAt,
+                metadata: metadata
+            ))
+        }
+        return claims
+    }
+
+    private func ensureTaskClaimsSchema() async throws {
+        let rows = try await client.query("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = 'task_claims'
+            )
+            """)
+
+        for try await exists in rows.decode(Bool.self) {
+            if exists {
+                return
+            }
+            throw PostgresTaskStoreError.schemaOutOfDate("missing table task_claims")
+        }
+
+        throw PostgresTaskStoreError.schemaOutOfDate("could not verify table task_claims")
     }
 
     private func nextEventSequence(taskID: UUID) async throws -> Int64 {
