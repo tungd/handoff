@@ -75,15 +75,16 @@ func runTUIkitInteractiveLoop(
 ) async throws {
     let initialEntries = taskPersisted ? try await tuiEntries(for: task.id, store: store) : []
     let modelMetadata = resolvedAgentModelMetadata(backend: task.backendPreference, options: backendRunOptions)
+    let model = AgentTUIModel(task: task, isTaskPersisted: taskPersisted, entries: initialEntries.isEmpty ? [
+        TUITranscriptEntry(role: .system, text: "Ready.")
+    ] : initialEntries)
     let runtime = AgentTUIRuntime(
         task: task,
         storeOptions: storeOptions,
         repoURL: repoURL,
         snapshot: snapshot,
         store: store,
-        model: AgentTUIModel(task: task, isTaskPersisted: taskPersisted, entries: initialEntries.isEmpty ? [
-            TUITranscriptEntry(role: .system, text: "Ready.")
-        ] : initialEntries),
+        model: model,
         modelDisplayName: modelMetadata.displayName,
         modelContextWindowTokens: modelMetadata.contextWindowTokens,
         defaultBackend: defaultBackend,
@@ -92,19 +93,16 @@ func runTUIkitInteractiveLoop(
         backendRunOptions: backendRunOptions
     )
 
-    await MainActor.run {
-        setTerminalAlternateScrollMode(enabled: true)
-        defer { setTerminalAlternateScrollMode(enabled: false) }
-        AgentTUIRuntimeBox.current = runtime
-        AgentTUIApp.main()
+    let loop = AgentTUINativeLoop(model: model)
+    model.setUpdateHandler {
+        loop.requestRender()
+    }
+    AgentTUIRuntimeBox.current = runtime
+    defer {
+        model.setUpdateHandler(nil)
         AgentTUIRuntimeBox.current = nil
     }
-}
-
-private func setTerminalAlternateScrollMode(enabled: Bool) {
-    // xterm alternate-scroll mode turns wheel events into Up/Down keys in alternate screen.
-    let sequence = enabled ? "\u{1B}[?1007h" : "\u{1B}[?1007l"
-    FileHandle.standardOutput.write(Data(sequence.utf8))
+    try await loop.run()
 }
 
 struct AgentTUIApp: App {
@@ -219,6 +217,7 @@ private final class AgentTUIModel: @unchecked Sendable {
     private var state: AgentTUISnapshot
     private var cacheClearedRevision = 0
     private var runningOperation: AgentTUIRunningOperation?
+    private var updateHandler: (@Sendable () -> Void)?
 
     init(task: TaskRecord, isTaskPersisted: Bool = true, entries: [TUITranscriptEntry]) {
         state = AgentTUISnapshot(
@@ -248,6 +247,12 @@ private final class AgentTUIModel: @unchecked Sendable {
         }
         if shouldClear {
             RenderCache.shared.clearAll()
+        }
+    }
+
+    func setUpdateHandler(_ handler: (@Sendable () -> Void)?) {
+        lock.withLock {
+            updateHandler = handler
         }
     }
 
@@ -450,13 +455,19 @@ private final class AgentTUIModel: @unchecked Sendable {
     }
 
     private func update(_ body: (inout AgentTUISnapshot) -> Void) {
+        var handler: (@Sendable () -> Void)?
         lock.withLock {
             body(&state)
             state.revision += 1
+            handler = updateHandler
         }
-        AppState.shared.setNeedsRender()
-        // TUIkit's runner owns a private AppState; SIGWINCH is its process-wide render wake-up.
-        Darwin.raise(SIGWINCH)
+        if let handler {
+            handler()
+        } else {
+            AppState.shared.setNeedsRender()
+            // TUIkit's runner owns a private AppState; SIGWINCH is its process-wide render wake-up.
+            Darwin.raise(SIGWINCH)
+        }
     }
 
     private func append(
@@ -519,6 +530,1105 @@ private extension NSLock {
         lock()
         defer { unlock() }
         return try body()
+    }
+}
+
+private final class AgentTUINativeLoop: @unchecked Sendable {
+    private let model: AgentTUIModel
+    private let renderSignal = AgentTUIRenderSignal()
+    private let terminal = AgentTUINativeTerminal()
+    private var input = ""
+    private var inputCursor = 0
+    private var promptHistory: [String] = []
+    private var promptHistoryIndex: Int?
+    private var promptHistoryDraft = ""
+    private var printedEntryKeys = Set<String>()
+    private var hasPrintedTranscript = false
+    private var composerLineCount = 0
+    private let exitLock = NSLock()
+    private var shouldExitStorage = false
+
+    private var shouldExit: Bool {
+        get {
+            exitLock.withLock { shouldExitStorage }
+        }
+        set {
+            exitLock.withLock { shouldExitStorage = newValue }
+        }
+    }
+
+    init(model: AgentTUIModel) {
+        self.model = model
+    }
+
+    func requestRender() {
+        renderSignal.mark()
+    }
+
+    func run() async throws {
+        try terminal.enableRawMode()
+        defer {
+            clearComposer()
+            terminal.disableRawMode()
+            terminal.showCursor()
+        }
+
+        renderHeader()
+        renderTranscriptAndComposer(forceTranscript: true)
+
+        while !shouldExit {
+            var eventsProcessed = 0
+            while eventsProcessed < 128, let event = terminal.readKeyEvent() {
+                _ = handleKey(event)
+                eventsProcessed += 1
+            }
+
+            if renderSignal.consume() {
+                renderTranscriptAndComposer()
+            } else if shouldSpinActivity(model.snapshot()) {
+                renderComposerOnly()
+            }
+
+            usleep(23_800)
+        }
+    }
+
+    private func renderHeader() {
+        guard let runtime = AgentTUIRuntimeBox.current else {
+            return
+        }
+        let snapshot = model.snapshot()
+        let width = terminalSize().columns
+        let left = agentTUIANSIStyled("agentctl", color: .palette.accent, isBold: false, isItalic: false, isUnderlined: false, palette: AgentTUIPalette())
+        let slug = agentTUIANSIStyled(" \(snapshot.task.slug)", color: .palette.foregroundTertiary, isBold: false, isItalic: false, isUnderlined: false, palette: AgentTUIPalette())
+        let store = shortStoreName(storeDescription(options: runtime.storeOptions, repoURL: runtime.repoURL, snapshot: runtime.snapshot))
+        let plainLeft = "agentctl \(snapshot.task.slug)"
+        let spaces = max(1, width - plainLeft.count - store.count)
+        let right = agentTUIANSIStyled(store, color: .palette.foregroundTertiary, isBold: false, isItalic: false, isUnderlined: false, palette: AgentTUIPalette())
+        terminal.write(left + slug + String(repeating: " ", count: spaces) + right + "\r\n")
+        terminal.write(agentTUIANSIStyled(
+            String(repeating: "─", count: max(1, width)),
+            color: .palette.foregroundTertiary,
+            isBold: false,
+            isItalic: false,
+            isUnderlined: false,
+            palette: AgentTUIPalette()
+        ) + "\r\n")
+    }
+
+    private func renderTranscriptAndComposer(forceTranscript: Bool = false) {
+        let snapshot = model.snapshot()
+        let width = max(40, terminalSize().columns)
+        clearComposer()
+
+        for entry in snapshot.entries {
+            let key = transcriptRenderKey(entry)
+            guard forceTranscript || !printedEntryKeys.contains(key) else {
+                continue
+            }
+            printedEntryKeys.insert(key)
+
+            if hasPrintedTranscript {
+                terminal.write("\r\n")
+            }
+            hasPrintedTranscript = true
+
+            for line in transcriptLines([entry], width: max(20, width - 4)) {
+                terminal.write(agentTUIRenderedTranscriptRow(line, width: width, palette: AgentTUIPalette()) + "\r\n")
+            }
+        }
+
+        drawComposer(snapshot: snapshot)
+    }
+
+    private func renderComposerOnly() {
+        clearComposer()
+        drawComposer(snapshot: model.snapshot())
+    }
+
+    private func clearComposer() {
+        guard composerLineCount > 0 else {
+            return
+        }
+        terminal.hideCursor()
+        if composerLineCount > 1 {
+            terminal.write("\u{1B}[\(composerLineCount - 1)F")
+        } else {
+            terminal.write("\r")
+        }
+        terminal.write("\u{1B}[J")
+        composerLineCount = 0
+        terminal.showCursor()
+    }
+
+    private func drawComposer(snapshot: AgentTUISnapshot) {
+        let width = max(20, terminalSize().columns)
+        let maxInputRows = max(1, min(8, terminalSize().rows / 3))
+        let rows = agentTUIComposerRows(input: input, cursor: inputCursor, width: width, maxRows: maxInputRows)
+        let palette = AgentTUIPalette()
+        let lines = nativeComposerLines(snapshot: snapshot, rows: rows, width: width, palette: palette)
+
+        terminal.hideCursor()
+        for (index, line) in lines.enumerated() {
+            terminal.write(paddedANSI(line, width: width))
+            if index < lines.count - 1 {
+                terminal.write("\r\n")
+            }
+        }
+        terminal.showCursor()
+        composerLineCount = lines.count
+    }
+
+    private func nativeComposerLines(
+        snapshot: AgentTUISnapshot,
+        rows: [AgentTUIComposerRow],
+        width: Int,
+        palette: any Palette
+    ) -> [String] {
+        var lines: [String] = []
+        lines.append("")
+        lines.append(activityLine(snapshot, width: width, palette: palette))
+        lines.append("")
+        lines.append(agentTUIANSIStyled(
+            agentTUIHorizontalDivider(label: modelDisplayName, width: width),
+            color: .palette.foregroundTertiary,
+            isBold: false,
+            isItalic: false,
+            isUnderlined: false,
+            palette: palette
+        ))
+        for row in rows {
+            lines.append(inputRow(row, palette: palette))
+        }
+        lines.append(agentTUIANSIStyled(
+            agentTUIHorizontalDivider(label: nil, width: width),
+            color: .palette.foregroundTertiary,
+            isBold: false,
+            isItalic: false,
+            isUnderlined: false,
+            palette: palette
+        ))
+        lines.append(agentTUIANSIStyled(
+            statusLine(snapshot, width: width),
+            color: .palette.foregroundTertiary,
+            isBold: false,
+            isItalic: false,
+            isUnderlined: false,
+            palette: palette
+        ))
+        return lines
+    }
+
+    private func activityLine(_ snapshot: AgentTUISnapshot, width: Int, palette: any Palette) -> String {
+        guard shouldShowActivity(snapshot) else {
+            return ""
+        }
+
+        let text = shouldSpinActivity(snapshot)
+            ? "\(spinnerFrame()) \(activityText(snapshot))"
+            : activityText(snapshot)
+        let color = activityColor(snapshot)
+        return " " + agentTUIANSIStyled(
+            text,
+            color: color,
+            isBold: false,
+            isItalic: false,
+            isUnderlined: false,
+            palette: palette
+        )
+    }
+
+    private func spinnerFrame() -> String {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        let tick = Int(Date().timeIntervalSinceReferenceDate * 12)
+        return frames[((tick % frames.count) + frames.count) % frames.count]
+    }
+
+    private func inputRow(_ row: AgentTUIComposerRow, palette: any Palette) -> String {
+        var line = ""
+        if !row.before.isEmpty {
+            line += agentTUIANSIStyled(
+                row.before,
+                color: .palette.foreground,
+                isBold: false,
+                isItalic: false,
+                isUnderlined: false,
+                palette: palette
+            )
+        }
+        if row.hasCursor {
+            line += "█"
+        }
+        if !row.after.isEmpty {
+            line += agentTUIANSIStyled(
+                row.after,
+                color: .palette.foreground,
+                isBold: false,
+                isItalic: false,
+                isUnderlined: false,
+                palette: palette
+            )
+        }
+        return line
+    }
+
+    private func paddedANSI(_ line: String, width: Int) -> String {
+        let padding = max(0, width - line.strippedLength)
+        return line + String(repeating: " ", count: padding)
+    }
+
+    private func transcriptRenderKey(_ entry: TUITranscriptEntry) -> String {
+        "\(entry.id.uuidString)|\(entry.style)|\(entry.text)"
+    }
+
+    private func submitInput() {
+        let text = input.trimmingCharacters(in: .newlines)
+        input = ""
+        inputCursor = 0
+        promptHistoryIndex = nil
+        promptHistoryDraft = ""
+        requestRender()
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+
+        if let command = SlashCommand(text) {
+            handle(command)
+            return
+        }
+
+        guard let turn = model.startTurn(prompt: text) else {
+            return
+        }
+        appendPromptHistory(text)
+
+        guard let runtime = AgentTUIRuntimeBox.current else {
+            model.failTurn(RuntimeError("TUI runtime is not available."))
+            return
+        }
+
+        let model = model
+        let interruptHandle = AgentInterruptHandle()
+        let operation = _Concurrency.Task.detached {
+            defer {
+                model.clearRunningOperation()
+            }
+            do {
+                let currentTask = turn.task
+                try _Concurrency.Task.checkCancellation()
+                if !turn.isTaskPersisted {
+                    try await persistInteractiveTask(currentTask, store: runtime.store)
+                    model.markTaskPersisted(currentTask)
+                }
+                _ = try await refreshResumeClaimIfActive(task: currentTask, store: runtime.store)
+                _ = try await runAgentTurn(
+                    task: currentTask,
+                    prompt: text,
+                    repoURL: runtime.repoURL,
+                    snapshot: runtime.snapshot,
+                    store: runtime.store,
+                    fullAuto: runtime.fullAuto,
+                    sandbox: runtime.sandbox,
+                    backendRunOptions: runtime.backendRunOptions,
+                    showStatus: false,
+                    interruptHandle: interruptHandle
+                ) { update in
+                    model.render(update)
+                }
+                try _Concurrency.Task.checkCancellation()
+                _ = try await refreshResumeClaimIfActive(task: currentTask, store: runtime.store)
+                try _Concurrency.Task.checkCancellation()
+                model.finishTurn()
+            } catch is CancellationError {
+                model.interruptOperation()
+            } catch {
+                if _Concurrency.Task.isCancelled {
+                    model.interruptOperation()
+                } else {
+                    model.failTurn(error)
+                }
+            }
+        }
+        model.setRunningOperation(operation, interruptHandle: interruptHandle, cancelTaskOnInterrupt: false)
+    }
+
+    private func handle(_ command: SlashCommand) {
+        guard let runtime = AgentTUIRuntimeBox.current else {
+            model.append(.error, "TUI runtime is not available.")
+            return
+        }
+        let model = self.model
+
+        switch command.name {
+        case "exit", "quit":
+            checkpointReleaseClaimThenExit()
+        case "help":
+            model.append(.system, "/help /info /tasks /new [title] /resume <task> [--checkpoint <id|latest>] [--force] /checkpoint [--push] /checkpoints /artifacts /continue [path] /release /export [path] /events /raw /exit")
+        case "raw":
+            _ = model.toggleRawEvents()
+        case "info", "task", "repo":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
+            runCommand(status: "loading task info...") {
+                let summary = try await runtime.store.summary(for: task)
+                model.append(.system, tuiInfo(task: task, summary: summary, runtime: runtime))
+                model.setStatus("ready")
+            }
+        case "tasks":
+            runCommand(status: "loading tasks...") {
+                let tasks = try await runtime.store.listTasks()
+                model.append(.system, tuiTasks(tasks))
+                model.setStatus("ready")
+            }
+        case "events":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
+            runCommand(status: "loading events...") {
+                let events = try await runtime.store.events(for: task.id)
+                model.append(.system, tuiEvents(events))
+                model.setStatus("ready")
+            }
+        case "checkpoints":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
+            runCommand(status: "loading checkpoints...") {
+                let checkpoints = try await runtime.store.listCheckpoints(taskID: task.id)
+                model.append(.system, tuiCheckpoints(checkpoints))
+                model.setStatus("ready")
+            }
+        case "artifacts":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
+            runCommand(status: "loading artifacts...") {
+                let artifacts = try await runtime.store.listArtifacts(taskID: task.id)
+                model.append(.system, tuiArtifacts(artifacts))
+                model.setStatus("ready")
+            }
+        case "continue":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
+            runCommand(status: "writing continuation bundle...") {
+                let result = try await exportContinuationMarkdown(
+                    task: task,
+                    store: runtime.store,
+                    repoURL: runtime.repoURL,
+                    snapshot: runtime.snapshot,
+                    destination: command.argument
+                )
+                model.append(.system, "Continuation bundle written to \(result.url.path).")
+                model.setStatus("ready")
+            }
+        case "release":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
+            runCommand(status: "releasing claim...") {
+                let result = try await releaseResumeClaim(task: task, store: runtime.store)
+                model.append(.system, result.released ? "Claim released." : "No active claim for this machine.")
+                model.setStatus("ready")
+            }
+        case "export":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
+            runCommand(status: "exporting transcript...") {
+                let result = try await exportTranscriptMarkdown(
+                    task: task,
+                    store: runtime.store,
+                    repoURL: runtime.repoURL,
+                    snapshot: runtime.snapshot,
+                    destination: command.argument
+                )
+                model.append(.system, "Exported \(result.eventCount) events to \(result.url.path).")
+                model.setStatus("ready")
+            }
+        case "checkpoint":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
+            runCommand(status: "creating checkpoint...") {
+                let options = try checkpointSlashOptions(command.argument)
+                let result = try await createAndPersistCheckpoint(
+                    task: task,
+                    store: runtime.store,
+                    snapshot: runtime.snapshot,
+                    repoURL: runtime.repoURL,
+                    options: options,
+                    onStatus: { status in model.setStatus(status) }
+                )
+                let updatedSnapshot = try RepositoryInspector().inspect(path: runtime.repoURL)
+                updateAgentTUIRuntimeSnapshot(updatedSnapshot)
+                model.append(.system, checkpointCreatedStatus(result))
+                model.setStatus("ready")
+            }
+        case "new":
+            runCommand(status: "creating task...") {
+                let newTask = try await resolveInteractiveTask(
+                    identifier: nil,
+                    title: command.argument?.isEmpty == false ? command.argument : nil,
+                    backend: runtime.defaultBackend,
+                    snapshot: runtime.snapshot,
+                    repoURL: runtime.repoURL,
+                    store: runtime.store
+                )
+                updateAgentTUIRuntimeTask(newTask)
+                model.setTask(newTask, entries: [], message: "Created task \(newTask.slug).")
+            }
+        case "resume":
+            let resume: ResumeSlashOptions
+            do {
+                resume = try resumeSlashOptions(command.argument)
+            } catch {
+                model.append(.error, String(describing: error))
+                return
+            }
+            guard !resume.taskIdentifier.isEmpty else {
+                model.append(.error, "usage: /resume <task> [--checkpoint <id|latest>] [--force]")
+                return
+            }
+            runCommand(status: "resuming task...") {
+                let resumedTask = try await runtime.store.findTask(resume.taskIdentifier)
+                let handoff = try await prepareResumeHandoff(
+                    task: resumedTask,
+                    store: runtime.store,
+                    repoURL: runtime.repoURL,
+                    snapshot: runtime.snapshot,
+                    checkpointSelector: resume.checkpointSelector,
+                    forceClaim: resume.forceClaim,
+                    onStatus: { status in model.setStatus(status) }
+                )
+                if handoff.restore != nil {
+                    model.setStatus("inspecting restored repo...")
+                    let updatedSnapshot = try RepositoryInspector().inspect(path: runtime.repoURL)
+                    updateAgentTUIRuntimeSnapshot(updatedSnapshot)
+                }
+                model.setStatus("loading recent transcript...")
+                let loadedEntries = try await tuiEntries(for: resumedTask.id, store: runtime.store)
+                updateAgentTUIRuntimeTask(resumedTask)
+                var message = "Resumed task \(resumedTask.slug)."
+                if let restore = handoff.restore {
+                    message += "\n\(tuiCheckpointRestoreDetails(restore, claim: handoff.claim))"
+                } else {
+                    message += "\n\(taskClaimStatus(handoff.claim))"
+                }
+                model.setTask(resumedTask, entries: loadedEntries, message: message)
+                model.setStatus(handoff.restore.map(checkpointRestoreStatus) ?? taskClaimStatus(handoff.claim))
+            }
+        default:
+            model.append(.error, "unknown command: /\(command.name)")
+        }
+    }
+
+    private func checkpointReleaseClaimThenExit() {
+        guard let runtime = AgentTUIRuntimeBox.current else {
+            shouldExit = true
+            return
+        }
+        let snapshot = model.snapshot()
+        guard snapshot.isTaskPersisted else {
+            shouldExit = true
+            return
+        }
+        guard model.startCommand(status: "quitting...") else {
+            return
+        }
+
+        let task = snapshot.task
+        let model = model
+        let operation = _Concurrency.Task.detached { [weak self] in
+            defer {
+                model.clearRunningOperation()
+            }
+            do {
+                let refreshedSnapshot = try RepositoryInspector().inspect(path: runtime.repoURL)
+                updateAgentTUIRuntimeSnapshot(refreshedSnapshot)
+                if refreshedSnapshot.isGitRepository, refreshedSnapshot.isDirty {
+                    model.setStatus("checkpointing dirty work before quit...")
+                    let result = try await createAndPersistCheckpoint(
+                        task: task,
+                        store: runtime.store,
+                        snapshot: refreshedSnapshot,
+                        repoURL: runtime.repoURL,
+                        options: GitCheckpointOptions(),
+                        onStatus: { status in model.setStatus(status) }
+                    )
+                    model.append(.system, checkpointCreatedStatus(result))
+                }
+
+                model.setStatus("releasing claim...")
+                _ = try await releaseResumeClaim(task: task, store: runtime.store)
+                model.finishCommand()
+                self?.shouldExit = true
+            } catch {
+                model.commandFailed(error)
+            }
+        }
+        model.setRunningOperation(operation, cancelTaskOnInterrupt: false)
+    }
+
+    private func runCommand(status newStatus: String, operation: @escaping @Sendable () async throws -> Void) {
+        guard model.startCommand(status: newStatus) else {
+            return
+        }
+        let model = model
+        let runningOperation = _Concurrency.Task.detached {
+            defer {
+                model.clearRunningOperation()
+            }
+            do {
+                try _Concurrency.Task.checkCancellation()
+                try await operation()
+                try _Concurrency.Task.checkCancellation()
+                model.finishCommand()
+            } catch is CancellationError {
+                model.interruptOperation()
+            } catch {
+                if _Concurrency.Task.isCancelled {
+                    model.interruptOperation()
+                } else {
+                    model.commandFailed(error)
+                }
+            }
+        }
+        model.setRunningOperation(runningOperation)
+    }
+
+    private func handleKey(_ event: KeyEvent) -> Bool {
+        switch event.key {
+        case .enter where event.shift || event.alt:
+            insertInput("\n")
+            return true
+        case .enter:
+            submitInput()
+            return true
+        case .escape:
+            if model.interruptRunningOperation() {
+                return true
+            }
+            checkpointReleaseClaimThenExit()
+            return true
+        case .character("c") where event.ctrl:
+            if model.interruptRunningOperation() {
+                return true
+            }
+            checkpointReleaseClaimThenExit()
+            return true
+        case .character("a") where event.ctrl:
+            moveToBeginningOfInputLine()
+            return true
+        case .character("e") where event.ctrl:
+            moveToEndOfInputLine()
+            return true
+        case .character("b") where event.ctrl:
+            moveInputCursorBackward()
+            return true
+        case .character("f") where event.ctrl:
+            moveInputCursorForward()
+            return true
+        case .character("w") where event.ctrl:
+            killInputWordBackward()
+            return true
+        case .character("k") where event.ctrl:
+            killInputLineForward()
+            return true
+        case .character("p") where event.ctrl:
+            moveInputLineOrHistory(delta: -1)
+            return true
+        case .character("n") where event.ctrl:
+            moveInputLineOrHistory(delta: 1)
+            return true
+        case .backspace where event.alt:
+            killInputWordBackward()
+            return true
+        case .backspace:
+            deleteInputBackward()
+            return true
+        case .delete:
+            deleteInputForward()
+            return true
+        case .left:
+            inputCursor = max(0, inputCursor - 1)
+            requestRender()
+            return true
+        case .right:
+            inputCursor = min(input.count, inputCursor + 1)
+            requestRender()
+            return true
+        case .up:
+            inputCursor = agentTUIMoveCursorUp(lines: agentTUIInputLines(input), cursor: inputCursor)
+            requestRender()
+            return true
+        case .down:
+            inputCursor = agentTUIMoveCursorDown(lines: agentTUIInputLines(input), cursor: inputCursor)
+            requestRender()
+            return true
+        case .home:
+            inputCursor = 0
+            requestRender()
+            return true
+        case .end:
+            inputCursor = input.count
+            requestRender()
+            return true
+        case .space where !event.ctrl && !event.alt:
+            insertInput(" ")
+            return true
+        case .paste(let text):
+            insertInput(text)
+            return true
+        case .character(let character) where !event.ctrl && !event.alt:
+            insertInput(String(character))
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func insertInput(_ text: String) {
+        guard !text.isEmpty else {
+            return
+        }
+        let safeText = text.sanitizedForTerminal
+        let cursor = min(inputCursor, input.count)
+        let index = input.index(input.startIndex, offsetBy: cursor)
+        input.insert(contentsOf: safeText, at: index)
+        inputCursor = cursor + safeText.count
+        resetPromptHistorySelectionForEdit()
+        requestRender()
+    }
+
+    private func deleteInputBackward() {
+        guard inputCursor > 0 else {
+            return
+        }
+        let cursor = min(inputCursor, input.count)
+        let index = input.index(input.startIndex, offsetBy: cursor - 1)
+        input.remove(at: index)
+        inputCursor = cursor - 1
+        resetPromptHistorySelectionForEdit()
+        requestRender()
+    }
+
+    private func deleteInputForward() {
+        guard inputCursor < input.count else {
+            return
+        }
+        let cursor = min(inputCursor, input.count)
+        let index = input.index(input.startIndex, offsetBy: cursor)
+        input.remove(at: index)
+        inputCursor = cursor
+        resetPromptHistorySelectionForEdit()
+        requestRender()
+    }
+
+    private func moveInputCursorBackward() {
+        inputCursor = max(0, inputCursor - 1)
+        requestRender()
+    }
+
+    private func moveInputCursorForward() {
+        inputCursor = min(input.count, inputCursor + 1)
+        requestRender()
+    }
+
+    private func moveToBeginningOfInputLine() {
+        let lines = agentTUIInputLines(input)
+        let index = agentTUIInputLineIndex(lines: lines, cursor: inputCursor)
+        inputCursor = lines[index].start
+        requestRender()
+    }
+
+    private func moveToEndOfInputLine() {
+        let lines = agentTUIInputLines(input)
+        let index = agentTUIInputLineIndex(lines: lines, cursor: inputCursor)
+        inputCursor = lines[index].end
+        requestRender()
+    }
+
+    private func moveInputLineOrHistory(delta: Int) {
+        let lines = agentTUIInputLines(input)
+        let lineIndex = agentTUIInputLineIndex(lines: lines, cursor: inputCursor)
+        if delta < 0, lineIndex == 0 {
+            recallPreviousPrompt()
+            return
+        }
+        if delta > 0, lineIndex == lines.count - 1 {
+            recallNextPrompt()
+            return
+        }
+
+        let targetIndex = min(max(0, lineIndex + delta), lines.count - 1)
+        let column = max(0, inputCursor - lines[lineIndex].start)
+        let target = lines[targetIndex]
+        inputCursor = target.start + min(column, target.end - target.start)
+        requestRender()
+    }
+
+    private func killInputWordBackward() {
+        guard inputCursor > 0 else {
+            return
+        }
+        let characters = Array(input)
+        let cursor = min(inputCursor, characters.count)
+        var start = cursor
+
+        while start > 0, characters[start - 1].isWhitespace {
+            start -= 1
+        }
+        while start > 0, !characters[start - 1].isWhitespace {
+            start -= 1
+        }
+
+        guard start < cursor else {
+            return
+        }
+        var edited = characters
+        edited.removeSubrange(start..<cursor)
+        input = String(edited)
+        inputCursor = start
+        resetPromptHistorySelectionForEdit()
+        requestRender()
+    }
+
+    private func killInputLineForward() {
+        let result = agentTUIKillToEndOfLine(input: input, cursor: inputCursor)
+        guard result.input != input else {
+            return
+        }
+        input = result.input
+        inputCursor = result.cursor
+        resetPromptHistorySelectionForEdit()
+        requestRender()
+    }
+
+    private func appendPromptHistory(_ prompt: String) {
+        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+        if promptHistory.last != prompt {
+            promptHistory.append(prompt)
+        }
+    }
+
+    private func recallPreviousPrompt() {
+        guard !promptHistory.isEmpty else {
+            return
+        }
+        if promptHistoryIndex == nil {
+            promptHistoryDraft = input
+            promptHistoryIndex = promptHistory.count - 1
+        } else if let index = promptHistoryIndex, index > 0 {
+            promptHistoryIndex = index - 1
+        }
+        loadPromptHistorySelection()
+    }
+
+    private func recallNextPrompt() {
+        guard let index = promptHistoryIndex else {
+            return
+        }
+        if index < promptHistory.count - 1 {
+            promptHistoryIndex = index + 1
+            loadPromptHistorySelection()
+        } else {
+            promptHistoryIndex = nil
+            input = promptHistoryDraft
+            inputCursor = input.count
+            promptHistoryDraft = ""
+            requestRender()
+        }
+    }
+
+    private func loadPromptHistorySelection() {
+        guard let index = promptHistoryIndex, promptHistory.indices.contains(index) else {
+            return
+        }
+        input = promptHistory[index]
+        inputCursor = input.count
+        requestRender()
+    }
+
+    private func resetPromptHistorySelectionForEdit() {
+        promptHistoryIndex = nil
+        promptHistoryDraft = ""
+    }
+
+    private func shouldShowActivity(_ snapshot: AgentTUISnapshot) -> Bool {
+        snapshot.isRunning || snapshot.status != "ready"
+    }
+
+    private func shouldSpinActivity(_ snapshot: AgentTUISnapshot) -> Bool {
+        snapshot.isRunning || snapshot.status.hasSuffix("...")
+    }
+
+    private func activityText(_ snapshot: AgentTUISnapshot) -> String {
+        if snapshot.status.hasPrefix("turn failed") {
+            return "Turn failed."
+        }
+        if snapshot.status.hasPrefix("command failed") {
+            return "Command failed."
+        }
+        if snapshot.isRunning {
+            return snapshot.status == "ready" ? "Working..." : snapshot.status
+        }
+        return snapshot.status
+    }
+
+    private func activityColor(_ snapshot: AgentTUISnapshot) -> Color {
+        if snapshot.status.hasPrefix("turn failed") || snapshot.status.hasPrefix("command failed") {
+            return .palette.error
+        }
+        return .palette.foregroundTertiary
+    }
+
+    private var repoBranchText: String {
+        guard let runtime = AgentTUIRuntimeBox.current else {
+            return "- (-)"
+        }
+        let path = runtime.snapshot.rootPath ?? runtime.repoURL.path
+        let branch = runtime.snapshot.currentBranch ?? "-"
+        return "\(abbreviatedHomePath(path)) (\(branch))"
+    }
+
+    private var modelDisplayName: String {
+        AgentTUIRuntimeBox.current?.modelDisplayName ?? "codex"
+    }
+
+    private func tokenStatus(_ snapshot: AgentTUISnapshot) -> String {
+        let usage = snapshot.tokenUsage ?? TUITokenUsage(
+            inputTokens: 0,
+            outputTokens: 0,
+            reasoningTokens: 0,
+            contextWindowTokens: nil
+        )
+        let contextWindow = usage.contextWindowTokens
+            ?? AgentTUIRuntimeBox.current?.modelContextWindowTokens
+            ?? defaultContextWindowTokens(modelDisplayName: modelDisplayName)
+        let percent = contextWindow > 0 ? (Double(max(0, usage.inputTokens)) / Double(contextWindow)) * 100 : 0
+        var parts = [
+            "↑\(formatTokenCount(usage.inputTokens))",
+            "↓\(formatTokenCount(usage.outputTokens))"
+        ]
+        if usage.reasoningTokens > 0 {
+            parts.append("R\(formatTokenCount(usage.reasoningTokens))")
+        }
+        parts.append("\(formatPercent(percent))%/\(formatTokenCount(contextWindow))")
+        return parts.joined(separator: " ")
+    }
+
+    private func statusLine(_ snapshot: AgentTUISnapshot, width: Int) -> String {
+        var leftParts = [repoBranchText]
+        if snapshot.showRawEvents {
+            leftParts.append("raw")
+        }
+
+        return agentTUIStatusLine(
+            repoBranchText: repoBranchText,
+            badges: Array(leftParts.dropFirst()),
+            tokenStatus: tokenStatus(snapshot),
+            width: width
+        )
+    }
+}
+
+private final class AgentTUIRenderSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var needsRender = false
+
+    func mark() {
+        lock.withLock {
+            needsRender = true
+        }
+    }
+
+    func consume() -> Bool {
+        lock.withLock {
+            let value = needsRender
+            needsRender = false
+            return value
+        }
+    }
+}
+
+#if os(Linux)
+private typealias AgentTUITermFlag = UInt32
+#else
+private typealias AgentTUITermFlag = UInt
+#endif
+
+private final class AgentTUINativeTerminal: @unchecked Sendable {
+    private var originalTermios: termios?
+    private var isRawMode = false
+
+    func enableRawMode() throws {
+        guard !isRawMode else {
+            return
+        }
+
+        var raw = termios()
+        guard tcgetattr(STDIN_FILENO, &raw) == 0 else {
+            throw RuntimeError("failed to read terminal settings")
+        }
+        originalTermios = raw
+
+        raw.c_lflag &= ~AgentTUITermFlag(ECHO | ICANON | ISIG | IEXTEN)
+        raw.c_iflag &= ~AgentTUITermFlag(IXON | ICRNL | BRKINT | INPCK | ISTRIP)
+        raw.c_oflag &= ~AgentTUITermFlag(OPOST)
+        raw.c_cflag |= AgentTUITermFlag(CS8)
+
+        withUnsafeMutablePointer(to: &raw.c_cc) { pointer in
+            pointer.withMemoryRebound(to: cc_t.self, capacity: Int(NCCS)) { buffer in
+                buffer[Int(VMIN)] = 0
+                buffer[Int(VTIME)] = 0
+            }
+        }
+
+        guard tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0 else {
+            throw RuntimeError("failed to enable terminal raw mode")
+        }
+        isRawMode = true
+        write("\u{1B}[?2004h")
+    }
+
+    func disableRawMode() {
+        guard isRawMode, var originalTermios else {
+            return
+        }
+        write("\u{1B}[?2004l")
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &originalTermios)
+        isRawMode = false
+    }
+
+    func hideCursor() {
+        write("\u{1B}[?25l")
+    }
+
+    func showCursor() {
+        write("\u{1B}[?25h")
+    }
+
+    func write(_ string: String) {
+        string.utf8CString.withUnsafeBufferPointer { buffer in
+            let count = buffer.count - 1
+            guard count > 0, let baseAddress = buffer.baseAddress else {
+                return
+            }
+            baseAddress.withMemoryRebound(to: UInt8.self, capacity: count) { pointer in
+                var written = 0
+                while written < count {
+                    let result = Foundation.write(STDOUT_FILENO, pointer + written, count - written)
+                    if result <= 0 {
+                        break
+                    }
+                    written += result
+                }
+            }
+        }
+    }
+
+    func readKeyEvent() -> KeyEvent? {
+        let bytes = readBytes()
+        guard !bytes.isEmpty else {
+            return nil
+        }
+
+        if bytes == [0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E] {
+            return KeyEvent(key: .paste(readBracketedPasteContent()))
+        }
+
+        return KeyEvent.parse(bytes)
+    }
+
+    private func readBytes(maxBytes: Int = 8) -> [UInt8] {
+        var buffer = [UInt8](repeating: 0, count: 1)
+        let bytesRead = read(STDIN_FILENO, &buffer, 1)
+        guard bytesRead > 0 else {
+            return []
+        }
+
+        guard buffer[0] == 0x1B else {
+            return [buffer[0]]
+        }
+
+        var result: [UInt8] = [0x1B]
+        var nextByte = [UInt8](repeating: 0, count: 1)
+        let nextRead = read(STDIN_FILENO, &nextByte, 1)
+        guard nextRead > 0 else {
+            return result
+        }
+        result.append(nextByte[0])
+
+        if nextByte[0] == 0x5B {
+            for _ in 0..<(maxBytes - 2) {
+                let paramRead = read(STDIN_FILENO, &nextByte, 1)
+                guard paramRead > 0 else {
+                    break
+                }
+                result.append(nextByte[0])
+                if nextByte[0] >= 0x40 && nextByte[0] <= 0x7E {
+                    break
+                }
+            }
+        } else if nextByte[0] == 0x4F {
+            let funcRead = read(STDIN_FILENO, &nextByte, 1)
+            if funcRead > 0 {
+                result.append(nextByte[0])
+            }
+        }
+
+        return result
+    }
+
+    private func readBracketedPasteContent() -> String {
+        var content: [UInt8] = []
+        let endMarker: [UInt8] = [0x1B, 0x5B, 0x32, 0x30, 0x31, 0x7E]
+        let maxPasteBytes = 65_536
+
+        while content.count < maxPasteBytes {
+            var byte = [UInt8](repeating: 0, count: 1)
+            let bytesRead = read(STDIN_FILENO, &byte, 1)
+            guard bytesRead > 0 else {
+                usleep(1_000)
+                continue
+            }
+
+            content.append(byte[0])
+            if content.count >= endMarker.count, Array(content.suffix(endMarker.count)) == endMarker {
+                content.removeLast(endMarker.count)
+                break
+            }
+        }
+
+        return String(bytes: content, encoding: .utf8) ?? String(content.map { Character(UnicodeScalar($0)) })
     }
 }
 
