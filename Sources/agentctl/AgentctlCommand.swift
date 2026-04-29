@@ -44,49 +44,59 @@ struct Agentctl: AsyncParsableCommand {
         abstract: "Task/session manager for coding-agent workflows.",
         discussion: "Run without a subcommand to start an interactive agent session.",
         subcommands: [
+            Interactive.self,
             Repo.self,
             Task.self,
+            Memory.self,
             DB.self,
-            Backend.self,
-            MCP.self
-        ]
+            Backend.self
+        ],
+        defaultSubcommand: Interactive.self
     )
 
-    @Option(name: .shortAndLong, help: "Directory to use as the current workspace.")
-    var cwd: String = "."
-
-    @OptionGroup
-    var storeOptions: StoreOptions
-
-    @Option(name: .customLong("task"), help: "Task id, id prefix, or slug to resume interactively.")
-    var taskIdentifier: String?
-
-    @Option(help: "Title for a newly created interactive task.")
-    var title: String?
-
-    @Option(help: "Preferred backend for a newly created interactive task.")
-    var backend: AgentBackend = .codex
-
-    @Flag(help: "Pass --full-auto to Codex.")
-    var fullAuto: Bool = false
-
-    @Option(help: "Codex sandbox mode.")
-    var sandbox: String?
-
-    @OptionGroup
-    var backendRunOptions: BackendRunOptions
-
-    mutating func run() async throws {
-        try await runInteractiveAgent(
-            cwd: cwd,
-            storeOptions: storeOptions,
-            taskIdentifier: taskIdentifier,
-            title: title,
-            backend: backend,
-            fullAuto: fullAuto,
-            sandbox: sandbox,
-            backendRunOptions: backendRunOptions
+    struct Interactive: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "interactive",
+            abstract: "Start an interactive agent session.",
+            shouldDisplay: false
         )
+
+        @Option(name: .shortAndLong, help: "Directory to use as the current workspace.")
+        var cwd: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        @Option(name: .customLong("task"), help: "Task id, id prefix, or slug to resume interactively.")
+        var taskIdentifier: String?
+
+        @Option(help: "Title for a newly created interactive task.")
+        var title: String?
+
+        @Option(help: "Preferred backend for a newly created interactive task.")
+        var backend: AgentBackend = .codex
+
+        @Flag(help: "Pass --full-auto to Codex.")
+        var fullAuto: Bool = false
+
+        @Option(help: "Codex sandbox mode.")
+        var sandbox: String?
+
+        @OptionGroup
+        var backendRunOptions: BackendRunOptions
+
+        mutating func run() async throws {
+            try await runInteractiveAgent(
+                cwd: cwd,
+                storeOptions: storeOptions,
+                taskIdentifier: taskIdentifier,
+                title: title,
+                backend: backend,
+                fullAuto: fullAuto,
+                sandbox: sandbox,
+                backendRunOptions: backendRunOptions
+            )
+        }
     }
 }
 
@@ -742,38 +752,303 @@ struct Backend: ParsableCommand {
     }
 }
 
-struct MCP: ParsableCommand {
+enum MemoryScopeArgument: String, ExpressibleByArgument {
+    case task
+    case repo
+    case globalPersonal = "global-personal"
+    case globalWork = "global-work"
+    case session
+    case machine
+
+    var kind: MemoryScopeKind {
+        switch self {
+        case .task:
+            return .task
+        case .repo:
+            return .repo
+        case .globalPersonal:
+            return .globalPersonal
+        case .globalWork:
+            return .globalWork
+        case .session:
+            return .session
+        case .machine:
+            return .machine
+        }
+    }
+}
+
+struct MemoryRecordOutput: Codable, Equatable {
+    var id: UUID
+    var title: String
+    var summary: String
+    var body: String
+    var scope: String
+    var tags: [String]
+    var score: Double?
+    var createdAt: Date
+    var updatedAt: Date
+    var archivedAt: Date?
+
+    init(memory: MemoryItem, score: Double? = nil) {
+        id = memory.id
+        title = memory.title
+        summary = memory.summary ?? ""
+        body = memory.body
+        scope = MemoryScopeArgument(scopeKind: memory.scopeKind).rawValue
+        tags = memory.tags
+        self.score = score
+        createdAt = memory.createdAt
+        updatedAt = memory.updatedAt
+        archivedAt = memory.archivedAt
+    }
+}
+
+extension MemoryScopeArgument {
+    init(scopeKind: MemoryScopeKind) {
+        switch scopeKind {
+        case .task:
+            self = .task
+        case .repo:
+            self = .repo
+        case .globalPersonal:
+            self = .globalPersonal
+        case .globalWork:
+            self = .globalWork
+        case .session:
+            self = .session
+        case .machine:
+            self = .machine
+        }
+    }
+}
+
+struct Memory: ParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "mcp",
-        abstract: "MCP server helpers.",
-        subcommands: [Memory.self]
+        commandName: "memory",
+        abstract: "Search and write agent memory.",
+        subcommands: [Search.self, Recent.self, Write.self, Archive.self]
     )
 
-    struct Memory: ParsableCommand {
+    struct Search: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
-            commandName: "memory",
-            abstract: "Describe the planned memory MCP tools."
+            commandName: "search",
+            abstract: "Search active agent memory."
         )
 
-        mutating func run() throws {
-            let tools = [
-                "memory.search(query, scope?, repo?, task?, limit?)",
-                "memory.get(id)",
-                "memory.write(kind, title, body, tags?, scope?)",
-                "memory.update(id, patch)",
-                "memory.archive(id)",
-                "memory.recent(repo?, task?)",
-                "context.current()",
-                "skill.search(query)",
-                "skill.get(id)"
-            ]
+        @Argument(help: "Search query.")
+        var query: String
 
-            print("Planned memory MCP tools")
-            for tool in tools {
-                print("  \(tool)")
+        @Option(help: "Maximum number of memories to return.")
+        var limit: Int = 10
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        mutating func run() async throws {
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let results = try await store.searchMemory(query, limit: limit)
+                    .map { MemoryRecordOutput(memory: $0.item, score: $0.score) }
+                try printJSON(results)
             }
         }
     }
+
+    struct Recent: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "recent",
+            abstract: "List recent active agent memory."
+        )
+
+        @Option(help: "Maximum number of memories to return.")
+        var limit: Int = 10
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        mutating func run() async throws {
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let memories = try await store.recentMemories(limit: limit)
+                    .map { MemoryRecordOutput(memory: $0) }
+                try printJSON(memories)
+            }
+        }
+    }
+
+    struct Write: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "write",
+            abstract: "Write an active memory item."
+        )
+
+        @Option(help: "Memory title.")
+        var title: String
+
+        @Option(help: "Memory body.")
+        var body: String
+
+        @Option(help: "Memory scope: task, repo, global-personal, global-work, session, or machine.")
+        var scope: MemoryScopeArgument = .repo
+
+        @Option(name: .customLong("tag"), help: "Memory tag. Repeat for multiple tags.")
+        var tags: [String] = []
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        mutating func run() async throws {
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+            let memory = makeMemoryItem(
+                title: title,
+                body: body,
+                scope: scope,
+                tags: tags,
+                repoURL: repoURL,
+                snapshot: snapshot
+            )
+
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let stored = try await store.writeMemory(memory)
+                try printJSON(MemoryRecordOutput(memory: stored))
+            }
+        }
+    }
+
+    struct Archive: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "archive",
+            abstract: "Archive an active memory item."
+        )
+
+        @Argument(help: "Memory id.")
+        var id: String
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        mutating func run() async throws {
+            guard let memoryID = UUID(uuidString: id) else {
+                throw RuntimeError("invalid memory id: \(id)")
+            }
+
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let memory = try await store.archiveMemory(id: memoryID)
+                try printJSON(MemoryRecordOutput(memory: memory))
+            }
+        }
+    }
+}
+
+func makeMemoryItem(
+    title: String,
+    body: String,
+    scope: MemoryScopeArgument,
+    tags: [String],
+    repoURL: URL,
+    snapshot: RepositorySnapshot
+) -> MemoryItem {
+    let now = Date()
+    let environment = ProcessInfo.processInfo.environment
+    let taskID = environmentUUID("AGENTCTL_TASK_ID", environment: environment)
+    let sessionID = environmentUUID("AGENTCTL_SESSION_ID", environment: environment)
+    let scopeID: UUID?
+
+    switch scope {
+    case .task:
+        scopeID = taskID
+    case .session:
+        scopeID = sessionID
+    case .repo, .globalPersonal, .globalWork, .machine:
+        scopeID = nil
+    }
+
+    var metadata: [String: JSONValue] = [
+        "reviewStatus": .string("unreviewed"),
+        "creationSurface": .string("agentctl.memory.write"),
+        "scope": .string(scope.rawValue),
+        "cwd": .string(repoURL.path)
+    ]
+
+    if let rootPath = snapshot.rootPath {
+        metadata["repoRoot"] = .string(rootPath)
+    }
+    if let originURL = snapshot.originURL {
+        metadata["repoOrigin"] = .string(originURL)
+    }
+    if let currentBranch = snapshot.currentBranch {
+        metadata["repoBranch"] = .string(currentBranch)
+    }
+    if let headSHA = snapshot.headSHA {
+        metadata["repoHead"] = .string(headSHA)
+    }
+    if let taskID {
+        metadata["taskID"] = .string(taskID.uuidString)
+    }
+    if let sessionID {
+        metadata["sessionID"] = .string(sessionID.uuidString)
+    }
+
+    return MemoryItem(
+        scopeKind: scope.kind,
+        scopeID: scopeID,
+        taskID: taskID,
+        title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+        body: body.trimmingCharacters(in: .whitespacesAndNewlines),
+        summary: nil,
+        tags: normalizedMemoryTags(tags),
+        status: .active,
+        createdBy: "agentctl",
+        createdAt: now,
+        updatedAt: now,
+        metadata: metadata
+    )
+}
+
+func normalizedMemoryTags(_ tags: [String]) -> [String] {
+    var seen = Set<String>()
+    var normalized: [String] = []
+    for tag in tags {
+        let value = tag.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            continue
+        }
+        let key = value.lowercased()
+        guard seen.insert(key).inserted else {
+            continue
+        }
+        normalized.append(value)
+    }
+    return normalized
+}
+
+func environmentUUID(_ key: String, environment: [String: String]) -> UUID? {
+    guard let value = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !value.isEmpty else {
+        return nil
+    }
+    return UUID(uuidString: value)
 }
 
 struct TaskPreview: Codable {
@@ -800,7 +1075,7 @@ func runInteractiveAgent(
     let snapshot = try RepositoryInspector().inspect(path: repoURL)
 
     try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
-        var activeSnapshot = snapshot
+        let activeSnapshot = snapshot
         let taskResolution = try await resolveInitialInteractiveTask(
             identifier: taskIdentifier,
             title: title,
@@ -809,210 +1084,21 @@ func runInteractiveAgent(
             repoURL: repoURL,
             store: store
         )
-        var task = taskResolution.task
-        var taskPersisted = taskResolution.isPersisted
+        let task = taskResolution.task
+        let taskPersisted = taskResolution.isPersisted
 
-        if TerminalCapability.isInteractive {
-            try await runTUIkitInteractiveLoop(
-                task: task,
-                taskPersisted: taskPersisted,
-                storeOptions: storeOptions,
-                repoURL: repoURL,
-                snapshot: activeSnapshot,
-                store: store,
-                defaultBackend: backend,
-                fullAuto: fullAuto,
-                sandbox: sandbox,
-                backendRunOptions: backendRunOptions
-            )
-            return
-        }
-
-        let renderer = TerminalRenderer()
-        var showRawEvents = false
-
-        renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
-
-        interactiveLoop: while true {
-            renderer.prompt(task: task)
-            guard let line = readLine() else {
-                writeStdout("\n")
-                break interactiveLoop
-            }
-
-            let input = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !input.isEmpty else {
-                continue
-            }
-
-            if let command = SlashCommand(input) {
-                switch command.name {
-                case "exit", "quit":
-                    if taskPersisted {
-                        _ = try? await releaseResumeClaim(task: task, store: store)
-                    }
-                    break interactiveLoop
-                case "help":
-                    renderer.help()
-                case "info", "task", "repo":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    let summary = try await store.summary(for: task)
-                    renderer.info(task: task, summary: summary, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
-                case "tasks":
-                    renderer.tasks(try await store.listTasks())
-                case "events":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    renderer.events(try await store.events(for: task.id))
-                case "checkpoints":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    printCheckpoints(try await store.listCheckpoints(taskID: task.id))
-                case "artifacts":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    printArtifacts(try await store.listArtifacts(taskID: task.id))
-                case "continue":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    let result = try await exportContinuationMarkdown(
-                        task: task,
-                        store: store,
-                        repoURL: repoURL,
-                        snapshot: activeSnapshot,
-                        destination: command.argument
-                    )
-                    renderer.status("Continuation bundle written to \(result.url.path).")
-                case "release":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    let result = try await releaseResumeClaim(task: task, store: store)
-                    renderer.status(result.released ? "Claim released." : "No active claim for this machine.")
-                case "export":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    let result = try await exportTranscriptMarkdown(
-                        task: task,
-                        store: store,
-                        repoURL: repoURL,
-                        snapshot: activeSnapshot,
-                        destination: command.argument
-                    )
-                    renderer.status("Exported \(result.eventCount) events to \(result.url.path).")
-                case "checkpoint":
-                    guard taskPersisted else {
-                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
-                        continue
-                    }
-                    let options = try checkpointSlashOptions(command.argument)
-                    let result = try await createAndPersistCheckpoint(
-                        task: task,
-                        store: store,
-                        snapshot: activeSnapshot,
-                        repoURL: repoURL,
-                        options: options,
-                        onStatus: { status in renderer.status(status) }
-                    )
-                    activeSnapshot = try RepositoryInspector().inspect(path: repoURL)
-                    printCheckpointResult(result)
-                case "raw":
-                    showRawEvents.toggle()
-                    renderer.status(showRawEvents ? "Raw event rendering enabled." : "Raw event rendering disabled.")
-                case "new":
-                    task = try await resolveInteractiveTask(
-                        identifier: nil,
-                        title: command.argument?.isEmpty == false ? command.argument : nil,
-                        backend: backend,
-                        snapshot: activeSnapshot,
-                        repoURL: repoURL,
-                        store: store
-                    )
-                    taskPersisted = true
-                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
-                case "resume":
-                    let resume = try resumeSlashOptions(command.argument)
-                    guard !resume.taskIdentifier.isEmpty else {
-                        renderer.error("usage: /resume <task> [--checkpoint <id|latest>] [--force]")
-                        continue
-                    }
-                    task = try await store.findTask(resume.taskIdentifier)
-                    let handoff = try await prepareResumeHandoff(
-                        task: task,
-                        store: store,
-                        repoURL: repoURL,
-                        snapshot: activeSnapshot,
-                        checkpointSelector: resume.checkpointSelector,
-                        forceClaim: resume.forceClaim
-                    )
-                    if handoff.restore != nil {
-                        activeSnapshot = try RepositoryInspector().inspect(path: repoURL)
-                    }
-                    taskPersisted = true
-                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
-                    if let restore = handoff.restore {
-                        renderer.status(checkpointRestoreStatus(restore))
-                    } else {
-                        renderer.status(taskClaimStatus(handoff.claim))
-                    }
-                default:
-                    renderer.error("unknown command: /\(command.name)")
-                    renderer.help()
-                }
-                continue
-            }
-
-            do {
-                if !taskPersisted {
-                    try await persistInteractiveTask(task, store: store)
-                    taskPersisted = true
-                    renderer.header(task: task, storeOptions: storeOptions, repoURL: repoURL, snapshot: activeSnapshot)
-                }
-                renderer.status("running \(task.backendPreference.rawValue) turn...")
-                _ = try await refreshResumeClaimIfActive(task: task, store: store)
-                let assistantRendered = SendableFlag()
-                let renderRawEvents = showRawEvents
-                let summary = try await runAgentTurn(
-                    task: task,
-                    prompt: input,
-                    repoURL: repoURL,
-                    snapshot: activeSnapshot,
-                    store: store,
-                    fullAuto: fullAuto,
-                    sandbox: sandbox,
-                    backendRunOptions: backendRunOptions,
-                    showStatus: false
-                ) { update in
-                    if renderer.render(update: update, showRawEvents: renderRawEvents) {
-                        assistantRendered.value = true
-                    }
-                }
-                if !assistantRendered.value {
-                    printRunSummary(summary)
-                }
-                _ = try await refreshResumeClaimIfActive(task: task, store: store)
-            } catch {
-                renderer.error("turn failed: \(agentctlErrorMessage(error))")
-            }
-        }
-
-        if taskPersisted {
-            _ = try? await releaseResumeClaim(task: task, store: store)
-        }
+        try await runTUIkitInteractiveLoop(
+            task: task,
+            taskPersisted: taskPersisted,
+            storeOptions: storeOptions,
+            repoURL: repoURL,
+            snapshot: activeSnapshot,
+            store: store,
+            defaultBackend: backend,
+            fullAuto: fullAuto,
+            sandbox: sandbox,
+            backendRunOptions: backendRunOptions
+        )
     }
 }
 
@@ -1043,15 +1129,46 @@ func resolveInteractiveTask(
     backend: AgentBackend = .codex,
     snapshot: RepositorySnapshot,
     repoURL: URL,
-    store: any AgentTaskStore
+    store: any AgentTaskStore,
+    syncSkills: Bool = true
 ) async throws -> TaskRecord {
     if let identifier {
         return try await store.findTask(identifier)
     }
 
+    // Sync skills from Postgres before creating new task
+    if syncSkills {
+        try await syncSkillsForTask(repoURL: repoURL, store: store)
+    }
+
     let task = makeInteractiveTask(title: title, backend: backend, snapshot: snapshot, repoURL: repoURL)
     try await persistInteractiveTask(task, store: store)
     return task
+}
+
+func syncSkillsForTask(repoURL: URL, store: any AgentTaskStore) async throws {
+    let skills = try await store.listSkills()
+    guard !skills.isEmpty else {
+        return
+    }
+
+    let repoRoot = snapshotRootPath(repoURL: repoURL)
+    let result = try SkillSync.syncSkills(skills: skills, repoRoot: repoRoot)
+    if result.skillsWritten > 0 {
+        printError("Synced \(result.skillsWritten) skill(s) to .agentctl/skills/")
+    }
+    if result.agentsMdUpdated {
+        printError("Updated AGENTS.md with skill instructions")
+    }
+}
+
+func snapshotRootPath(repoURL: URL) -> URL {
+    // Use repoURL as the root for writing skills
+    // If it's a directory, use it directly
+    if repoURL.hasDirectoryPath {
+        return repoURL
+    }
+    return repoURL.deletingLastPathComponent()
 }
 
 func makeInteractiveTask(
@@ -1151,9 +1268,6 @@ func createAndPersistCheckpoint(
     options: GitCheckpointOptions = GitCheckpointOptions(),
     onStatus: (@Sendable (String) -> Void)? = nil
 ) async throws -> GitCheckpointResult {
-    onStatus?("collecting handoff context...")
-    async let manifestContextTask = handoffManifestContext(task: task, store: store)
-
     onStatus?("preparing git checkpoint...")
     let manager = GitCheckpointManager()
     let gitState = try manager.createGitCheckpoint(
@@ -1164,19 +1278,32 @@ func createAndPersistCheckpoint(
         onProgress: onStatus
     )
 
-    onStatus?("recording handoff metadata...")
-    let manifestContext = try await manifestContextTask
-    let result = GitCheckpointManager.makeCheckpointResult(
+    // Persist local skills to Postgres as part of checkpoint
+    onStatus?("persisting skills...")
+    let repoRoot = URL(fileURLWithPath: snapshot.rootPath ?? repoURL.path, isDirectory: true)
+    let localSkills = try SkillSync.readLocalSkills(repoRoot: repoRoot)
+    var persistedSkillNames: [String] = []
+    for skill in localSkills {
+        let persisted = try await store.writeSkill(skill)
+        persistedSkillNames.append(persisted.name)
+    }
+    if !persistedSkillNames.isEmpty {
+        onStatus?("persisted \(persistedSkillNames.count) skill(s): \(persistedSkillNames.joined(separator: ", "))")
+    }
+
+    onStatus?("recording checkpoint cursor...")
+    let transcriptCursor = try await checkpointTranscriptCursor(task: task, store: store)
+    var result = GitCheckpointManager.makeCheckpointResult(
         task: task,
         options: options,
-        gitState: gitState,
-        manifestContext: manifestContext
+        gitState: gitState
     )
-    try await store.saveCheckpoint(result.checkpoint)
-    let artifacts = checkpointArtifacts(from: result, task: task)
-    for artifact in artifacts {
-        try await store.saveArtifact(artifact)
+    result.checkpoint.metadata["transcriptCursor"] = .object(transcriptCursor)
+    // Record persisted skills in checkpoint metadata
+    if !persistedSkillNames.isEmpty {
+        result.checkpoint.metadata["skills"] = .array(persistedSkillNames.map { .string($0) })
     }
+    try await store.saveCheckpoint(result.checkpoint)
     try await store.appendEvent(AgentEvent(
         taskID: task.id,
         kind: .checkpointCreated,
@@ -1191,6 +1318,28 @@ func createAndPersistCheckpoint(
         ))
     }
     return result
+}
+
+func checkpointTranscriptCursor(task: TaskRecord, store: any AgentTaskStore) async throws -> [String: JSONValue] {
+    let latestEvent = try await store.recentEvents(for: task.id, limit: 1).last
+    var cursor: [String: JSONValue] = [
+        "taskID": .string(task.id.uuidString),
+        "capturedAt": .string(ISO8601DateFormatter().string(from: Date()))
+    ]
+
+    if let latestEvent {
+        cursor["eventID"] = .string(latestEvent.id.uuidString)
+        cursor["eventKind"] = .string(latestEvent.kind.rawValue)
+        cursor["eventOccurredAt"] = .string(ISO8601DateFormatter().string(from: latestEvent.occurredAt))
+        if let sequence = latestEvent.sequence {
+            cursor["eventSequence"] = .int(sequence)
+        }
+        if let sessionID = latestEvent.sessionID {
+            cursor["sessionID"] = .string(sessionID.uuidString)
+        }
+    }
+
+    return cursor
 }
 
 func checkpointArtifacts(from result: GitCheckpointResult, task: TaskRecord) -> [ArtifactRecord] {
@@ -1265,7 +1414,7 @@ func checkpointArtifacts(from result: GitCheckpointResult, task: TaskRecord) -> 
 }
 
 func handoffManifestContext(task: TaskRecord, store: any AgentTaskStore) async throws -> HandoffManifest {
-    let events = try await store.events(for: task.id)
+    let events = try await store.recentEvents(for: task.id, limit: 80)
     return handoffManifestContext(events: events)
 }
 
@@ -1356,10 +1505,13 @@ func prepareResumeHandoff(
     repoURL: URL,
     snapshot: RepositorySnapshot,
     checkpointSelector: String?,
-    forceClaim: Bool = false
+    forceClaim: Bool = false,
+    onStatus: (@Sendable (String) -> Void)? = nil
 ) async throws -> ResumeHandoffResult {
+    onStatus?("loading checkpoints...")
     let checkpoints = try await store.listCheckpoints(taskID: task.id)
     let checkpoint = try selectCheckpoint(checkpoints, selector: checkpointSelector)
+    onStatus?("claiming task...")
     let claim = try await store.claimTask(
         taskID: task.id,
         checkpointID: checkpoint?.id,
@@ -1379,25 +1531,30 @@ func prepareResumeHandoff(
 
     let result: GitCheckpointRestoreResult
     do {
+        onStatus?("restoring checkpoint...")
         result = try GitCheckpointManager().restoreCheckpoint(
             checkpoint,
             snapshot: snapshot,
-            repoURL: repoURL
+            repoURL: repoURL,
+            onProgress: onStatus
         )
     } catch {
         _ = try? await store.releaseTaskClaim(taskID: task.id, ownerName: claim.ownerName)
         throw error
     }
+    onStatus?("recording claim metadata...")
     try await store.appendEvent(AgentEvent(
         taskID: task.id,
         kind: .taskClaimed,
         payload: taskClaimPayload(claim)
     ))
+    onStatus?("recording restore metadata...")
     try await store.appendEvent(AgentEvent(
         taskID: task.id,
         kind: .backendEvent,
         payload: checkpointRestorePayload(result, claim: claim)
     ))
+    onStatus?("resume metadata recorded")
     return ResumeHandoffResult(restore: result, claim: claim)
 }
 
@@ -1517,12 +1674,17 @@ func runAgentTurn(
     fullAuto: Bool,
     sandbox: String?,
     backendRunOptions: BackendRunOptions,
+    images: [PiRPCImage] = [],
     showStatus: Bool = true,
+    interruptHandle: AgentInterruptHandle? = nil,
     onUpdate: @escaping @Sendable (AgentSessionUpdate) async throws -> Void = { _ in }
 ) async throws -> TaskRunSummary {
     if showStatus {
         printError("Running \(task.backendPreference.rawValue) turn for \(task.slug)...")
     }
+
+    // Get skill paths for Pi backend
+    let skillPaths = skillPathsForBackend(repoURL: repoURL, store: store)
 
     let controller = AgentSessionController(store: store)
     return try await controller.runAgentTurn(
@@ -1540,10 +1702,39 @@ func runAgentTurn(
             model: backendRunOptions.model,
             thinking: backendRunOptions.thinking,
             tools: backendRunOptions.tools,
-            noTools: backendRunOptions.noTools
+            noTools: backendRunOptions.noTools,
+            skillPaths: skillPaths
         ),
+        images: images,
+        interruptHandle: interruptHandle,
         onUpdate: onUpdate
     )
+}
+
+func skillPathsForBackend(repoURL: URL, store: any AgentTaskStore) -> [URL] {
+    // Skill paths are already synced to .agentctl/skills/ during task creation
+    // Return paths for existing skill files
+    let skillsDir = snapshotRootPath(repoURL: repoURL)
+        .appendingPathComponent(".agentctl", isDirectory: true)
+        .appendingPathComponent("skills", isDirectory: true)
+
+    guard FileManager.default.fileExists(atPath: skillsDir.path) else {
+        return []
+    }
+
+    var paths: [URL] = []
+    do {
+        let skillDirs = try FileManager.default.contentsOfDirectory(at: skillsDir, includingPropertiesForKeys: nil)
+        for skillDir in skillDirs where skillDir.hasDirectoryPath {
+            let skillFile = skillDir.appendingPathComponent("SKILL.md")
+            if FileManager.default.fileExists(atPath: skillFile.path) {
+                paths.append(skillFile)
+            }
+        }
+    } catch {
+        // Ignore errors - skills may not be synced yet
+    }
+    return paths
 }
 
 func withTaskStore<T>(
@@ -1675,7 +1866,8 @@ func checkpointPayload(_ result: GitCheckpointResult) -> [String: JSONValue] {
         "committed": .bool(result.committed),
         "pushed": .bool(result.pushed),
         "dirtyStatus": .string(result.dirtyStatus),
-        "handoffManifest": result.manifest.jsonValue
+        "changedFiles": .array(result.manifest.changedFiles.map { .string($0) }),
+        "generatedFiles": .array(result.manifest.generatedFiles.map { .string($0) })
     ]
 
     if let commitSHA = result.checkpoint.commitSHA {
@@ -1683,6 +1875,9 @@ func checkpointPayload(_ result: GitCheckpointResult) -> [String: JSONValue] {
     }
     if let pushedAt = result.checkpoint.pushedAt {
         payload["pushedAt"] = .string(ISO8601DateFormatter().string(from: pushedAt))
+    }
+    if let transcriptCursor = result.checkpoint.metadata["transcriptCursor"] {
+        payload["transcriptCursor"] = transcriptCursor
     }
     return payload
 }
@@ -1695,7 +1890,8 @@ func checkpointRestorePayload(_ result: GitCheckpointRestoreResult, claim: TaskC
         "remote": .string(result.checkpoint.remoteName),
         "fetched": .bool(result.fetched),
         "switched": .bool(result.switched),
-        "fastForwarded": .bool(result.fastForwarded)
+        "fastForwarded": .bool(result.fastForwarded),
+        "advancedBeyondCheckpoint": .bool(result.advancedBeyondCheckpoint)
     ]
 
     if let commitSHA = result.checkpoint.commitSHA {
@@ -1751,11 +1947,15 @@ func printCheckpointRestoreResult(_ result: GitCheckpointRestoreResult) {
     print("  commit: \(result.headSHA ?? result.checkpoint.commitSHA ?? "-")")
     print("  remote: \(result.fetched ? result.checkpoint.remoteName : "-")")
     print("  files:  \(checkpointChangedFileCount(result.checkpoint))")
+    if result.advancedBeyondCheckpoint {
+        print("  note:   branch is ahead of the checkpoint commit")
+    }
 }
 
 func checkpointRestoreStatus(_ result: GitCheckpointRestoreResult) -> String {
     let commit = shortCommit(result.headSHA ?? result.checkpoint.commitSHA)
-    return "Restored checkpoint \(result.checkpoint.branch) @ \(commit) (\(checkpointChangedFileCount(result.checkpoint)) files)."
+    let advanced = result.advancedBeyondCheckpoint ? ", branch ahead of checkpoint" : ""
+    return "Restored checkpoint \(result.checkpoint.branch) @ \(commit)\(advanced) (\(checkpointChangedFileCount(result.checkpoint)) files)."
 }
 
 func taskClaimStatus(_ claim: TaskClaimRecord) -> String {
@@ -1876,7 +2076,7 @@ func exportContinuationMarkdown(
     snapshot: RepositorySnapshot,
     destination: String?
 ) async throws -> ContinuationExportResult {
-    let events = try await store.events(for: task.id)
+    let events = try await store.recentEvents(for: task.id, limit: 120)
     let checkpoints = try await store.listCheckpoints(taskID: task.id)
     let artifacts = try await store.listArtifacts(taskID: task.id)
     let claim = try? await store.currentTaskClaim(taskID: task.id)
@@ -2105,9 +2305,12 @@ private func continuationCheckpointMarkdown(_ checkpoint: CheckpointRecord) -> S
         lines.append(contentsOf: generatedFiles.prefix(40).map { "- `\($0)`" })
     }
 
-    if let manifest = checkpoint.metadata["handoffManifest"]?.objectValue {
+    if let cursor = checkpoint.metadata["transcriptCursor"]?.objectValue {
         lines.append("")
-        lines.append("Handoff manifest: \(handoffManifestSummary(manifest))")
+        lines.append("Transcript cursor: \(checkpointTranscriptCursorSummary(cursor))")
+    } else if let manifest = checkpoint.metadata["handoffManifest"]?.objectValue {
+        lines.append("")
+        lines.append("Legacy handoff manifest: \(handoffManifestSummary(manifest))")
     }
 
     return lines.joined(separator: "\n")
@@ -2308,8 +2511,10 @@ private func checkpointTranscriptMarkdownBlock(title: String, payload: [String: 
     if let pushed = payload["pushed"] {
         lines.append("- Pushed: `\(pushed == .bool(true) ? "yes" : "no")`")
     }
-    if let manifest = payload["handoffManifest"]?.objectValue {
-        lines.append("- Handoff: \(handoffManifestSummary(manifest))")
+    if let cursor = payload["transcriptCursor"]?.objectValue {
+        lines.append("- Transcript cursor: \(checkpointTranscriptCursorSummary(cursor))")
+    } else if let manifest = payload["handoffManifest"]?.objectValue {
+        lines.append("- Legacy handoff: \(handoffManifestSummary(manifest))")
     }
     return lines.joined(separator: "\n")
 }
@@ -2337,6 +2542,18 @@ private func handoffManifestSummary(_ manifest: [String: JSONValue]) -> String {
     let commands = manifest["commandOutputs"]?.arrayValue?.count ?? 0
     let tests = manifest["testResults"]?.arrayValue?.count ?? 0
     return "`\(files)` files, `\(generated)` generated, `\(commands)` commands, `\(tests)` tests"
+}
+
+private func checkpointTranscriptCursorSummary(_ cursor: [String: JSONValue]) -> String {
+    let sequence: String
+    if case let .int(value) = cursor["eventSequence"] {
+        sequence = "#\(value)"
+    } else {
+        sequence = "-"
+    }
+    let kind = cursor["eventKind"]?.stringValue ?? "none"
+    let session = cursor["sessionID"]?.stringValue.map { String($0.prefix(8)) } ?? "-"
+    return "`\(sequence)` `\(kind)` session `\(session)`"
 }
 
 private func markdownQuote(_ text: String) -> String {

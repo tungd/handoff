@@ -1,24 +1,39 @@
 import Foundation
 
+/// Image content for sending to Pi backend via RPC.
+public struct PiRPCImage: Codable, Equatable, Sendable {
+    public var type: String = "image"
+    public var data: String  // base64-encoded
+    public var mimeType: String
+
+    public init(data: String, mimeType: String) {
+        self.data = data
+        self.mimeType = mimeType
+    }
+}
+
 public struct PiRPCOptions: Codable, Equatable, Sendable {
     public var provider: String?
     public var model: String?
     public var thinking: String?
     public var tools: String?
     public var noTools: Bool
+    public var skillPaths: [URL]
 
     public init(
         provider: String? = nil,
         model: String? = nil,
         thinking: String? = nil,
         tools: String? = nil,
-        noTools: Bool = false
+        noTools: Bool = false,
+        skillPaths: [URL] = []
     ) {
         self.provider = provider
         self.model = model
         self.thinking = thinking
         self.tools = tools
         self.noTools = noTools
+        self.skillPaths = skillPaths
     }
 }
 
@@ -83,6 +98,8 @@ public struct PiRPCBackend: Sendable {
         cwd: URL,
         sessionPath: URL,
         options: PiRPCOptions = PiRPCOptions(),
+        images: [PiRPCImage] = [],
+        interruptHandle: AgentInterruptHandle? = nil,
         onUpdate: (PiRPCStreamUpdate) async throws -> Void
     ) async throws -> PiRPCResult {
         try FileManager.default.createDirectory(
@@ -98,11 +115,34 @@ public struct PiRPCBackend: Sendable {
 
         let promptID = "prompt-\(UUID().uuidString)"
         let statsID = "stats-\(UUID().uuidString)"
-        try process.sendLine(Self.encodeCommand([
+        
+        // Build prompt command with optional images
+        var promptCommand: [String: Any] = [
             "id": promptID,
             "type": "prompt",
             "message": prompt
-        ]))
+        ]
+        if !images.isEmpty {
+            promptCommand["images"] = images.map { img -> [String: String] in
+                ["type": "image", "data": img.data, "mimeType": img.mimeType]
+            }
+        }
+        try process.sendLine(Self.encodeCommand(promptCommand))
+
+        interruptHandle?.setAction {
+            do {
+                try process.sendLine(Self.encodeCommand([
+                    "id": "abort-\(UUID().uuidString)",
+                    "type": "abort"
+                ]))
+                return true
+            } catch {
+                return false
+            }
+        }
+        defer {
+            interruptHandle?.clearAction()
+        }
 
         var exitCode: Int32 = 0
         var stderrLines: [String] = []
@@ -182,6 +222,11 @@ public struct PiRPCBackend: Sendable {
             arguments.append("--no-tools")
         } else if let tools = options.tools, !tools.isEmpty {
             arguments += ["--tools", tools]
+        }
+
+        // Add skill paths
+        for skillPath in options.skillPaths {
+            arguments += ["--skill", skillPath.path]
         }
 
         return arguments

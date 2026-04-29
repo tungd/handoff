@@ -110,10 +110,10 @@ struct AgentTUIMarkdownTests {
         let lines = agentTUIQuoteStyledLines("How **far** is it?", width: 80)
 
         #expect(lines.map(agentTUIPlainText) == [
-            "│ How far is it?"
+            "┃ How far is it?"
         ])
         #expect(lines[0].count == 1)
-        #expect(lines[0].first?.text == "│ How far is it?")
+        #expect(lines[0].first?.text == "┃ How far is it?")
         #expect(lines[0].first?.tone == .quote)
         #expect(lines[0].first?.isItalic == true)
         #expect(lines[0].first?.preservesLayout == true)
@@ -169,6 +169,15 @@ struct AgentTUIMarkdownTests {
         let rendered = agentTUIToolOutputStyledLines(text ?? "", width: 80)
         #expect(rendered.first?.count == 1)
         #expect(rendered.first.map(agentTUIPlainText) == "$ pnpm test")
+    }
+
+    @Test
+    func hydratedTranscriptTextKeepsRecentTail() {
+        let text = "abcdef"
+        let truncated = agentTUIHydratedTranscriptText(text, limit: 3)
+
+        #expect(truncated == "[... 3 chars truncated from earlier transcript ...]\ndef")
+        #expect(agentTUIHydratedTranscriptText(text, limit: 10) == text)
     }
 }
 

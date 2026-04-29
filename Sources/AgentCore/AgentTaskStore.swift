@@ -15,6 +15,18 @@ public protocol AgentTaskStore: Sendable {
     func saveArtifact(_ artifact: ArtifactRecord) async throws
     func listArtifacts(taskID: UUID?) async throws -> [ArtifactRecord]
 
+    @discardableResult
+    func writeMemory(_ memory: MemoryItem) async throws -> MemoryItem
+    func searchMemory(_ query: String, limit: Int) async throws -> [MemorySearchResult]
+    func recentMemories(limit: Int) async throws -> [MemoryItem]
+    @discardableResult
+    func archiveMemory(id: UUID) async throws -> MemoryItem
+
+    func listSkills() async throws -> [SkillRecord]
+
+    @discardableResult
+    func writeSkill(_ skill: SkillRecord) async throws -> SkillRecord
+
     func claimTask(
         taskID: UUID,
         checkpointID: UUID?,
@@ -29,6 +41,8 @@ public protocol AgentTaskStore: Sendable {
     @discardableResult
     func appendEvent(_ event: AgentEvent) async throws -> AgentEvent
     func events(for taskID: UUID) async throws -> [AgentEvent]
+    func recentEvents(for taskID: UUID, limit: Int) async throws -> [AgentEvent]
+    func recentEvents(for taskID: UUID, limit: Int, kinds: [EventKind]) async throws -> [AgentEvent]
     func summary(for task: TaskRecord, eventLimit: Int) async throws -> TaskRunSummary
 }
 
@@ -94,6 +108,24 @@ extension LocalTaskStore: AgentTaskStore {
         try listArtifactsSync(taskID: taskID)
     }
 
+    @discardableResult
+    public func writeMemory(_ memory: MemoryItem) async throws -> MemoryItem {
+        try writeMemorySync(memory)
+    }
+
+    public func searchMemory(_ query: String, limit: Int) async throws -> [MemorySearchResult] {
+        try searchMemorySync(query, limit: limit)
+    }
+
+    public func recentMemories(limit: Int) async throws -> [MemoryItem] {
+        try recentMemoriesSync(limit: limit)
+    }
+
+    @discardableResult
+    public func archiveMemory(id: UUID) async throws -> MemoryItem {
+        try archiveMemorySync(id: id)
+    }
+
     public func claimTask(
         taskID: UUID,
         checkpointID: UUID?,
@@ -133,7 +165,33 @@ extension LocalTaskStore: AgentTaskStore {
         try eventsSync(for: taskID)
     }
 
+    public func recentEvents(for taskID: UUID, limit: Int) async throws -> [AgentEvent] {
+        guard limit > 0 else {
+            return []
+        }
+        return Array(try await events(for: taskID).suffix(limit))
+    }
+
+    public func recentEvents(for taskID: UUID, limit: Int, kinds: [EventKind]) async throws -> [AgentEvent] {
+        guard limit > 0, !kinds.isEmpty else {
+            return []
+        }
+        let allowed = Set(kinds)
+        return Array(try await events(for: taskID).filter { allowed.contains($0.kind) }.suffix(limit))
+    }
+
     public func summary(for task: TaskRecord, eventLimit: Int) async throws -> TaskRunSummary {
         try summarySync(for: task, eventLimit: eventLimit)
+    }
+
+    public func listSkills() async throws -> [SkillRecord] {
+        // Skills require Postgres store
+        return []
+    }
+
+    @discardableResult
+    public func writeSkill(_ skill: SkillRecord) async throws -> SkillRecord {
+        // Skills require Postgres store - return unchanged
+        return skill
     }
 }

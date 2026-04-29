@@ -6,6 +6,9 @@ The durable workflow belongs to `agentctl`; Codex, Pi, and Claude are backend ex
 Codex is the primary backend. Pi RPC support is available for lighter polishing
 turns, while Claude support remains deferred.
 
+Product direction and next slices are tracked in
+[`docs/product-roadmap.md`](docs/product-roadmap.md).
+
 ## Design
 
 ```text
@@ -36,7 +39,7 @@ Postgres schema
 repo detection
 task/session/event model
 backend runtime boundary
-memory MCP boundary
+memory CLI boundary
 basic CLI commands
 ```
 
@@ -50,6 +53,7 @@ swift run agentctl task new "first task" --prompt "Reply briefly."
 swift run agentctl task send first-task "Continue."
 swift run agentctl task new "polish task" --backend pi --model openai/gpt-4o-mini --prompt "Tighten README wording."
 swift run agentctl task checkpoint first-task
+swift run agentctl memory recent
 swift run agentctl db schema
 ```
 

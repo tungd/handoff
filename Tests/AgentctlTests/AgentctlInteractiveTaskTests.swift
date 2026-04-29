@@ -175,11 +175,10 @@ struct AgentctlInteractiveTaskTests {
             commitSHA: "abcdef123",
             metadata: [
                 "changedFiles": .array([.string("Sources/App.swift")]),
-                "handoffManifest": .object([
-                    "changedFiles": .array([.string("Sources/App.swift")]),
-                    "generatedFiles": .array([]),
-                    "commandOutputs": .array([]),
-                    "testResults": .array([])
+                "transcriptCursor": .object([
+                    "eventSequence": .int(12),
+                    "eventKind": .string("assistant.done"),
+                    "sessionID": .string("12345678-1234-1234-1234-123456789abc")
                 ])
             ]
         )
@@ -212,6 +211,7 @@ struct AgentctlInteractiveTaskTests {
         #expect(markdown.contains("You are continuing an `agentctl` task"))
         #expect(markdown.contains("- Branch: `agent/continue-demo`"))
         #expect(markdown.contains("- `Sources/App.swift`"))
+        #expect(markdown.contains("Transcript cursor: `#12` `assistant.done`"))
         #expect(markdown.contains("- `swift test` -> passed"))
         #expect(markdown.contains("> continue here"))
     }

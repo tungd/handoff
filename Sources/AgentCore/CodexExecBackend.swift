@@ -5,17 +5,20 @@ public struct CodexExecOptions: Codable, Equatable, Sendable {
     public var sandbox: String?
     public var model: String?
     public var profile: String?
+    public var imagePaths: [String]?  // Paths to image files for -i/--image option
 
     public init(
         fullAuto: Bool = false,
         sandbox: String? = nil,
         model: String? = nil,
-        profile: String? = nil
+        profile: String? = nil,
+        imagePaths: [String]? = nil
     ) {
         self.fullAuto = fullAuto
         self.sandbox = sandbox
         self.model = model
         self.profile = profile
+        self.imagePaths = imagePaths
     }
 }
 
@@ -110,6 +113,14 @@ public struct CodexExecBackend: Sendable {
             arguments += ["--profile", profile]
         }
 
+        // Add image attachments (-i is repeatable for multiple images). `codex exec`
+        // and `codex exec resume` both accept images before their positional args.
+        if let imagePaths = options.imagePaths {
+            for imagePath in imagePaths {
+                arguments += ["-i", imagePath]
+            }
+        }
+
         if let resumeThreadID {
             arguments.append(resumeThreadID)
         } else {
@@ -135,6 +146,7 @@ public struct CodexStreamingBackend: Sendable {
         cwd: URL,
         resumeThreadID: String? = nil,
         options: CodexExecOptions = CodexExecOptions(),
+        interruptHandle: AgentInterruptHandle? = nil,
         onUpdate: (CodexStreamUpdate) async throws -> Void
     ) async throws -> CodexExecResult {
         let arguments = CodexExecBackend(executable: executable).makeArguments(
@@ -150,9 +162,25 @@ public struct CodexStreamingBackend: Sendable {
         var events: [AgentEvent] = []
         var stderrLines: [String] = []
 
-        for try await streamEvent in runner.stream(executable, arguments: arguments, workingDirectory: cwd) {
+        let stream = runner.controlledStream(executable, arguments: arguments, workingDirectory: cwd)
+        if let control = stream.control {
+            interruptHandle?.setAction {
+                do {
+                    try control.send(Data([0x1B]))
+                    return true
+                } catch {
+                    return false
+                }
+            }
+        }
+        defer {
+            interruptHandle?.clearAction()
+        }
+
+        for try await streamEvent in stream.events {
             switch streamEvent {
-            case let .stdoutLine(line):
+            case let .stdoutLine(rawLine):
+                let line = rawLine.trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
                 let mapped = CodexJSONLMapper.mapLine(line)
                 if let mappedThreadID = mapped.threadID {
                     threadID = mappedThreadID
@@ -162,7 +190,8 @@ public struct CodexStreamingBackend: Sendable {
                 }
                 events.append(mapped.event)
                 try await onUpdate(.mappedLine(mapped))
-            case let .stderrLine(line):
+            case let .stderrLine(rawLine):
+                let line = rawLine.trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
                 stderrLines.append(line)
                 try await onUpdate(.stderrLine(line))
             case let .exited(status):

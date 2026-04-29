@@ -76,6 +76,62 @@ func schemaLoaderFindsInitialMigration() throws {
 }
 
 @Test
+func localMemoryWriteSearchRecentAndArchive() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("agentctl-memory-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let store: any AgentTaskStore = LocalTaskStore(root: root)
+    let first = MemoryItem(
+        scopeKind: .repo,
+        title: "Postgres memory search",
+        body: "Use websearch_to_tsquery for durable memory lookup.",
+        tags: ["database", "search"],
+        createdBy: "test",
+        createdAt: Date(timeIntervalSince1970: 1),
+        updatedAt: Date(timeIntervalSince1970: 1),
+        metadata: ["reviewStatus": .string("unreviewed")]
+    )
+    let second = MemoryItem(
+        scopeKind: .globalPersonal,
+        title: "Preferred test store",
+        body: "Use local storage in fast tests.",
+        tags: ["tests"],
+        createdBy: "test",
+        createdAt: Date(timeIntervalSince1970: 2),
+        updatedAt: Date(timeIntervalSince1970: 2)
+    )
+    let expired = MemoryItem(
+        scopeKind: .repo,
+        title: "Expired memory",
+        body: "This should not be visible.",
+        tags: ["search"],
+        createdBy: "test",
+        expiresAt: Date(timeIntervalSince1970: 0),
+        createdAt: Date(timeIntervalSince1970: 3),
+        updatedAt: Date(timeIntervalSince1970: 3)
+    )
+
+    try await store.writeMemory(first)
+    try await store.writeMemory(second)
+    try await store.writeMemory(expired)
+
+    let searchResults = try await store.searchMemory("websearch durable", limit: 10)
+    #expect(searchResults.map(\.item.id) == [first.id])
+    #expect(searchResults.first?.score ?? 0 > 0)
+
+    let recent = try await store.recentMemories(limit: 10)
+    #expect(recent.map(\.id) == [second.id, first.id])
+
+    let archived = try await store.archiveMemory(id: first.id)
+    #expect(archived.status == .archived)
+    #expect(archived.archivedAt != nil)
+
+    #expect(try await store.searchMemory("websearch", limit: 10).isEmpty)
+    #expect(try await store.recentMemories(limit: 10).map(\.id) == [second.id])
+}
+
+@Test
 func backendDescriptorsCaptureInitialBackendPriorities() {
     let codex = CodexBackendAdapter()
     let pi = PiBackendAdapter()
@@ -246,6 +302,32 @@ func codexStreamingBackendEmitsUpdatesAsLinesArrive() async throws {
 }
 
 @Test
+func codexStreamingBackendForwardsInterruptEscape() async throws {
+    let sentData = SentDataRecorder()
+    let backend = CodexStreamingBackend(runner: FakeStreamingProcessRunner(events: [
+        .stdoutLine(#"{"type":"item.completed","item":{"type":"agent_message","text":"stopped"}}"#),
+        .exited(0)
+    ], control: ProcessStreamControl(sendData: { data in
+        sentData.append(data)
+    })), executable: "/fake/env")
+    let interruptHandle = AgentInterruptHandle()
+    var requestedInterrupt = false
+
+    _ = try await backend.run(
+        prompt: "hello",
+        cwd: URL(fileURLWithPath: "/tmp/repo"),
+        interruptHandle: interruptHandle
+    ) { _ in
+        if !requestedInterrupt {
+            requestedInterrupt = true
+            #expect(interruptHandle.requestInterrupt())
+        }
+    }
+
+    #expect(sentData.values() == [Data([0x1B])])
+}
+
+@Test
 func codexExecArgumentsUseFreshExecShape() {
     let backend = CodexExecBackend()
     let args = backend.makeArguments(
@@ -291,6 +373,39 @@ func codexExecArgumentsUseResumeShapeWithoutUnsupportedFlags() {
         "gpt-test",
         "thread-123",
         "continue"
+    ])
+}
+
+@Test
+func codexExecArgumentsAttachImagesWhenResuming() {
+    let backend = CodexExecBackend()
+    let args = backend.makeArguments(
+        prompt: "continue with image",
+        cwd: URL(fileURLWithPath: "/tmp/repo"),
+        resumeThreadID: "thread-123",
+        options: CodexExecOptions(
+            fullAuto: true,
+            sandbox: "workspace-write",
+            model: "gpt-test",
+            profile: "default",
+            imagePaths: ["/tmp/a.png", "/tmp/b.jpg"]
+        )
+    )
+
+    #expect(args == [
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "--full-auto",
+        "--model",
+        "gpt-test",
+        "-i",
+        "/tmp/a.png",
+        "-i",
+        "/tmp/b.jpg",
+        "thread-123",
+        "continue with image"
     ])
 }
 
@@ -416,6 +531,21 @@ func localTaskStorePersistsTasksSessionsAndEvents() throws {
 }
 
 @Test
+func localTaskStoreRecentEventsUsesLatestEvents() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("agentctl-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let store: any AgentTaskStore = LocalTaskStore(root: root)
+    let task = TaskRecord(title: "Test Task", slug: "test-task")
+    try await store.saveTask(task)
+    try await store.appendEvent(AgentEvent(taskID: task.id, kind: .userMessage))
+    try await store.appendEvent(AgentEvent(taskID: task.id, kind: .assistantDone))
+
+    #expect(try await store.recentEvents(for: task.id, limit: 1).map(\.kind) == [.assistantDone])
+}
+
+@Test
 func localTaskStoreConformsToAsyncStoreProtocol() async throws {
     let root = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("agentctl-tests-\(UUID().uuidString)", isDirectory: true)
@@ -478,6 +608,54 @@ func agentSessionControllerPersistsStreamingCodexTurn() async throws {
 }
 
 @Test
+func agentSessionControllerPassesImagesToResumedCodexTurn() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("agentctl-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let store: any AgentTaskStore = LocalTaskStore(root: root)
+    let task = TaskRecord(title: "Streaming Images", slug: "streaming-images")
+    try await store.saveTask(task)
+    try await store.saveSession(SessionRecord(
+        taskID: task.id,
+        backend: .codex,
+        backendSessionID: "thread-123",
+        cwd: root.path
+    ))
+
+    let invocations = StreamingInvocationRecorder()
+    let backend = CodexStreamingBackend(runner: FakeStreamingProcessRunner(events: [
+        .stdoutLine(#"{"type":"thread.started","thread_id":"thread-123"}"#),
+        .stdoutLine(#"{"type":"item.completed","item":{"type":"agent_message","text":"looked"}}"#),
+        .exited(0)
+    ], invocations: invocations), executable: "/fake/env")
+    let controller = AgentSessionController(store: store, codexBackend: backend)
+
+    _ = try await controller.runCodexTurn(
+        task: task,
+        prompt: "describe image",
+        repoURL: root,
+        snapshot: RepositorySnapshot(isGitRepository: false),
+        images: [
+            PiRPCImage(data: Data("image-data".utf8).base64EncodedString(), mimeType: "image/png")
+        ]
+    )
+
+    let arguments = invocations.argumentsList().first ?? []
+    let imageFlagIndex = try #require(arguments.firstIndex(of: "-i"))
+    let imagePathIndex = arguments.index(after: imageFlagIndex)
+    try #require(imagePathIndex < arguments.endIndex)
+    #expect(Array(arguments.prefix(6)) == ["codex", "exec", "resume", "--json", "-i", arguments[imagePathIndex]])
+    #expect(Array(arguments.suffix(2)) == ["thread-123", "describe image"])
+    #expect(arguments[imagePathIndex].hasSuffix(".png"))
+    #expect(!FileManager.default.fileExists(atPath: arguments[imagePathIndex]))
+
+    let events = try await store.events(for: task.id)
+    let userMessage = try #require(events.first { $0.kind == .userMessage })
+    #expect(userMessage.payload["images"]?.arrayValue?.count == 1)
+}
+
+@Test
 func agentSessionControllerPersistsPiRPCTurn() async throws {
     let root = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("agentctl-tests-\(UUID().uuidString)", isDirectory: true)
@@ -519,6 +697,35 @@ func agentSessionControllerPersistsPiRPCTurn() async throws {
 }
 
 @Test
+func piRPCBackendSendsAbortCommandWhenInterrupted() async throws {
+    let sentLines = SentLineRecorder()
+    let backend = PiRPCBackend(runner: FakeInteractiveProcessRunner(events: [
+        .stdoutLine(#"{"id":"prompt-1","type":"response","command":"prompt","success":true}"#),
+        .stdoutLine(#"{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"stopped"}]}]}"#),
+        .stdoutLine(#"{"id":"stats-1","type":"response","command":"get_session_stats","success":true,"data":{"sessionFile":"/tmp/pi-session.jsonl"}}"#),
+        .exited(0)
+    ], sentLines: sentLines), executable: "/fake/env")
+    let interruptHandle = AgentInterruptHandle()
+    var requestedInterrupt = false
+
+    _ = try await backend.run(
+        prompt: "polish",
+        cwd: URL(fileURLWithPath: "/tmp/repo"),
+        sessionPath: URL(fileURLWithPath: "/tmp/pi-session.jsonl"),
+        interruptHandle: interruptHandle
+    ) { _ in
+        if !requestedInterrupt {
+            requestedInterrupt = true
+            #expect(interruptHandle.requestInterrupt())
+        }
+    }
+
+    let lines = sentLines.values()
+    #expect(lines.contains { $0.contains(#""type":"prompt""#) })
+    #expect(lines.contains { $0.contains(#""type":"abort""#) })
+}
+
+@Test
 func gitCheckpointManagerCreatesBranchCommitsChangesAndReturnsCheckpoint() throws {
     let root = URL(fileURLWithPath: "/tmp/repo", isDirectory: true)
     let task = TaskRecord(title: "Cashout Race", slug: "cashout-race")
@@ -549,7 +756,8 @@ func gitCheckpointManagerCreatesBranchCommitsChangesAndReturnsCheckpoint() throw
     #expect(result.pushed == false)
     #expect(result.dirtyStatus == " M Sources/file.swift\n")
     #expect(result.manifest.changedFiles == ["Sources/file.swift"])
-    #expect(result.checkpoint.metadata["handoffManifest"] != nil)
+    #expect(result.checkpoint.metadata["handoffManifest"] == nil)
+    #expect(result.checkpoint.metadata["changedFiles"] == .array([.string("Sources/file.swift")]))
 }
 
 @Test
@@ -609,6 +817,35 @@ func gitCheckpointManagerRestoresPushedCheckpointFromRemote() throws {
 }
 
 @Test
+func gitCheckpointManagerSkipsFetchWhenLocalBranchAlreadyContainsPushedCheckpoint() throws {
+    let root = URL(fileURLWithPath: "/tmp/repo", isDirectory: true)
+    let checkpoint = CheckpointRecord(
+        taskID: UUID(),
+        branch: "agent/handoff",
+        commitSHA: "feedface",
+        remoteName: "origin",
+        pushedAt: Date(timeIntervalSince1970: 0)
+    )
+    let manager = GitCheckpointManager(git: GitRunner(runner: FakeProcessRunner(responses: [
+        gitKey("status", "--porcelain=v1", "--", ".", ":!.agentctl"): ok(""),
+        gitKey("show-ref", "--verify", "--quiet", "refs/heads/agent/handoff"): ok(""),
+        gitKey("merge-base", "--is-ancestor", "feedface", "agent/handoff"): ok(""),
+        gitKey("switch", "agent/handoff"): ok(""),
+        gitKey("rev-parse", "HEAD"): ok("feedface\n")
+    ])))
+
+    let result = try manager.restoreCheckpoint(
+        checkpoint,
+        snapshot: RepositorySnapshot(isGitRepository: true, rootPath: root.path),
+        repoURL: root
+    )
+
+    #expect(result.fetched == false)
+    #expect(result.fastForwarded == false)
+    #expect(result.headSHA == "feedface")
+}
+
+@Test
 func gitCheckpointManagerRestoresLocalCheckpointWithoutFetching() throws {
     let root = URL(fileURLWithPath: "/tmp/repo", isDirectory: true)
     let checkpoint = CheckpointRecord(
@@ -631,6 +868,64 @@ func gitCheckpointManagerRestoresLocalCheckpointWithoutFetching() throws {
     #expect(result.fetched == false)
     #expect(result.fastForwarded == false)
     #expect(result.headSHA == "abc1234")
+    #expect(result.advancedBeyondCheckpoint == false)
+}
+
+@Test
+func gitCheckpointManagerAcceptsRestoredBranchAheadOfCheckpoint() throws {
+    let root = URL(fileURLWithPath: "/tmp/repo", isDirectory: true)
+    let checkpoint = CheckpointRecord(
+        taskID: UUID(),
+        branch: "agent/local",
+        commitSHA: "base123"
+    )
+    let manager = GitCheckpointManager(git: GitRunner(runner: FakeProcessRunner(responses: [
+        gitKey("status", "--porcelain=v1", "--", ".", ":!.agentctl"): ok(""),
+        gitKey("switch", "agent/local"): ok(""),
+        gitKey("rev-parse", "HEAD"): ok("child456\n"),
+        gitKey("merge-base", "--is-ancestor", "base123", "child456"): ok("")
+    ])))
+
+    let result = try manager.restoreCheckpoint(
+        checkpoint,
+        snapshot: RepositorySnapshot(isGitRepository: true, rootPath: root.path),
+        repoURL: root
+    )
+
+    #expect(result.headSHA == "child456")
+    #expect(result.advancedBeyondCheckpoint)
+}
+
+@Test
+func gitCheckpointManagerRejectsRestoredBranchMissingCheckpointCommit() throws {
+    let root = URL(fileURLWithPath: "/tmp/repo", isDirectory: true)
+    let checkpoint = CheckpointRecord(
+        taskID: UUID(),
+        branch: "agent/local",
+        commitSHA: "base123"
+    )
+    let manager = GitCheckpointManager(git: GitRunner(runner: FakeProcessRunner(responses: [
+        gitKey("status", "--porcelain=v1", "--", ".", ":!.agentctl"): ok(""),
+        gitKey("switch", "agent/local"): ok(""),
+        gitKey("rev-parse", "HEAD"): ok("other789\n"),
+        gitKey("merge-base", "--is-ancestor", "base123", "other789"): ProcessResult(
+            exitCode: 1,
+            stdout: "",
+            stderr: ""
+        )
+    ])))
+
+    do {
+        _ = try manager.restoreCheckpoint(
+            checkpoint,
+            snapshot: RepositorySnapshot(isGitRepository: true, rootPath: root.path),
+            repoURL: root
+        )
+        Issue.record("expected restore to reject a branch missing the checkpoint commit")
+    } catch let GitCheckpointError.checkpointCommitMismatch(expected, actual) {
+        #expect(expected == "base123")
+        #expect(actual == "other789")
+    }
 }
 
 @Test
@@ -688,6 +983,40 @@ private final class SentLineRecorder: @unchecked Sendable {
     }
 }
 
+private final class SentDataRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data: [Data] = []
+
+    func append(_ value: Data) {
+        lock.withLock {
+            data.append(value)
+        }
+    }
+
+    func values() -> [Data] {
+        lock.withLock {
+            data
+        }
+    }
+}
+
+private final class StreamingInvocationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var invocations: [(arguments: [String], workingDirectory: URL?)] = []
+
+    func append(arguments: [String], workingDirectory: URL?) {
+        lock.withLock {
+            invocations.append((arguments: arguments, workingDirectory: workingDirectory))
+        }
+    }
+
+    func argumentsList() -> [[String]] {
+        lock.withLock {
+            invocations.map(\.arguments)
+        }
+    }
+}
+
 private struct FakeInteractiveProcessRunner: ProcessInteracting {
     let events: [ProcessStreamEvent]
     let sentLines: SentLineRecorder
@@ -726,18 +1055,32 @@ private final class FakeInteractiveProcess: InteractiveProcess, @unchecked Senda
 
 private struct FakeStreamingProcessRunner: ProcessStreaming {
     let events: [ProcessStreamEvent]
+    var invocations: StreamingInvocationRecorder?
+    var control: ProcessStreamControl?
 
     func stream(
         _ executable: String,
         arguments: [String],
         workingDirectory: URL?
     ) -> AsyncThrowingStream<ProcessStreamEvent, Error> {
-        AsyncThrowingStream { continuation in
+        invocations?.append(arguments: arguments, workingDirectory: workingDirectory)
+        return AsyncThrowingStream { continuation in
             for event in events {
                 continuation.yield(event)
             }
             continuation.finish()
         }
+    }
+
+    func controlledStream(
+        _ executable: String,
+        arguments: [String],
+        workingDirectory: URL?
+    ) -> ProcessStreamSession {
+        ProcessStreamSession(
+            events: stream(executable, arguments: arguments, workingDirectory: workingDirectory),
+            control: control
+        )
     }
 }
 

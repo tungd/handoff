@@ -55,6 +55,11 @@ public enum MemoryScopeKind: String, Codable, CaseIterable, Sendable {
     case session
 }
 
+public enum MemoryStatus: String, Codable, CaseIterable, Sendable {
+    case active
+    case archived
+}
+
 public struct MachineRecord: Codable, Equatable, Sendable, Identifiable {
     public let id: UUID
     public var stableName: String
@@ -124,6 +129,13 @@ public struct TaskRecord: Codable, Equatable, Sendable, Identifiable {
         self.state = state
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+    }
+
+    public func withTitle(_ newTitle: String) -> TaskRecord {
+        var copy = self
+        copy.title = newTitle
+        copy.updatedAt = Date()
+        return copy
     }
 }
 
@@ -343,8 +355,13 @@ public struct MemoryItem: Codable, Equatable, Sendable, Identifiable {
     public var body: String
     public var summary: String?
     public var tags: [String]
+    public var status: MemoryStatus
     public var createdBy: String
+    public var expiresAt: Date?
+    public var archivedAt: Date?
     public var createdAt: Date
+    public var updatedAt: Date
+    public var metadata: [String: JSONValue]
 
     public init(
         id: UUID = UUID(),
@@ -356,8 +373,13 @@ public struct MemoryItem: Codable, Equatable, Sendable, Identifiable {
         body: String,
         summary: String? = nil,
         tags: [String] = [],
+        status: MemoryStatus = .active,
         createdBy: String,
-        createdAt: Date = Date()
+        expiresAt: Date? = nil,
+        archivedAt: Date? = nil,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date(),
+        metadata: [String: JSONValue] = [:]
     ) {
         self.id = id
         self.scopeKind = scopeKind
@@ -368,7 +390,90 @@ public struct MemoryItem: Codable, Equatable, Sendable, Identifiable {
         self.body = body
         self.summary = summary
         self.tags = tags
+        self.status = status
         self.createdBy = createdBy
+        self.expiresAt = expiresAt
+        self.archivedAt = archivedAt
         self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.metadata = metadata
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case scopeKind
+        case scopeID
+        case repoID
+        case taskID
+        case title
+        case body
+        case summary
+        case tags
+        case status
+        case createdBy
+        case expiresAt
+        case archivedAt
+        case createdAt
+        case updatedAt
+        case metadata
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        id = try container.decode(UUID.self, forKey: .id)
+        scopeKind = try container.decode(MemoryScopeKind.self, forKey: .scopeKind)
+        scopeID = try container.decodeIfPresent(UUID.self, forKey: .scopeID)
+        repoID = try container.decodeIfPresent(UUID.self, forKey: .repoID)
+        taskID = try container.decodeIfPresent(UUID.self, forKey: .taskID)
+        title = try container.decode(String.self, forKey: .title)
+        body = try container.decode(String.self, forKey: .body)
+        summary = try container.decodeIfPresent(String.self, forKey: .summary)
+        tags = try container.decodeIfPresent([String].self, forKey: .tags) ?? []
+        status = try container.decodeIfPresent(MemoryStatus.self, forKey: .status) ?? .active
+        createdBy = try container.decode(String.self, forKey: .createdBy)
+        expiresAt = try container.decodeIfPresent(Date.self, forKey: .expiresAt)
+        archivedAt = try container.decodeIfPresent(Date.self, forKey: .archivedAt)
+        self.createdAt = createdAt
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
+        metadata = try container.decodeIfPresent([String: JSONValue].self, forKey: .metadata) ?? [:]
+    }
+}
+
+public struct MemorySearchResult: Codable, Equatable, Sendable {
+    public var item: MemoryItem
+    public var score: Double
+
+    public init(item: MemoryItem, score: Double) {
+        self.item = item
+        self.score = score
+    }
+}
+
+public struct SkillRecord: Codable, Equatable, Sendable, Identifiable {
+    public let id: UUID
+    public var name: String
+    public var description: String?
+    public var content: String
+    public var tags: [String]
+    public var createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        description: String? = nil,
+        content: String,
+        tags: [String] = [],
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.name = name
+        self.description = description
+        self.content = content
+        self.tags = tags
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
     }
 }

@@ -2,12 +2,15 @@ import Foundation
 
 public enum LocalTaskStoreError: Error, CustomStringConvertible, Sendable {
     case taskNotFound(String)
+    case memoryNotFound(UUID)
     case malformedEventLine(URL)
 
     public var description: String {
         switch self {
         case let .taskNotFound(identifier):
             return "task not found: \(identifier)"
+        case let .memoryNotFound(id):
+            return "memory not found: \(id.uuidString)"
         case let .malformedEventLine(url):
             return "malformed event line in \(url.path)"
         }
@@ -41,6 +44,7 @@ public struct LocalTaskStore: Sendable {
     private var eventsDirectory: URL { root.appendingPathComponent("events", isDirectory: true) }
     private var checkpointsDirectory: URL { root.appendingPathComponent("checkpoints", isDirectory: true) }
     private var artifactsDirectory: URL { root.appendingPathComponent("artifacts", isDirectory: true) }
+    private var memoriesDirectory: URL { root.appendingPathComponent("memories", isDirectory: true) }
 
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
@@ -65,6 +69,7 @@ public struct LocalTaskStore: Sendable {
         try fileManager.createDirectory(at: eventsDirectory, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: checkpointsDirectory, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: artifactsDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: memoriesDirectory, withIntermediateDirectories: true)
     }
 
     public func saveTask(_ task: TaskRecord) throws {
@@ -284,6 +289,148 @@ public struct LocalTaskStore: Sendable {
         try summary(for: task, eventLimit: eventLimit)
     }
 
+    @discardableResult
+    public func writeMemory(_ memory: MemoryItem) throws -> MemoryItem {
+        try prepare()
+        var stored = memory
+        if stored.updatedAt < stored.createdAt {
+            stored.updatedAt = stored.createdAt
+        }
+        let data = try encoder.encode(stored)
+        try data.write(to: memoryURL(stored.id), options: [.atomic])
+        return stored
+    }
+
+    @discardableResult
+    public func writeMemorySync(_ memory: MemoryItem) throws -> MemoryItem {
+        try writeMemory(memory)
+    }
+
+    public func searchMemory(_ query: String, limit: Int) throws -> [MemorySearchResult] {
+        guard limit > 0 else {
+            return []
+        }
+
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalizedQuery.isEmpty else {
+            return []
+        }
+
+        let terms = normalizedQuery
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+
+        let scored = try listActiveMemories()
+            .compactMap { item -> MemorySearchResult? in
+                let title = item.title.lowercased()
+                let body = item.body.lowercased()
+                let tags = item.tags.map { $0.lowercased() }
+                var score = 0.0
+
+                if title.contains(normalizedQuery) {
+                    score += 6
+                }
+                if body.contains(normalizedQuery) {
+                    score += 2
+                }
+                if tags.contains(where: { $0.contains(normalizedQuery) }) {
+                    score += 4
+                }
+
+                for term in terms {
+                    if title.contains(term) {
+                        score += 3
+                    }
+                    if body.contains(term) {
+                        score += 1
+                    }
+                    if tags.contains(where: { $0.contains(term) }) {
+                        score += 2
+                    }
+                }
+
+                guard score > 0 else {
+                    return nil
+                }
+                return MemorySearchResult(item: item, score: score)
+            }
+            .sorted {
+                if $0.score == $1.score {
+                    return $0.item.createdAt > $1.item.createdAt
+                }
+                return $0.score > $1.score
+            }
+
+        return Array(scored.prefix(limit))
+    }
+
+    public func searchMemorySync(_ query: String, limit: Int) throws -> [MemorySearchResult] {
+        try searchMemory(query, limit: limit)
+    }
+
+    public func recentMemories(limit: Int) throws -> [MemoryItem] {
+        guard limit > 0 else {
+            return []
+        }
+
+        return Array(try listActiveMemories()
+            .sorted {
+                if $0.createdAt == $1.createdAt {
+                    return $0.updatedAt > $1.updatedAt
+                }
+                return $0.createdAt > $1.createdAt
+            }
+            .prefix(limit))
+    }
+
+    public func recentMemoriesSync(limit: Int) throws -> [MemoryItem] {
+        try recentMemories(limit: limit)
+    }
+
+    @discardableResult
+    public func archiveMemory(id: UUID) throws -> MemoryItem {
+        try prepare()
+        let url = memoryURL(id)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw LocalTaskStoreError.memoryNotFound(id)
+        }
+
+        var memory = try decoder.decode(MemoryItem.self, from: Data(contentsOf: url))
+        let now = Date()
+        memory.status = .archived
+        memory.archivedAt = now
+        memory.updatedAt = now
+        let data = try encoder.encode(memory)
+        try data.write(to: url, options: [.atomic])
+        return memory
+    }
+
+    @discardableResult
+    public func archiveMemorySync(id: UUID) throws -> MemoryItem {
+        try archiveMemory(id: id)
+    }
+
+    private func listActiveMemories() throws -> [MemoryItem] {
+        let now = Date()
+        return try listMemories()
+            .filter { item in
+                item.status == .active
+                    && item.archivedAt == nil
+                    && (item.expiresAt == nil || item.expiresAt! > now)
+            }
+    }
+
+    private func listMemories() throws -> [MemoryItem] {
+        try prepare()
+        let files = try FileManager.default.contentsOfDirectory(
+            at: memoriesDirectory,
+            includingPropertiesForKeys: nil
+        )
+        .filter { $0.pathExtension == "json" }
+
+        return try files.map { try decoder.decode(MemoryItem.self, from: Data(contentsOf: $0)) }
+    }
+
     private func taskURL(_ id: UUID) -> URL {
         tasksDirectory.appendingPathComponent("\(id.uuidString).json")
     }
@@ -302,6 +449,10 @@ public struct LocalTaskStore: Sendable {
 
     private func artifactURL(_ id: UUID) -> URL {
         artifactsDirectory.appendingPathComponent("\(id.uuidString).json")
+    }
+
+    private func memoryURL(_ id: UUID) -> URL {
+        memoriesDirectory.appendingPathComponent("\(id.uuidString).json")
     }
 }
 

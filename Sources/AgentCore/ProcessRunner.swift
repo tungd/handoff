@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public struct ProcessResult: Equatable, Sendable {
@@ -32,6 +33,60 @@ public protocol ProcessStreaming: Sendable {
         arguments: [String],
         workingDirectory: URL?
     ) -> AsyncThrowingStream<ProcessStreamEvent, Error>
+
+    func controlledStream(
+        _ executable: String,
+        arguments: [String],
+        workingDirectory: URL?
+    ) -> ProcessStreamSession
+}
+
+public struct ProcessStreamSession: Sendable {
+    public var events: AsyncThrowingStream<ProcessStreamEvent, Error>
+    public var control: ProcessStreamControl?
+
+    public init(events: AsyncThrowingStream<ProcessStreamEvent, Error>, control: ProcessStreamControl? = nil) {
+        self.events = events
+        self.control = control
+    }
+}
+
+public final class ProcessStreamControl: @unchecked Sendable {
+    private let sendData: @Sendable (Data) throws -> Void
+    private let closeInput: @Sendable () throws -> Void
+    private let terminateProcess: @Sendable () -> Void
+
+    public init(
+        sendData: @escaping @Sendable (Data) throws -> Void,
+        closeInput: @escaping @Sendable () throws -> Void = {},
+        terminate: @escaping @Sendable () -> Void = {}
+    ) {
+        self.sendData = sendData
+        self.closeInput = closeInput
+        self.terminateProcess = terminate
+    }
+
+    public func send(_ data: Data) throws {
+        try sendData(data)
+    }
+
+    public func closeStdin() throws {
+        try closeInput()
+    }
+
+    public func terminate() {
+        terminateProcess()
+    }
+}
+
+public extension ProcessStreaming {
+    func controlledStream(
+        _ executable: String,
+        arguments: [String],
+        workingDirectory: URL?
+    ) -> ProcessStreamSession {
+        ProcessStreamSession(events: stream(executable, arguments: arguments, workingDirectory: workingDirectory))
+    }
 }
 
 public protocol InteractiveProcess: Sendable {
@@ -107,20 +162,90 @@ public struct SubprocessStreamRunner: ProcessStreaming {
         arguments: [String] = [],
         workingDirectory: URL? = nil
     ) -> AsyncThrowingStream<ProcessStreamEvent, Error> {
-        AsyncThrowingStream { continuation in
-            let state = StreamingProcessState(
-                executable: executable,
-                arguments: arguments,
-                workingDirectory: workingDirectory,
-                continuation: continuation
-            )
+        startStream(
+            executable,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            closeStdinOnStart: true
+        ).events
+    }
 
-            continuation.onTermination = { @Sendable _ in
-                state.terminate()
-            }
+    public func controlledStream(
+        _ executable: String,
+        arguments: [String] = [],
+        workingDirectory: URL? = nil
+    ) -> ProcessStreamSession {
+        startStream(
+            executable,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            closeStdinOnStart: false
+        )
+    }
 
-            state.start()
+    private func startStream(
+        _ executable: String,
+        arguments: [String],
+        workingDirectory: URL?,
+        closeStdinOnStart: Bool
+    ) -> ProcessStreamSession {
+        let stream = AsyncThrowingStream.makeStream(of: ProcessStreamEvent.self, throwing: Error.self)
+        let state = StreamingProcessState(
+            executable: executable,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            continuation: stream.continuation
+        )
+        let control = ProcessStreamControl(
+            sendData: { data in try state.send(data) },
+            closeInput: { try state.closeStdin() },
+            terminate: { state.terminate() }
+        )
+
+        stream.continuation.onTermination = { @Sendable _ in
+            state.terminate()
         }
+
+        state.start(closeStdinOnStart: closeStdinOnStart)
+        return ProcessStreamSession(events: stream.stream, control: control)
+    }
+}
+
+public struct SubprocessPTYStreamRunner: ProcessStreaming {
+    public init() {}
+
+    public func stream(
+        _ executable: String,
+        arguments: [String] = [],
+        workingDirectory: URL? = nil
+    ) -> AsyncThrowingStream<ProcessStreamEvent, Error> {
+        controlledStream(executable, arguments: arguments, workingDirectory: workingDirectory).events
+    }
+
+    public func controlledStream(
+        _ executable: String,
+        arguments: [String] = [],
+        workingDirectory: URL? = nil
+    ) -> ProcessStreamSession {
+        let stream = AsyncThrowingStream.makeStream(of: ProcessStreamEvent.self, throwing: Error.self)
+        let state = PTYProcessState(
+            executable: executable,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            continuation: stream.continuation
+        )
+        let control = ProcessStreamControl(
+            sendData: { data in try state.send(data) },
+            closeInput: { try state.closeInput() },
+            terminate: { state.terminate() }
+        )
+
+        stream.continuation.onTermination = { @Sendable _ in
+            state.terminate()
+        }
+
+        state.start()
+        return ProcessStreamSession(events: stream.stream, control: control)
     }
 }
 
@@ -146,8 +271,11 @@ private final class StreamingProcessState: @unchecked Sendable {
     private let workingDirectory: URL?
     private let continuation: AsyncThrowingStream<ProcessStreamEvent, Error>.Continuation
     private let process = Process()
+    private let stdinPipe = Pipe()
+    private let stdinLock = NSLock()
     private let group = DispatchGroup()
     private let queue = DispatchQueue(label: "agentctl.streaming-process", attributes: .concurrent)
+    private var stdinClosed = false
 
     init(
         executable: String,
@@ -161,12 +289,11 @@ private final class StreamingProcessState: @unchecked Sendable {
         self.continuation = continuation
     }
 
-    func start() {
+    func start(closeStdinOnStart: Bool) {
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.currentDirectoryURL = workingDirectory
 
-        let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         process.standardInput = stdinPipe
@@ -175,7 +302,9 @@ private final class StreamingProcessState: @unchecked Sendable {
 
         do {
             try process.run()
-            try stdinPipe.fileHandleForWriting.close()
+            if closeStdinOnStart {
+                try closeStdin()
+            }
         } catch {
             continuation.finish(throwing: error)
             return
@@ -211,6 +340,25 @@ private final class StreamingProcessState: @unchecked Sendable {
         }
     }
 
+    func send(_ data: Data) throws {
+        try stdinLock.withLock {
+            guard !stdinClosed else {
+                return
+            }
+            try stdinPipe.fileHandleForWriting.write(contentsOf: data)
+        }
+    }
+
+    func closeStdin() throws {
+        try stdinLock.withLock {
+            guard !stdinClosed else {
+                return
+            }
+            stdinClosed = true
+            try stdinPipe.fileHandleForWriting.close()
+        }
+    }
+
     private func readLines(from handle: FileHandle, emit: (String) -> Void) {
         var buffer = Data()
         let newline = Data([0x0A])
@@ -233,6 +381,130 @@ private final class StreamingProcessState: @unchecked Sendable {
         if !buffer.isEmpty {
             emit(String(decoding: buffer, as: UTF8.self))
         }
+    }
+}
+
+private final class PTYProcessState: @unchecked Sendable {
+    private let executable: String
+    private let arguments: [String]
+    private let workingDirectory: URL?
+    private let continuation: AsyncThrowingStream<ProcessStreamEvent, Error>.Continuation
+    private let process = Process()
+    private let group = DispatchGroup()
+    private let queue = DispatchQueue(label: "agentctl.pty-process", attributes: .concurrent)
+    private let inputLock = NSLock()
+    private var masterHandle: FileHandle?
+    private var inputClosed = false
+
+    init(
+        executable: String,
+        arguments: [String],
+        workingDirectory: URL?,
+        continuation: AsyncThrowingStream<ProcessStreamEvent, Error>.Continuation
+    ) {
+        self.executable = executable
+        self.arguments = arguments
+        self.workingDirectory = workingDirectory
+        self.continuation = continuation
+    }
+
+    func start() {
+        var masterFD: Int32 = 0
+        var slaveFD: Int32 = 0
+        guard openpty(&masterFD, &slaveFD, nil, nil, nil) == 0 else {
+            continuation.finish(throwing: POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO))
+            return
+        }
+
+        let master = FileHandle(fileDescriptor: masterFD, closeOnDealloc: true)
+        let slave = FileHandle(fileDescriptor: slaveFD, closeOnDealloc: true)
+        masterHandle = master
+
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.currentDirectoryURL = workingDirectory
+        process.standardInput = slave
+        process.standardOutput = slave
+        process.standardError = slave
+
+        do {
+            try process.run()
+            try slave.close()
+        } catch {
+            try? slave.close()
+            try? master.close()
+            continuation.finish(throwing: error)
+            return
+        }
+
+        group.enter()
+        queue.async {
+            self.readLines(from: master) { line in
+                self.continuation.yield(.stdoutLine(line))
+            }
+            self.group.leave()
+        }
+
+        queue.async {
+            self.process.waitUntilExit()
+            self.group.wait()
+            self.continuation.yield(.exited(self.process.terminationStatus))
+            self.continuation.finish()
+        }
+    }
+
+    func send(_ data: Data) throws {
+        try inputLock.withLock {
+            guard !inputClosed, let masterHandle else {
+                return
+            }
+            try masterHandle.write(contentsOf: data)
+        }
+    }
+
+    func closeInput() throws {
+        try inputLock.withLock {
+            guard !inputClosed else {
+                return
+            }
+            inputClosed = true
+            try masterHandle?.close()
+        }
+    }
+
+    func terminate() {
+        if process.isRunning {
+            process.terminate()
+        }
+    }
+
+    private func readLines(from handle: FileHandle, emit: (String) -> Void) {
+        var buffer = Data()
+        let newline = Data([0x0A])
+
+        while true {
+            let data = handle.availableData
+            if data.isEmpty {
+                break
+            }
+
+            buffer.append(data)
+
+            while let range = buffer.range(of: newline) {
+                let lineData = buffer.subdata(in: buffer.startIndex..<range.lowerBound)
+                emit(Self.decodePTYLine(lineData))
+                buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+            }
+        }
+
+        if !buffer.isEmpty {
+            emit(Self.decodePTYLine(buffer))
+        }
+    }
+
+    private static func decodePTYLine(_ data: Data) -> String {
+        String(decoding: data, as: UTF8.self)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
     }
 }
 
