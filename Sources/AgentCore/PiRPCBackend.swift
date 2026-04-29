@@ -18,19 +18,22 @@ public struct PiRPCOptions: Codable, Equatable, Sendable {
     public var thinking: String?
     public var tools: String?
     public var noTools: Bool
+    public var skillPaths: [URL]
 
     public init(
         provider: String? = nil,
         model: String? = nil,
         thinking: String? = nil,
         tools: String? = nil,
-        noTools: Bool = false
+        noTools: Bool = false,
+        skillPaths: [URL] = []
     ) {
         self.provider = provider
         self.model = model
         self.thinking = thinking
         self.tools = tools
         self.noTools = noTools
+        self.skillPaths = skillPaths
     }
 }
 
@@ -219,6 +222,11 @@ public struct PiRPCBackend: Sendable {
             arguments.append("--no-tools")
         } else if let tools = options.tools, !tools.isEmpty {
             arguments += ["--tools", tools]
+        }
+
+        // Add skill paths
+        for skillPath in options.skillPaths {
+            arguments += ["--skill", skillPath.path]
         }
 
         return arguments

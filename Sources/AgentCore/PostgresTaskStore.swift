@@ -49,10 +49,7 @@ public struct PostgresTaskStore: AgentTaskStore {
     }
 
     public func migrate() async throws {
-        let statements = try SchemaLoader.initialMigration()
-            .split(separator: ";", omittingEmptySubsequences: true)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        let statements = try SchemaLoader.allMigrationStatements()
 
         for statement in statements {
             try await drain(client.query(PostgresQuery(unsafeSQL: statement)))
@@ -1050,5 +1047,38 @@ public struct PostgresTaskStore: AgentTaskStore {
 
     private func drain(_ rows: PostgresRowSequence) async throws {
         for try await _ in rows {}
+    }
+
+    public func listSkills() async throws -> [SkillRecord] {
+        let rows = try await client.query("""
+            SELECT id, name, description, content, to_json(tags)::text, created_at, updated_at
+            FROM skills
+            ORDER BY name
+            """)
+
+        var skills: [SkillRecord] = []
+        for try await (id, name, description, content, tagsText, createdAt, updatedAt) in rows.decode((
+            UUID,
+            String,
+            String?,
+            String,
+            String,
+            Date,
+            Date
+        ).self) {
+            let tags = try decoder.decode([String].self, from: Data(tagsText.utf8))
+
+            skills.append(SkillRecord(
+                id: id,
+                name: name,
+                description: description,
+                content: content,
+                tags: tags,
+                createdAt: createdAt,
+                updatedAt: updatedAt
+            ))
+        }
+
+        return skills
     }
 }

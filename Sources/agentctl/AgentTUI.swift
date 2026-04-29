@@ -705,21 +705,40 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         }
         let snapshot = model.snapshot()
         let width = terminalSize().columns
+        let lines = nativeHeaderLines(
+            snapshot: snapshot,
+            store: shortStoreName(storeDescription(options: runtime.storeOptions, repoURL: runtime.repoURL, snapshot: runtime.snapshot)),
+            width: width,
+            palette: AgentTUIPalette()
+        )
+        for line in lines {
+            terminal.write(line + "\r\n")
+        }
+    }
+
+    private func nativeHeaderLines(
+        snapshot: AgentTUISnapshot,
+        store: String,
+        width: Int,
+        palette: any Palette
+    ) -> [String] {
+        let width = max(1, width)
         let left = agentTUIANSIStyled("agentctl", color: .palette.accent, isBold: false, isItalic: false, isUnderlined: false, palette: AgentTUIPalette())
         let slug = agentTUIANSIStyled(" \(snapshot.task.slug)", color: .palette.foregroundTertiary, isBold: false, isItalic: false, isUnderlined: false, palette: AgentTUIPalette())
-        let store = shortStoreName(storeDescription(options: runtime.storeOptions, repoURL: runtime.repoURL, snapshot: runtime.snapshot))
         let plainLeft = "agentctl \(snapshot.task.slug)"
         let spaces = max(1, width - plainLeft.count - store.count)
         let right = agentTUIANSIStyled(store, color: .palette.foregroundTertiary, isBold: false, isItalic: false, isUnderlined: false, palette: AgentTUIPalette())
-        terminal.write(left + slug + String(repeating: " ", count: spaces) + right + "\r\n")
-        terminal.write(agentTUIANSIStyled(
-            String(repeating: "─", count: max(1, width)),
-            color: .palette.foregroundTertiary,
-            isBold: false,
-            isItalic: false,
-            isUnderlined: false,
-            palette: AgentTUIPalette()
-        ) + "\r\n")
+        return [
+            left + slug + String(repeating: " ", count: spaces) + right,
+            agentTUIANSIStyled(
+                String(repeating: "─", count: max(1, width)),
+                color: .palette.foregroundTertiary,
+                isBold: false,
+                isItalic: false,
+                isUnderlined: false,
+                palette: palette
+            )
+        ]
     }
 
     private func renderTranscriptAndComposer(forceTranscript: Bool = false) {
@@ -747,7 +766,10 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             }
         }
 
-        // Cursor is now at start of line below transcript - that's where composer starts
+        if !entriesToRender.isEmpty {
+            reserveComposerSpace(snapshot: snapshot)
+        }
+
         drawComposer(snapshot: snapshot)
     }
 
@@ -806,6 +828,23 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             terminal.write(paddedANSI(line, width: width))
         }
         composerLineCount = lines.count
+    }
+
+    private func reserveComposerSpace(snapshot: AgentTUISnapshot) {
+        let size = terminalSize()
+        let width = max(20, size.columns)
+        let maxInputRows = max(1, min(8, size.rows / 3))
+        let rows = agentTUIComposerRows(input: input, cursor: inputCursor, width: width, maxRows: maxInputRows)
+        let lineCount = nativeComposerLines(
+            snapshot: snapshot,
+            rows: rows,
+            width: width,
+            palette: AgentTUIPalette()
+        ).count
+
+        for _ in 0..<lineCount {
+            terminal.write("\r\n")
+        }
     }
 
     private func nativeComposerLines(

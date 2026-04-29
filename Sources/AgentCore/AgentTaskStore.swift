@@ -22,6 +22,8 @@ public protocol AgentTaskStore: Sendable {
     @discardableResult
     func archiveMemory(id: UUID) async throws -> MemoryItem
 
+    func listSkills() async throws -> [SkillRecord]
+
     func claimTask(
         taskID: UUID,
         checkpointID: UUID?,
@@ -177,5 +179,10 @@ extension LocalTaskStore: AgentTaskStore {
 
     public func summary(for task: TaskRecord, eventLimit: Int) async throws -> TaskRunSummary {
         try summarySync(for: task, eventLimit: eventLimit)
+    }
+
+    public func listSkills() async throws -> [SkillRecord] {
+        // Skills require Postgres store
+        return []
     }
 }

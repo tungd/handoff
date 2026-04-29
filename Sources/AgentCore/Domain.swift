@@ -442,3 +442,31 @@ public struct MemorySearchResult: Codable, Equatable, Sendable {
         self.score = score
     }
 }
+
+public struct SkillRecord: Codable, Equatable, Sendable, Identifiable {
+    public let id: UUID
+    public var name: String
+    public var description: String?
+    public var content: String
+    public var tags: [String]
+    public var createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        description: String? = nil,
+        content: String,
+        tags: [String] = [],
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.name = name
+        self.description = description
+        self.content = content
+        self.tags = tags
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}

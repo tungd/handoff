@@ -1129,15 +1129,46 @@ func resolveInteractiveTask(
     backend: AgentBackend = .codex,
     snapshot: RepositorySnapshot,
     repoURL: URL,
-    store: any AgentTaskStore
+    store: any AgentTaskStore,
+    syncSkills: Bool = true
 ) async throws -> TaskRecord {
     if let identifier {
         return try await store.findTask(identifier)
     }
 
+    // Sync skills from Postgres before creating new task
+    if syncSkills {
+        try await syncSkillsForTask(repoURL: repoURL, store: store)
+    }
+
     let task = makeInteractiveTask(title: title, backend: backend, snapshot: snapshot, repoURL: repoURL)
     try await persistInteractiveTask(task, store: store)
     return task
+}
+
+func syncSkillsForTask(repoURL: URL, store: any AgentTaskStore) async throws {
+    let skills = try await store.listSkills()
+    guard !skills.isEmpty else {
+        return
+    }
+
+    let repoRoot = snapshotRootPath(repoURL: repoURL)
+    let result = try SkillSync.syncSkills(skills: skills, repoRoot: repoRoot)
+    if result.skillsWritten > 0 {
+        printError("Synced \(result.skillsWritten) skill(s) to .agentctl/skills/")
+    }
+    if result.agentsMdUpdated {
+        printError("Updated AGENTS.md with skill instructions")
+    }
+}
+
+func snapshotRootPath(repoURL: URL) -> URL {
+    // Use repoURL as the root for writing skills
+    // If it's a directory, use it directly
+    if repoURL.hasDirectoryPath {
+        return repoURL
+    }
+    return repoURL.deletingLastPathComponent()
 }
 
 func makeInteractiveTask(
@@ -1635,6 +1666,9 @@ func runAgentTurn(
         printError("Running \(task.backendPreference.rawValue) turn for \(task.slug)...")
     }
 
+    // Get skill paths for Pi backend
+    let skillPaths = skillPathsForBackend(repoURL: repoURL, store: store)
+
     let controller = AgentSessionController(store: store)
     return try await controller.runAgentTurn(
         task: task,
@@ -1651,12 +1685,39 @@ func runAgentTurn(
             model: backendRunOptions.model,
             thinking: backendRunOptions.thinking,
             tools: backendRunOptions.tools,
-            noTools: backendRunOptions.noTools
+            noTools: backendRunOptions.noTools,
+            skillPaths: skillPaths
         ),
         images: images,
         interruptHandle: interruptHandle,
         onUpdate: onUpdate
     )
+}
+
+func skillPathsForBackend(repoURL: URL, store: any AgentTaskStore) -> [URL] {
+    // Skill paths are already synced to .agentctl/skills/ during task creation
+    // Return paths for existing skill files
+    let skillsDir = snapshotRootPath(repoURL: repoURL)
+        .appendingPathComponent(".agentctl", isDirectory: true)
+        .appendingPathComponent("skills", isDirectory: true)
+
+    guard FileManager.default.fileExists(atPath: skillsDir.path) else {
+        return []
+    }
+
+    var paths: [URL] = []
+    do {
+        let skillDirs = try FileManager.default.contentsOfDirectory(at: skillsDir, includingPropertiesForKeys: nil)
+        for skillDir in skillDirs where skillDir.hasDirectoryPath {
+            let skillFile = skillDir.appendingPathComponent("SKILL.md")
+            if FileManager.default.fileExists(atPath: skillFile.path) {
+                paths.append(skillFile)
+            }
+        }
+    } catch {
+        // Ignore errors - skills may not be synced yet
+    }
+    return paths
 }
 
 func withTaskStore<T>(
