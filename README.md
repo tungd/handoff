@@ -6,6 +6,9 @@ The durable workflow belongs to `agentctl`; Codex, Pi, and Claude are backend ex
 Codex is the primary backend. Pi RPC support is available for lighter polishing
 turns, while Claude support remains deferred.
 
+Product direction and next slices are tracked in
+[`docs/product-roadmap.md`](docs/product-roadmap.md).
+
 ## Design
 
 ```text
