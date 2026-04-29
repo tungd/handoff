@@ -567,6 +567,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
 
     func run() async throws {
         try terminal.enableRawMode()
+        terminal.hideCursor()
         defer {
             clearComposer()
             terminal.disableRawMode()
@@ -575,6 +576,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
 
         renderHeader()
         renderTranscriptAndComposer(forceTranscript: true)
+        var nextSpinnerRender = Date.distantPast
 
         while !shouldExit {
             var eventsProcessed = 0
@@ -583,10 +585,13 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
                 eventsProcessed += 1
             }
 
+            let now = Date()
             if renderSignal.consume() {
                 renderTranscriptAndComposer()
-            } else if shouldSpinActivity(model.snapshot()) {
+                nextSpinnerRender = now.addingTimeInterval(1.0 / 12.0)
+            } else if shouldSpinActivity(model.snapshot()), now >= nextSpinnerRender {
                 renderComposerOnly()
+                nextSpinnerRender = now.addingTimeInterval(1.0 / 12.0)
             }
 
             usleep(23_800)
@@ -650,7 +655,6 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         guard composerLineCount > 0 else {
             return
         }
-        terminal.hideCursor()
         if composerLineCount > 1 {
             terminal.write("\u{1B}[\(composerLineCount - 1)F")
         } else {
@@ -658,7 +662,6 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         }
         terminal.write("\u{1B}[J")
         composerLineCount = 0
-        terminal.showCursor()
     }
 
     private func drawComposer(snapshot: AgentTUISnapshot) {
@@ -668,14 +671,12 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         let palette = AgentTUIPalette()
         let lines = nativeComposerLines(snapshot: snapshot, rows: rows, width: width, palette: palette)
 
-        terminal.hideCursor()
         for (index, line) in lines.enumerated() {
             terminal.write(paddedANSI(line, width: width))
             if index < lines.count - 1 {
                 terminal.write("\r\n")
             }
         }
-        terminal.showCursor()
         composerLineCount = lines.count
     }
 
@@ -861,7 +862,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
 
         switch command.name {
         case "exit", "quit":
-            checkpointReleaseClaimThenExit()
+            releaseClaimThenExit()
         case "help":
             model.append(.system, "/help /info /tasks /new [title] /resume <task> [--checkpoint <id|latest>] [--force] /checkpoint [--push] /checkpoints /artifacts /continue [path] /release /export [path] /events /raw /exit")
         case "raw":
@@ -1048,7 +1049,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         }
     }
 
-    private func checkpointReleaseClaimThenExit() {
+    private func releaseClaimThenExit() {
         guard let runtime = AgentTUIRuntimeBox.current else {
             shouldExit = true
             return
@@ -1058,41 +1059,14 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             shouldExit = true
             return
         }
-        guard model.startCommand(status: "quitting...") else {
-            return
-        }
 
         let task = snapshot.task
-        let model = model
-        let operation = _Concurrency.Task.detached { [weak self] in
-            defer {
-                model.clearRunningOperation()
-            }
-            do {
-                let refreshedSnapshot = try RepositoryInspector().inspect(path: runtime.repoURL)
-                updateAgentTUIRuntimeSnapshot(refreshedSnapshot)
-                if refreshedSnapshot.isGitRepository, refreshedSnapshot.isDirty {
-                    model.setStatus("checkpointing dirty work before quit...")
-                    let result = try await createAndPersistCheckpoint(
-                        task: task,
-                        store: runtime.store,
-                        snapshot: refreshedSnapshot,
-                        repoURL: runtime.repoURL,
-                        options: GitCheckpointOptions(),
-                        onStatus: { status in model.setStatus(status) }
-                    )
-                    model.append(.system, checkpointCreatedStatus(result))
-                }
-
-                model.setStatus("releasing claim...")
-                _ = try await releaseResumeClaim(task: task, store: runtime.store)
-                model.finishCommand()
-                self?.shouldExit = true
-            } catch {
-                model.commandFailed(error)
-            }
+        let ownerName = currentClaimOwnerName()
+        model.setStatus("releasing claim...")
+        _Concurrency.Task.detached {
+            _ = try? await runtime.store.releaseTaskClaim(taskID: task.id, ownerName: ownerName)
         }
-        model.setRunningOperation(operation, cancelTaskOnInterrupt: false)
+        shouldExit = true
     }
 
     private func runCommand(status newStatus: String, operation: @escaping @Sendable () async throws -> Void) {
@@ -1134,13 +1108,13 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             if model.interruptRunningOperation() {
                 return true
             }
-            checkpointReleaseClaimThenExit()
+            releaseClaimThenExit()
             return true
         case .character("c") where event.ctrl:
             if model.interruptRunningOperation() {
                 return true
             }
-            checkpointReleaseClaimThenExit()
+            releaseClaimThenExit()
             return true
         case .character("a") where event.ctrl:
             moveToBeginningOfInputLine()
