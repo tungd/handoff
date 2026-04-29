@@ -281,6 +281,76 @@ public struct PostgresTaskStore: AgentTaskStore {
         return checkpoints
     }
 
+    public func saveArtifact(_ artifact: ArtifactRecord) async throws {
+        let metadataJSON = try jsonString(artifact.metadata)
+        try await drain(client.query("""
+            INSERT INTO artifacts (id, task_id, session_id, kind, title, content_ref, content_type, created_at, metadata)
+            VALUES (
+                \(artifact.id),
+                \(artifact.taskID),
+                \(artifact.sessionID),
+                \(artifact.kind.rawValue),
+                \(artifact.title),
+                \(artifact.contentRef),
+                \(artifact.contentType),
+                \(artifact.createdAt),
+                \(metadataJSON)::jsonb
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                session_id = EXCLUDED.session_id,
+                kind = EXCLUDED.kind,
+                title = EXCLUDED.title,
+                content_ref = EXCLUDED.content_ref,
+                content_type = EXCLUDED.content_type,
+                metadata = EXCLUDED.metadata
+            """))
+    }
+
+    public func listArtifacts(taskID: UUID? = nil) async throws -> [ArtifactRecord] {
+        let rows: PostgresRowSequence
+        if let taskID {
+            rows = try await client.query("""
+                SELECT id, task_id, session_id, kind, title, content_ref, content_type, created_at, metadata::text
+                FROM artifacts
+                WHERE task_id = \(taskID)
+                ORDER BY created_at DESC
+                """)
+        } else {
+            rows = try await client.query("""
+                SELECT id, task_id, session_id, kind, title, content_ref, content_type, created_at, metadata::text
+                FROM artifacts
+                ORDER BY created_at DESC
+                """)
+        }
+
+        var artifacts: [ArtifactRecord] = []
+        for try await (id, taskID, sessionID, kind, title, contentRef, contentType, createdAt, metadataText) in rows.decode((
+            UUID,
+            UUID,
+            UUID?,
+            String,
+            String,
+            String,
+            String?,
+            Date,
+            String
+        ).self) {
+            let metadata = try decoder.decode([String: JSONValue].self, from: Data(metadataText.utf8))
+            artifacts.append(ArtifactRecord(
+                id: id,
+                taskID: taskID,
+                sessionID: sessionID,
+                kind: ArtifactKind(rawValue: kind) ?? .handoffManifest,
+                title: title,
+                contentRef: contentRef,
+                contentType: contentType,
+                createdAt: createdAt,
+                metadata: metadata
+            ))
+        }
+        return artifacts
+    }
+
     public func claimTask(
         taskID: UUID,
         checkpointID: UUID?,
@@ -454,10 +524,12 @@ public struct PostgresTaskStore: AgentTaskStore {
     public func summary(for task: TaskRecord, eventLimit: Int = 12) async throws -> TaskRunSummary {
         let sessions = try await listSessions(taskID: task.id)
         let events = try await events(for: task.id)
+        let claim = try? await currentTaskClaim(taskID: task.id)
         return TaskRunSummary(
             task: task,
             sessions: sessions,
-            latestEvents: Array(events.suffix(eventLimit))
+            latestEvents: Array(events.suffix(eventLimit)),
+            currentClaim: claim
         )
     }
 

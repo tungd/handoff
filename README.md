@@ -60,6 +60,8 @@ The root command starts the interactive Codex shell. It currently supports:
 /resume <task> [--checkpoint <id|latest>] [--force]
 /checkpoint [--push]
 /checkpoints
+/artifacts
+/continue [path]
 /release
 /export [path]
 /events
@@ -109,7 +111,12 @@ swift run agentctl task resume first-task
 swift run agentctl task resume first-task --checkpoint latest
 swift run agentctl task release first-task
 swift run agentctl task checkpoints first-task
+swift run agentctl task artifacts first-task
+swift run agentctl task continue first-task
 ```
 
 `/export [path]` writes the current task transcript as Markdown. Without a path
 it writes to `.agentctl/exports/<task>-transcript-<timestamp>.md` in the repo.
+`/continue [path]` writes a portable continuation prompt for another agent,
+including task metadata, latest checkpoint, artifacts, recent commands/tests,
+and recent transcript context.

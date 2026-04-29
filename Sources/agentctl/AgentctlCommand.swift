@@ -94,7 +94,7 @@ struct Task: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "task",
         abstract: "Create, list, and resume agentctl tasks.",
-        subcommands: [New.self, List.self, Show.self, Send.self, Resume.self, Release.self, Checkpoint.self, Checkpoints.self]
+        subcommands: [New.self, List.self, Show.self, Send.self, Resume.self, Release.self, Checkpoint.self, Checkpoints.self, Artifacts.self, Continuation.self]
     )
 
     struct New: AsyncParsableCommand {
@@ -541,6 +541,90 @@ struct Task: ParsableCommand {
             }
         }
     }
+
+    struct Artifacts: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "artifacts",
+            abstract: "List handoff artifacts for a task."
+        )
+
+        @Argument(help: "Task id, id prefix, or slug.")
+        var task: String
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        @Flag(name: .long, help: "Emit JSON.")
+        var json: Bool = false
+
+        mutating func run() async throws {
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let task = try await store.findTask(task)
+                let artifacts = try await store.listArtifacts(taskID: task.id)
+
+                if json {
+                    try printJSON(artifacts)
+                    return
+                }
+
+                printArtifacts(artifacts)
+            }
+        }
+    }
+
+    struct Continuation: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "continue",
+            abstract: "Export a portable continuation prompt for another agent."
+        )
+
+        @Argument(help: "Task id, id prefix, or slug.")
+        var task: String
+
+        @Argument(help: "Optional output path.")
+        var path: String?
+
+        @Option(name: .shortAndLong, help: "Repository path.")
+        var repo: String = "."
+
+        @OptionGroup
+        var storeOptions: StoreOptions
+
+        @Flag(name: .long, help: "Emit JSON.")
+        var json: Bool = false
+
+        mutating func run() async throws {
+            let repoURL = URL(fileURLWithPath: repo)
+            let snapshot = try RepositoryInspector().inspect(path: repoURL)
+
+            try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+                let task = try await store.findTask(task)
+                let result = try await exportContinuationMarkdown(
+                    task: task,
+                    store: store,
+                    repoURL: repoURL,
+                    snapshot: snapshot,
+                    destination: path
+                )
+
+                if json {
+                    try printJSON(result)
+                    return
+                }
+
+                print("Continuation bundle written")
+                print("  path:      \(result.url.path)")
+                print("  events:    \(result.eventCount)")
+                print("  artifacts: \(result.artifactCount)")
+            }
+        }
+    }
 }
 
 struct DB: ParsableCommand {
@@ -748,6 +832,25 @@ func runInteractiveAgent(
                         continue
                     }
                     printCheckpoints(try await store.listCheckpoints(taskID: task.id))
+                case "artifacts":
+                    guard taskPersisted else {
+                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                        continue
+                    }
+                    printArtifacts(try await store.listArtifacts(taskID: task.id))
+                case "continue":
+                    guard taskPersisted else {
+                        renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                        continue
+                    }
+                    let result = try await exportContinuationMarkdown(
+                        task: task,
+                        store: store,
+                        repoURL: repoURL,
+                        snapshot: activeSnapshot,
+                        destination: command.argument
+                    )
+                    renderer.status("Continuation bundle written to \(result.url.path).")
                 case "release":
                     guard taskPersisted else {
                         renderer.status("No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
@@ -1007,6 +1110,10 @@ func createAndPersistCheckpoint(
         manifestContext: manifestContext
     )
     try await store.saveCheckpoint(result.checkpoint)
+    let artifacts = checkpointArtifacts(from: result, task: task)
+    for artifact in artifacts {
+        try await store.saveArtifact(artifact)
+    }
     try await store.appendEvent(AgentEvent(
         taskID: task.id,
         kind: .checkpointCreated,
@@ -1021,6 +1128,77 @@ func createAndPersistCheckpoint(
         ))
     }
     return result
+}
+
+func checkpointArtifacts(from result: GitCheckpointResult, task: TaskRecord) -> [ArtifactRecord] {
+    let checkpointID = result.checkpoint.id.uuidString
+    let baseMetadata: [String: JSONValue] = [
+        "checkpointID": .string(checkpointID),
+        "branch": .string(result.checkpoint.branch),
+        "commitSHA": .string(result.checkpoint.commitSHA ?? ""),
+        "pushed": .bool(result.pushed)
+    ]
+
+    var artifacts: [ArtifactRecord] = [
+        ArtifactRecord(
+            taskID: task.id,
+            kind: .handoffManifest,
+            title: "Handoff manifest for \(result.checkpoint.branch)",
+            contentRef: "checkpoint://\(checkpointID)/handoff_manifest",
+            contentType: "application/json",
+            metadata: baseMetadata.merging([
+                "manifest": result.manifest.jsonValue
+            ]) { _, new in new }
+        )
+    ]
+
+    for output in result.manifest.commandOutputs {
+        artifacts.append(ArtifactRecord(
+            taskID: task.id,
+            kind: .commandOutput,
+            title: output.command,
+            contentRef: "checkpoint://\(checkpointID)/command_output/\(artifacts.count)",
+            contentType: "text/plain",
+            metadata: baseMetadata.merging([
+                "command": .string(output.command),
+                "exitCode": .int(Int64(output.exitCode)),
+                "output": .string(output.output)
+            ]) { _, new in new }
+        ))
+    }
+
+    for test in result.manifest.testResults {
+        var metadata = baseMetadata.merging([
+            "command": .string(test.command),
+            "status": .string(test.status)
+        ]) { _, new in new }
+        if let output = test.output {
+            metadata["output"] = .string(output)
+        }
+        artifacts.append(ArtifactRecord(
+            taskID: task.id,
+            kind: .testResult,
+            title: "\(test.status): \(test.command)",
+            contentRef: "checkpoint://\(checkpointID)/test_result/\(artifacts.count)",
+            contentType: "text/plain",
+            metadata: metadata
+        ))
+    }
+
+    for file in result.manifest.generatedFiles {
+        artifacts.append(ArtifactRecord(
+            taskID: task.id,
+            kind: .generatedFile,
+            title: file,
+            contentRef: file,
+            contentType: nil,
+            metadata: baseMetadata.merging([
+                "path": .string(file)
+            ]) { _, new in new }
+        ))
+    }
+
+    return artifacts
 }
 
 func handoffManifestContext(task: TaskRecord, store: any AgentTaskStore) async throws -> HandoffManifest {
@@ -1401,6 +1579,9 @@ func printTaskSummary(_ summary: TaskRunSummary) {
         print("  thread:  \(session.backendSessionID ?? "-")")
         print("  cwd:     \(session.cwd)")
     }
+    if let claim = activeTaskClaim(summary.currentClaim) {
+        print("  claim:   \(claim.ownerName) until \(ISO8601DateFormatter().string(from: claim.expiresAt))")
+    }
 
     if !summary.latestEvents.isEmpty {
         print("")
@@ -1535,6 +1716,31 @@ func printCheckpoints(_ checkpoints: [CheckpointRecord]) {
     }
 }
 
+func printArtifacts(_ artifacts: [ArtifactRecord]) {
+    if artifacts.isEmpty {
+        print("No artifacts found.")
+        return
+    }
+
+    for artifact in artifacts {
+        print("\(artifact.kind.rawValue)  \(artifact.title)")
+        print("  id:      \(artifact.id.uuidString)")
+        print("  ref:     \(artifact.contentRef)")
+        print("  type:    \(artifact.contentType ?? "-")")
+        print("  created: \(ISO8601DateFormatter().string(from: artifact.createdAt))")
+        if let checkpointID = artifact.metadata["checkpointID"]?.stringValue {
+            print("  checkpoint: \(String(checkpointID.prefix(8)))")
+        }
+    }
+}
+
+func activeTaskClaim(_ claim: TaskClaimRecord?, now: Date = Date()) -> TaskClaimRecord? {
+    guard let claim, claim.expiresAt > now else {
+        return nil
+    }
+    return claim
+}
+
 func checkpointChangedFileCount(_ checkpoint: CheckpointRecord) -> Int {
     guard let values = checkpoint.metadata["changedFiles"]?.arrayValue else {
         return 0
@@ -1545,6 +1751,13 @@ func checkpointChangedFileCount(_ checkpoint: CheckpointRecord) -> Int {
 struct TranscriptExportResult: Equatable, Sendable {
     var url: URL
     var eventCount: Int
+}
+
+struct ContinuationExportResult: Codable, Equatable, Sendable {
+    var url: URL
+    var eventCount: Int
+    var checkpointCount: Int
+    var artifactCount: Int
 }
 
 func exportTranscriptMarkdown(
@@ -1567,7 +1780,69 @@ func exportTranscriptMarkdown(
     )
     let markdown = transcriptMarkdown(task: task, events: events, exportedAt: Date())
     try markdown.write(to: url, atomically: true, encoding: .utf8)
+    try await store.saveArtifact(ArtifactRecord(
+        taskID: task.id,
+        kind: .transcriptExport,
+        title: url.lastPathComponent,
+        contentRef: url.path,
+        contentType: "text/markdown",
+        metadata: [
+            "path": .string(url.path),
+            "eventCount": .int(Int64(events.count))
+        ]
+    ))
     return TranscriptExportResult(url: url, eventCount: events.count)
+}
+
+func exportContinuationMarkdown(
+    task: TaskRecord,
+    store: any AgentTaskStore,
+    repoURL: URL,
+    snapshot: RepositorySnapshot,
+    destination: String?
+) async throws -> ContinuationExportResult {
+    let events = try await store.events(for: task.id)
+    let checkpoints = try await store.listCheckpoints(taskID: task.id)
+    let artifacts = try await store.listArtifacts(taskID: task.id)
+    let claim = try? await store.currentTaskClaim(taskID: task.id)
+    let url = continuationExportURL(
+        task: task,
+        repoURL: repoURL,
+        snapshot: snapshot,
+        destination: destination
+    )
+    try FileManager.default.createDirectory(
+        at: url.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    let markdown = continuationMarkdown(
+        task: task,
+        events: events,
+        checkpoints: checkpoints,
+        artifacts: artifacts,
+        currentClaim: activeTaskClaim(claim),
+        exportedAt: Date()
+    )
+    try markdown.write(to: url, atomically: true, encoding: .utf8)
+    try await store.saveArtifact(ArtifactRecord(
+        taskID: task.id,
+        kind: .continuationPrompt,
+        title: url.lastPathComponent,
+        contentRef: url.path,
+        contentType: "text/markdown",
+        metadata: [
+            "path": .string(url.path),
+            "eventCount": .int(Int64(events.count)),
+            "checkpointCount": .int(Int64(checkpoints.count)),
+            "artifactCount": .int(Int64(artifacts.count))
+        ]
+    ))
+    return ContinuationExportResult(
+        url: url,
+        eventCount: events.count,
+        checkpointCount: checkpoints.count,
+        artifactCount: artifacts.count
+    )
 }
 
 func transcriptExportURL(
@@ -1609,12 +1884,268 @@ func transcriptExportURL(
     return url
 }
 
+func continuationExportURL(
+    task: TaskRecord,
+    repoURL: URL,
+    snapshot: RepositorySnapshot,
+    destination: String?,
+    now: Date = Date()
+) -> URL {
+    exportURL(
+        task: task,
+        repoURL: repoURL,
+        snapshot: snapshot,
+        destination: destination,
+        filename: defaultContinuationExportFilename(task: task, now: now)
+    )
+}
+
 func defaultTranscriptExportFilename(task: TaskRecord, now: Date) -> String {
+    defaultExportFilename(task: task, label: "transcript", now: now)
+}
+
+func defaultContinuationExportFilename(task: TaskRecord, now: Date) -> String {
+    defaultExportFilename(task: task, label: "continue", now: now)
+}
+
+private func defaultExportFilename(task: TaskRecord, label: String, now: Date) -> String {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.timeZone = TimeZone(secondsFromGMT: 0)
     formatter.dateFormat = "yyyyMMdd-HHmmss"
-    return "\(task.slug)-transcript-\(formatter.string(from: now)).md"
+    return "\(task.slug)-\(label)-\(formatter.string(from: now)).md"
+}
+
+private func exportURL(
+    task: TaskRecord,
+    repoURL: URL,
+    snapshot: RepositorySnapshot,
+    destination: String?,
+    filename: String
+) -> URL {
+    let baseURL = snapshot.rootPath.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? repoURL
+    let rawDestination = destination?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !rawDestination.isEmpty else {
+        return baseURL
+            .appendingPathComponent(".agentctl", isDirectory: true)
+            .appendingPathComponent("exports", isDirectory: true)
+            .appendingPathComponent(filename)
+    }
+
+    let expandedDestination: String
+    if rawDestination == "~" {
+        expandedDestination = FileManager.default.homeDirectoryForCurrentUser.path
+    } else if rawDestination.hasPrefix("~/") {
+        expandedDestination = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(String(rawDestination.dropFirst(2)))
+            .path
+    } else {
+        expandedDestination = rawDestination
+    }
+
+    var url = expandedDestination.hasPrefix("/")
+        ? URL(fileURLWithPath: expandedDestination)
+        : baseURL.appendingPathComponent(expandedDestination)
+    if rawDestination.hasSuffix("/") {
+        url.appendPathComponent(filename)
+    } else if url.pathExtension.isEmpty {
+        url.appendPathExtension("md")
+    }
+    return url
+}
+
+func continuationMarkdown(
+    task: TaskRecord,
+    events: [AgentEvent],
+    checkpoints: [CheckpointRecord],
+    artifacts: [ArtifactRecord],
+    currentClaim: TaskClaimRecord?,
+    exportedAt: Date
+) -> String {
+    let latestCheckpoint = checkpoints.max { $0.createdAt < $1.createdAt }
+    var blocks: [String] = [
+        "# Continue \(task.title)",
+        """
+        You are continuing an `agentctl` task from a portable handoff bundle. This is lossy context, not the model's hidden state. Use the task metadata, latest checkpoint, artifacts, recent commands, tests, and recent transcript below to continue the work.
+        """,
+        [
+            "## Task",
+            "- Slug: `\(task.slug)`",
+            "- Task ID: `\(task.id.uuidString)`",
+            "- Backend: `\(task.backendPreference.rawValue)`",
+            "- State: `\(task.state.rawValue)`",
+            "- Exported: `\(ISO8601DateFormatter().string(from: exportedAt))`"
+        ].joined(separator: "\n")
+    ]
+
+    if let currentClaim {
+        blocks.append([
+            "## Active Claim",
+            "- Owner: `\(currentClaim.ownerName)`",
+            "- Expires: `\(ISO8601DateFormatter().string(from: currentClaim.expiresAt))`"
+        ].joined(separator: "\n"))
+    }
+
+    if let checkpoint = latestCheckpoint {
+        blocks.append(continuationCheckpointMarkdown(checkpoint))
+    } else {
+        blocks.append("## Latest Checkpoint\n\nNo checkpoint recorded for this task.")
+    }
+
+    let artifactBlock = continuationArtifactsMarkdown(artifacts)
+    if !artifactBlock.isEmpty {
+        blocks.append(artifactBlock)
+    }
+
+    let commandBlock = continuationCommandMarkdown(events: events, artifacts: artifacts, latestCheckpoint: latestCheckpoint)
+    if !commandBlock.isEmpty {
+        blocks.append(commandBlock)
+    }
+
+    blocks.append(continuationRecentTranscriptMarkdown(events))
+    return blocks.joined(separator: "\n\n") + "\n"
+}
+
+private func continuationCheckpointMarkdown(_ checkpoint: CheckpointRecord) -> String {
+    var lines = [
+        "## Latest Checkpoint",
+        "- Checkpoint: `\(checkpoint.id.uuidString)`",
+        "- Branch: `\(checkpoint.branch)`",
+        "- Commit: `\(checkpoint.commitSHA ?? "-")`",
+        "- Remote: `\(checkpoint.remoteName)`",
+        "- Pushed: `\(checkpoint.pushedAt.map { ISO8601DateFormatter().string(from: $0) } ?? "-")`"
+    ]
+
+    let changedFiles = jsonStringArray(checkpoint.metadata["changedFiles"])
+    if !changedFiles.isEmpty {
+        lines.append("")
+        lines.append("Changed files:")
+        lines.append(contentsOf: changedFiles.prefix(40).map { "- `\($0)`" })
+    }
+
+    let generatedFiles = jsonStringArray(checkpoint.metadata["generatedFiles"])
+    if !generatedFiles.isEmpty {
+        lines.append("")
+        lines.append("Generated files:")
+        lines.append(contentsOf: generatedFiles.prefix(40).map { "- `\($0)`" })
+    }
+
+    if let manifest = checkpoint.metadata["handoffManifest"]?.objectValue {
+        lines.append("")
+        lines.append("Handoff manifest: \(handoffManifestSummary(manifest))")
+    }
+
+    return lines.joined(separator: "\n")
+}
+
+private func continuationArtifactsMarkdown(_ artifacts: [ArtifactRecord]) -> String {
+    guard !artifacts.isEmpty else {
+        return ""
+    }
+
+    var lines = ["## Artifacts"]
+    for artifact in artifacts.prefix(30) {
+        let checkpoint = artifact.metadata["checkpointID"]?.stringValue.map { " checkpoint `\(String($0.prefix(8)))`" } ?? ""
+        lines.append("- `\(artifact.kind.rawValue)` \(artifact.title) -> `\(artifact.contentRef)`\(checkpoint)")
+    }
+    return lines.joined(separator: "\n")
+}
+
+private func continuationCommandMarkdown(
+    events: [AgentEvent],
+    artifacts: [ArtifactRecord],
+    latestCheckpoint: CheckpointRecord?
+) -> String {
+    var lines: [String] = []
+    let commandArtifacts = artifacts.filter { $0.kind == .commandOutput || $0.kind == .testResult }
+    for artifact in commandArtifacts.prefix(12) {
+        if let command = artifact.metadata["command"]?.stringValue {
+            let status = artifact.metadata["status"]?.stringValue
+                ?? artifact.metadata["exitCode"]?.stringValue
+                ?? "-"
+            lines.append("- `\(command)` -> \(status)")
+        }
+    }
+
+    if lines.isEmpty,
+       let manifest = latestCheckpoint?.metadata["handoffManifest"]?.objectValue,
+       let commandOutputs = manifest["commandOutputs"]?.arrayValue {
+        for value in commandOutputs.prefix(12) {
+            guard let object = value.objectValue,
+                  let command = object["command"]?.stringValue else {
+                continue
+            }
+            let exitCode: String
+            if case let .int(value) = object["exitCode"] {
+                exitCode = "exit \(value)"
+            } else {
+                exitCode = "-"
+            }
+            lines.append("- `\(command)` -> \(exitCode)")
+        }
+    }
+
+    if lines.isEmpty {
+        let toolEvents = events.filter { $0.kind == .toolFinished }
+        for event in toolEvents.suffix(12) {
+            guard let command = event.payload["command"]?.stringValue else {
+                continue
+            }
+            let exitCode: String
+            if case let .int(value) = event.payload["exitCode"] {
+                exitCode = "exit \(value)"
+            } else {
+                exitCode = "-"
+            }
+            lines.append("- `\(command)` -> \(exitCode)")
+        }
+    }
+
+    guard !lines.isEmpty else {
+        return ""
+    }
+    return (["## Recent Commands And Tests"] + lines).joined(separator: "\n")
+}
+
+private func continuationRecentTranscriptMarkdown(_ events: [AgentEvent]) -> String {
+    var blocks = ["## Recent Transcript"]
+    let transcriptEvents = events.filter { event in
+        event.kind == .userMessage || event.kind == .assistantDone || event.kind == .toolFinished
+    }
+
+    if transcriptEvents.isEmpty {
+        return "## Recent Transcript\n\nNo transcript events found."
+    }
+
+    for event in transcriptEvents.suffix(18) {
+        switch event.kind {
+        case .userMessage:
+            if let text = event.payload["text"]?.stringValue {
+                blocks.append("### User\n\n\(markdownQuote(truncateHandoffText(text, limit: 2_000)))")
+            }
+        case .assistantDone:
+            if let text = event.payload["text"]?.stringValue {
+                blocks.append("### Codex\n\n\(truncateHandoffText(text, limit: 4_000))")
+            }
+        case .toolFinished:
+            if let command = event.payload["command"]?.stringValue {
+                var text = "### Tool\n\n\(markdownFence(language: "sh", text: "$ \(command)"))"
+                if let output = event.payload["output"]?.stringValue,
+                   !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    text += "\n\n" + markdownFence(language: "text", text: truncateHandoffText(output, limit: 2_000))
+                }
+                blocks.append(text)
+            }
+        default:
+            break
+        }
+    }
+
+    return blocks.joined(separator: "\n\n")
+}
+
+private func jsonStringArray(_ value: JSONValue?) -> [String] {
+    value?.arrayValue?.compactMap(\.stringValue) ?? []
 }
 
 func transcriptMarkdown(task: TaskRecord, events: [AgentEvent], exportedAt: Date) -> String {

@@ -32,7 +32,7 @@ struct TerminalRenderer {
     }
 
     func help() {
-        print(dim("/help /info /tasks /new [title] /resume <task> [--checkpoint <id|latest>] [--force] /checkpoint [--push] /checkpoints /release /export [path] /events /raw /exit"))
+        print(dim("/help /info /tasks /new [title] /resume <task> [--checkpoint <id|latest>] [--force] /checkpoint [--push] /checkpoints /artifacts /continue [path] /release /export [path] /events /raw /exit"))
     }
 
     func prompt(task: TaskRecord) {
@@ -60,6 +60,9 @@ struct TerminalRenderer {
         if let session = summary.sessions.first {
             print("\(label("thread"))  \(session.backendSessionID ?? "-")")
             print("\(label("cwd"))  \(session.cwd)")
+        }
+        if let claim = activeTaskClaim(summary.currentClaim) {
+            print("\(label("claim"))  \(claim.ownerName) until \(ISO8601DateFormatter().string(from: claim.expiresAt))")
         }
     }
 

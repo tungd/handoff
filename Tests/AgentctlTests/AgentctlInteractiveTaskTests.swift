@@ -130,6 +130,21 @@ struct AgentctlInteractiveTaskTests {
     }
 
     @Test
+    func continuationExportURLDefaultsInsideAgentctlExports() throws {
+        let task = TaskRecord(title: "Export Demo", slug: "export-demo")
+        let root = URL(fileURLWithPath: "/tmp/agentctl-export", isDirectory: true)
+        let url = continuationExportURL(
+            task: task,
+            repoURL: root,
+            snapshot: RepositorySnapshot(isGitRepository: true, rootPath: root.path),
+            destination: nil,
+            now: Date(timeIntervalSince1970: 0)
+        )
+
+        #expect(url.path == "/tmp/agentctl-export/.agentctl/exports/export-demo-continue-19700101-000000.md")
+    }
+
+    @Test
     func handoffManifestContextCapturesRecentToolAndTestOutput() throws {
         let events = [
             AgentEvent(kind: .toolFinished, payload: [
@@ -149,5 +164,55 @@ struct AgentctlInteractiveTaskTests {
         #expect(manifest.commandOutputs.map(\.command) == ["swift test", "git status --short"])
         #expect(manifest.testResults.map(\.command) == ["swift test"])
         #expect(manifest.testResults.first?.status == "passed")
+    }
+
+    @Test
+    func continuationMarkdownIncludesPortablePromptAndCheckpointContext() throws {
+        let task = TaskRecord(title: "Continue Demo", slug: "continue-demo")
+        let checkpoint = CheckpointRecord(
+            taskID: task.id,
+            branch: "agent/continue-demo",
+            commitSHA: "abcdef123",
+            metadata: [
+                "changedFiles": .array([.string("Sources/App.swift")]),
+                "handoffManifest": .object([
+                    "changedFiles": .array([.string("Sources/App.swift")]),
+                    "generatedFiles": .array([]),
+                    "commandOutputs": .array([]),
+                    "testResults": .array([])
+                ])
+            ]
+        )
+        let events = [
+            AgentEvent(taskID: task.id, kind: .userMessage, payload: ["text": .string("continue here")]),
+            AgentEvent(taskID: task.id, kind: .toolFinished, payload: [
+                "command": .string("swift test"),
+                "exitCode": .int(0),
+                "output": .string("passed")
+            ])
+        ]
+
+        let markdown = continuationMarkdown(
+            task: task,
+            events: events,
+            checkpoints: [checkpoint],
+            artifacts: [
+                ArtifactRecord(
+                    taskID: task.id,
+                    kind: .testResult,
+                    title: "passed: swift test",
+                    contentRef: "checkpoint://test",
+                    metadata: ["command": .string("swift test"), "status": .string("passed")]
+                )
+            ],
+            currentClaim: nil,
+            exportedAt: Date(timeIntervalSince1970: 0)
+        )
+
+        #expect(markdown.contains("You are continuing an `agentctl` task"))
+        #expect(markdown.contains("- Branch: `agent/continue-demo`"))
+        #expect(markdown.contains("- `Sources/App.swift`"))
+        #expect(markdown.contains("- `swift test` -> passed"))
+        #expect(markdown.contains("> continue here"))
     }
 }

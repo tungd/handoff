@@ -18,11 +18,18 @@ public struct TaskRunSummary: Codable, Equatable, Sendable {
     public var task: TaskRecord
     public var sessions: [SessionRecord]
     public var latestEvents: [AgentEvent]
+    public var currentClaim: TaskClaimRecord?
 
-    public init(task: TaskRecord, sessions: [SessionRecord], latestEvents: [AgentEvent]) {
+    public init(
+        task: TaskRecord,
+        sessions: [SessionRecord],
+        latestEvents: [AgentEvent],
+        currentClaim: TaskClaimRecord? = nil
+    ) {
         self.task = task
         self.sessions = sessions
         self.latestEvents = latestEvents
+        self.currentClaim = currentClaim
     }
 }
 
@@ -33,6 +40,7 @@ public struct LocalTaskStore: Sendable {
     private var sessionsDirectory: URL { root.appendingPathComponent("sessions", isDirectory: true) }
     private var eventsDirectory: URL { root.appendingPathComponent("events", isDirectory: true) }
     private var checkpointsDirectory: URL { root.appendingPathComponent("checkpoints", isDirectory: true) }
+    private var artifactsDirectory: URL { root.appendingPathComponent("artifacts", isDirectory: true) }
 
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
@@ -56,6 +64,7 @@ public struct LocalTaskStore: Sendable {
         try fileManager.createDirectory(at: sessionsDirectory, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: eventsDirectory, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: checkpointsDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: artifactsDirectory, withIntermediateDirectories: true)
     }
 
     public func saveTask(_ task: TaskRecord) throws {
@@ -172,6 +181,34 @@ public struct LocalTaskStore: Sendable {
         try listCheckpoints(taskID: taskID)
     }
 
+    public func saveArtifact(_ artifact: ArtifactRecord) throws {
+        try prepare()
+        let data = try encoder.encode(artifact)
+        try data.write(to: artifactURL(artifact.id), options: [.atomic])
+    }
+
+    public func saveArtifactSync(_ artifact: ArtifactRecord) throws {
+        try saveArtifact(artifact)
+    }
+
+    public func listArtifacts(taskID: UUID? = nil) throws -> [ArtifactRecord] {
+        try prepare()
+        let files = try FileManager.default.contentsOfDirectory(
+            at: artifactsDirectory,
+            includingPropertiesForKeys: nil
+        )
+        .filter { $0.pathExtension == "json" }
+
+        let artifacts = try files.map { try decoder.decode(ArtifactRecord.self, from: Data(contentsOf: $0)) }
+        return artifacts
+            .filter { taskID == nil || $0.taskID == taskID }
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    public func listArtifactsSync(taskID: UUID? = nil) throws -> [ArtifactRecord] {
+        try listArtifacts(taskID: taskID)
+    }
+
     @discardableResult
     public func appendEvent(_ event: AgentEvent) throws -> AgentEvent {
         try prepare()
@@ -261,6 +298,10 @@ public struct LocalTaskStore: Sendable {
 
     private func checkpointURL(_ id: UUID) -> URL {
         checkpointsDirectory.appendingPathComponent("\(id.uuidString).json")
+    }
+
+    private func artifactURL(_ id: UUID) -> URL {
+        artifactsDirectory.appendingPathComponent("\(id.uuidString).json")
     }
 }
 

@@ -12,6 +12,9 @@ public protocol AgentTaskStore: Sendable {
     func saveCheckpoint(_ checkpoint: CheckpointRecord) async throws
     func listCheckpoints(taskID: UUID?) async throws -> [CheckpointRecord]
 
+    func saveArtifact(_ artifact: ArtifactRecord) async throws
+    func listArtifacts(taskID: UUID?) async throws -> [ArtifactRecord]
+
     func claimTask(
         taskID: UUID,
         checkpointID: UUID?,
@@ -81,6 +84,14 @@ extension LocalTaskStore: AgentTaskStore {
 
     public func listCheckpoints(taskID: UUID?) async throws -> [CheckpointRecord] {
         try listCheckpointsSync(taskID: taskID)
+    }
+
+    public func saveArtifact(_ artifact: ArtifactRecord) async throws {
+        try saveArtifactSync(artifact)
+    }
+
+    public func listArtifacts(taskID: UUID?) async throws -> [ArtifactRecord] {
+        try listArtifactsSync(taskID: taskID)
     }
 
     public func claimTask(

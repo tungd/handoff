@@ -41,8 +41,10 @@
 - Refresh and release task claims from CLI/TUI lifecycle. (implemented)
 - Persist lightweight handoff manifests with checkpoint metadata. (implemented)
 - Include recent command/test output in checkpoint handoff manifests. (implemented)
+- Persist first-class handoff artifacts for checkpoints, command output, tests, generated files, transcript exports, and continuation prompts. (implemented)
 - List and target checkpoint history from chat. (implemented)
 - Export task transcripts as Markdown from chat. (implemented)
+- Export portable continuation prompts for other agents from chat. (implemented)
 
 ## Phase 4: Skills Sync
 

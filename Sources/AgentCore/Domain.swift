@@ -249,6 +249,49 @@ public struct TaskClaimRecord: Codable, Equatable, Sendable {
     }
 }
 
+public enum ArtifactKind: String, Codable, CaseIterable, Sendable {
+    case handoffManifest = "handoff_manifest"
+    case commandOutput = "command_output"
+    case testResult = "test_result"
+    case generatedFile = "generated_file"
+    case transcriptExport = "transcript_export"
+    case continuationPrompt = "continuation_prompt"
+}
+
+public struct ArtifactRecord: Codable, Equatable, Sendable, Identifiable {
+    public let id: UUID
+    public var taskID: UUID
+    public var sessionID: UUID?
+    public var kind: ArtifactKind
+    public var title: String
+    public var contentRef: String
+    public var contentType: String?
+    public var createdAt: Date
+    public var metadata: [String: JSONValue]
+
+    public init(
+        id: UUID = UUID(),
+        taskID: UUID,
+        sessionID: UUID? = nil,
+        kind: ArtifactKind,
+        title: String,
+        contentRef: String,
+        contentType: String? = nil,
+        createdAt: Date = Date(),
+        metadata: [String: JSONValue] = [:]
+    ) {
+        self.id = id
+        self.taskID = taskID
+        self.sessionID = sessionID
+        self.kind = kind
+        self.title = title
+        self.contentRef = contentRef
+        self.contentType = contentType
+        self.createdAt = createdAt
+        self.metadata = metadata
+    }
+}
+
 public enum TaskClaimError: Error, CustomStringConvertible, Sendable {
     case alreadyClaimed(TaskClaimRecord)
 

@@ -307,10 +307,18 @@ func localTaskStorePersistsTasksSessionsAndEvents() throws {
         branch: "agent/test-task",
         commitSHA: "abcdef123"
     )
+    let artifact = ArtifactRecord(
+        taskID: task.id,
+        kind: .handoffManifest,
+        title: "Handoff",
+        contentRef: "checkpoint://handoff",
+        contentType: "application/json"
+    )
 
     try store.saveTask(task)
     try store.saveSession(session)
     try store.saveCheckpoint(checkpoint)
+    try store.saveArtifact(artifact)
     let first = try store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .userMessage))
     let second = try store.appendEvent(AgentEvent(taskID: task.id, sessionID: session.id, kind: .assistantDone))
 
@@ -320,6 +328,7 @@ func localTaskStorePersistsTasksSessionsAndEvents() throws {
     #expect(try store.findTask(String(task.id.uuidString.prefix(8))).id == task.id)
     #expect(try store.listSessions(taskID: task.id).first?.backendSessionID == "thread-123")
     #expect(try store.listCheckpoints(taskID: task.id).first?.commitSHA == "abcdef123")
+    #expect(try store.listArtifacts(taskID: task.id).first?.kind == .handoffManifest)
     #expect(try store.events(for: task.id).map(\.kind) == [.userMessage, .assistantDone])
 }
 

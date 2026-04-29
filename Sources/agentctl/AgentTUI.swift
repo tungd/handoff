@@ -700,7 +700,7 @@ private struct AgentTUIView: View {
         case "exit", "quit":
             releaseClaimThenExit()
         case "help":
-            model.append(.system, "/help /info /tasks /new [title] /resume <task> [--checkpoint <id|latest>] [--force] /checkpoint [--push] /checkpoints /release /export [path] /events /raw /exit")
+            model.append(.system, "/help /info /tasks /new [title] /resume <task> [--checkpoint <id|latest>] [--force] /checkpoint [--push] /checkpoints /artifacts /continue [path] /release /export [path] /events /raw /exit")
         case "raw":
             _ = model.toggleRawEvents()
         case "info", "task", "repo":
@@ -743,6 +743,36 @@ private struct AgentTUIView: View {
             runCommand(status: "loading checkpoints...") {
                 let checkpoints = try await runtime.store.listCheckpoints(taskID: task.id)
                 model.append(.system, tuiCheckpoints(checkpoints))
+                model.setStatus("ready")
+            }
+        case "artifacts":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
+            runCommand(status: "loading artifacts...") {
+                let artifacts = try await runtime.store.listArtifacts(taskID: task.id)
+                model.append(.system, tuiArtifacts(artifacts))
+                model.setStatus("ready")
+            }
+        case "continue":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            let task = snapshot.task
+            runCommand(status: "writing continuation bundle...") {
+                let result = try await exportContinuationMarkdown(
+                    task: task,
+                    store: runtime.store,
+                    repoURL: runtime.repoURL,
+                    snapshot: runtime.snapshot,
+                    destination: command.argument
+                )
+                model.append(.system, "Continuation bundle written to \(result.url.path).")
                 model.setStatus("ready")
             }
         case "release":
@@ -1399,6 +1429,9 @@ private func tuiInfo(task: TaskRecord, summary: TaskRunSummary, runtime: AgentTU
         lines.append("thread: \(session.backendSessionID ?? "-")")
         lines.append("cwd: \(session.cwd)")
     }
+    if let claim = activeTaskClaim(summary.currentClaim) {
+        lines.append("claim: \(claim.ownerName) until \(ISO8601DateFormatter().string(from: claim.expiresAt))")
+    }
 
     return lines.joined(separator: "\n")
 }
@@ -1439,6 +1472,24 @@ private func tuiCheckpoints(_ checkpoints: [CheckpointRecord]) -> String {
             "pushed: \(pushed)",
             "files: \(checkpointChangedFileCount(checkpoint))"
         ].joined(separator: "\n")
+    }.joined(separator: "\n\n")
+}
+
+private func tuiArtifacts(_ artifacts: [ArtifactRecord]) -> String {
+    if artifacts.isEmpty {
+        return "No artifacts found."
+    }
+
+    return artifacts.map { artifact in
+        var lines = [
+            "\(artifact.id.uuidString.prefix(8))  \(artifact.kind.rawValue)  \(artifact.title)",
+            "ref: \(artifact.contentRef)",
+            "type: \(artifact.contentType ?? "-")"
+        ]
+        if let checkpointID = artifact.metadata["checkpointID"]?.stringValue {
+            lines.append("checkpoint: \(String(checkpointID.prefix(8)))")
+        }
+        return lines.joined(separator: "\n")
     }.joined(separator: "\n\n")
 }
 
