@@ -237,7 +237,7 @@ private final class AgentTUIModel: @unchecked Sendable {
         var turn: (task: TaskRecord, isTaskPersisted: Bool)?
         update { state in
             guard !state.isRunning else {
-                append(.error, "An agent turn is already running.", to: &state)
+                append(.error, "Another operation is already running.", to: &state)
                 return
             }
             append(.user, prompt, to: &state)
@@ -251,6 +251,27 @@ private final class AgentTUIModel: @unchecked Sendable {
     func finishTurn() {
         update { state in
             state.status = "ready"
+            state.isRunning = false
+        }
+    }
+
+    func startCommand(status: String) -> Bool {
+        var started = false
+        update { state in
+            guard !state.isRunning else {
+                append(.error, "Another operation is already running.", to: &state)
+                return
+            }
+            state.isRunning = true
+            state.status = status
+            started = true
+        }
+        return started
+    }
+
+    func finishCommand(status: String = "ready") {
+        update { state in
+            state.status = status
             state.isRunning = false
         }
     }
@@ -272,6 +293,7 @@ private final class AgentTUIModel: @unchecked Sendable {
     func commandFailed(_ error: Error) {
         update { state in
             state.status = "command failed"
+            state.isRunning = false
             append(.error, agentctlErrorMessage(error), to: &state)
         }
     }
@@ -838,7 +860,8 @@ private struct AgentTUIView: View {
                     store: runtime.store,
                     snapshot: runtime.snapshot,
                     repoURL: runtime.repoURL,
-                    options: options
+                    options: options,
+                    onStatus: { status in model.setStatus(status) }
                 )
                 let updatedSnapshot = try RepositoryInspector().inspect(path: runtime.repoURL)
                 await updateAgentTUIRuntimeSnapshot(updatedSnapshot)
@@ -920,11 +943,14 @@ private struct AgentTUIView: View {
     }
 
     private func runCommand(status newStatus: String, operation: @escaping @Sendable () async throws -> Void) {
-        model.setStatus(newStatus)
+        guard model.startCommand(status: newStatus) else {
+            return
+        }
         let model = model
         _Concurrency.Task.detached {
             do {
                 try await operation()
+                model.finishCommand()
             } catch {
                 model.commandFailed(error)
             }

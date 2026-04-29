@@ -925,7 +925,8 @@ func runInteractiveAgent(
                         store: store,
                         snapshot: activeSnapshot,
                         repoURL: repoURL,
-                        options: options
+                        options: options,
+                        onStatus: { status in renderer.status(status) }
                     )
                     activeSnapshot = try RepositoryInspector().inspect(path: repoURL)
                     printCheckpointResult(result)
@@ -1147,14 +1148,28 @@ func createAndPersistCheckpoint(
     store: any AgentTaskStore,
     snapshot: RepositorySnapshot,
     repoURL: URL,
-    options: GitCheckpointOptions = GitCheckpointOptions()
+    options: GitCheckpointOptions = GitCheckpointOptions(),
+    onStatus: (@Sendable (String) -> Void)? = nil
 ) async throws -> GitCheckpointResult {
-    let manifestContext = try await handoffManifestContext(task: task, store: store)
-    let result = try GitCheckpointManager().createCheckpoint(
+    onStatus?("collecting handoff context...")
+    async let manifestContextTask = handoffManifestContext(task: task, store: store)
+
+    onStatus?("preparing git checkpoint...")
+    let manager = GitCheckpointManager()
+    let gitState = try manager.createGitCheckpoint(
         task: task,
         snapshot: snapshot,
         repoURL: repoURL,
         options: options,
+        onProgress: onStatus
+    )
+
+    onStatus?("recording handoff metadata...")
+    let manifestContext = try await manifestContextTask
+    let result = GitCheckpointManager.makeCheckpointResult(
+        task: task,
+        options: options,
+        gitState: gitState,
         manifestContext: manifestContext
     )
     try await store.saveCheckpoint(result.checkpoint)
