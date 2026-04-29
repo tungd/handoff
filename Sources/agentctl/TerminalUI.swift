@@ -40,6 +40,7 @@ private let agentctlSlashCommandNames: Set<String> = [
     "quit",
     "raw",
     "release",
+    "rename",
     "repo",
     "resume",
     "task",

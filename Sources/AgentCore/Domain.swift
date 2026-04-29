@@ -130,6 +130,13 @@ public struct TaskRecord: Codable, Equatable, Sendable, Identifiable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
+
+    public func withTitle(_ newTitle: String) -> TaskRecord {
+        var copy = self
+        copy.title = newTitle
+        copy.updatedAt = Date()
+        return copy
+    }
 }
 
 public struct SessionRecord: Codable, Equatable, Sendable, Identifiable {

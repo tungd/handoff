@@ -1129,7 +1129,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         case "exit", "quit":
             releaseClaimThenExit()
         case "help":
-            model.append(.system, "/help /info /tasks /new [title] /resume <task> [--checkpoint <id|latest>] [--force] /checkpoint [--push] /checkpoints /artifacts /continue [path] /release /export [path] /events /raw /exit\nUnknown /... commands are sent to Codex for Codex-backed tasks. Use //... to send /... to the backend.")
+            model.append(.system, tuiHelp())
         case "raw":
             _ = model.toggleRawEvents()
         case "info", "task", "repo":
@@ -1268,6 +1268,22 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
                 )
                 updateAgentTUIRuntimeTask(newTask)
                 model.setTask(newTask, entries: [], message: "Created task \(newTask.slug).")
+            }
+        case "rename":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            guard let newTitle = command.argument, !newTitle.isEmpty else {
+                model.append(.error, "usage: /rename <title>")
+                return
+            }
+            let renamedTask = snapshot.task.withTitle(newTitle)
+            runCommand(status: "renaming task...") {
+                try await runtime.store.saveTask(renamedTask)
+                updateAgentTUIRuntimeTask(renamedTask)
+                model.setTask(renamedTask, entries: [], message: "Renamed task to: \(newTitle)")
             }
         case "resume":
             let resume: ResumeSlashOptions
@@ -2328,7 +2344,7 @@ private struct AgentTUIView: View {
         case "exit", "quit":
             releaseClaimThenExit()
         case "help":
-            model.append(.system, "/help /info /tasks /new [title] /resume <task> [--checkpoint <id|latest>] [--force] /checkpoint [--push] /checkpoints /artifacts /continue [path] /release /export [path] /events /raw /exit\nUnknown /... commands are sent to Codex for Codex-backed tasks. Use //... to send /... to the backend.")
+            model.append(.system, tuiHelp())
         case "raw":
             _ = model.toggleRawEvents()
         case "info", "task", "repo":
@@ -2467,6 +2483,22 @@ private struct AgentTUIView: View {
                 )
                 updateAgentTUIRuntimeTask(newTask)
                 model.setTask(newTask, entries: [], message: "Created task \(newTask.slug).")
+            }
+        case "rename":
+            let snapshot = model.snapshot()
+            guard snapshot.isTaskPersisted else {
+                model.append(.system, "No persisted task yet. Send a prompt, /new [title], or /resume <task>.")
+                return
+            }
+            guard let newTitle = command.argument, !newTitle.isEmpty else {
+                model.append(.error, "usage: /rename <title>")
+                return
+            }
+            let renamedTask = snapshot.task.withTitle(newTitle)
+            runCommand(status: "renaming task...") {
+                try await runtime.store.saveTask(renamedTask)
+                updateAgentTUIRuntimeTask(renamedTask)
+                model.setTask(renamedTask, entries: [], message: "Renamed task to: \(newTitle)")
             }
         case "resume":
             let resume: ResumeSlashOptions
@@ -3099,6 +3131,37 @@ private func tuiTasks(_ tasks: [TaskRecord]) -> String {
     return tasks
         .map { "\($0.slug)  \($0.title)  \($0.state.rawValue)" }
         .joined(separator: "\n")
+}
+
+private func tuiHelp() -> String {
+    let commands: [(name: String, args: String, description: String)] = [
+        ("help", "", "Show this help message"),
+        ("info", "", "Show current task details"),
+        ("tasks", "", "List all tasks"),
+        ("new", "[title]", "Create a new task"),
+        ("resume", "<task> [--checkpoint <id|latest>] [--force]", "Resume a task"),
+        ("rename", "<title>", "Rename the current task"),
+        ("checkpoint", "[--push]", "Create a checkpoint"),
+        ("checkpoints", "", "List checkpoints for current task"),
+        ("artifacts", "", "List artifacts for current task"),
+        ("continue", "[path]", "Export continuation bundle"),
+        ("release", "", "Release claim on current task"),
+        ("export", "[path]", "Export transcript to markdown"),
+        ("events", "", "Show events for current task"),
+        ("raw", "", "Toggle raw event display"),
+        ("exit", "", "Exit the session"),
+    ]
+
+    let maxNameWidth = commands.map { $0.name.count }.max() ?? 0
+    let maxArgsWidth = commands.map { $0.args.count }.max() ?? 0
+
+    let lines = commands.map { cmd in
+        let paddedName = cmd.name.padding(toLength: maxNameWidth, withPad: " ", startingAt: 0)
+        let paddedArgs = cmd.args.padding(toLength: maxArgsWidth, withPad: " ", startingAt: 0)
+        return "  /\(paddedName) \(paddedArgs)  \(cmd.description)"
+    }
+
+    return "Available commands:\n\n" + lines.joined(separator: "\n") + "\n\nUnknown /... commands are sent to the backend. Use //... to send /... literally."
 }
 
 private func tuiEvents(_ events: [AgentEvent]) -> String {
