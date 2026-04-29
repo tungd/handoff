@@ -581,9 +581,15 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
 
         renderHeader()
         renderTranscriptAndComposer(forceTranscript: true)
+
+        // Vsync-style rendering: 60fps frame timing (16ms), minimum 8ms between renders
+        let minRenderInterval = 1.0 / 120.0  // Minimum time between actual renders (throttle)
+        let spinnerInterval = 1.0 / 15.0  // Spinner animation at 15fps
+        var lastRenderTime = Date()
         var nextSpinnerRender = Date.distantPast
 
         while !shouldExit {
+            // Process all pending input events (up to 128 per frame)
             var eventsProcessed = 0
             while eventsProcessed < 128, let event = terminal.readKeyEvent() {
                 _ = handleKey(event)
@@ -593,15 +599,23 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             drainQueuedInputIfIdle()
 
             let now = Date()
-            if renderSignal.consume() {
-                renderTranscriptAndComposer()
-                nextSpinnerRender = now.addingTimeInterval(1.0 / 12.0)
-            } else if shouldSpinActivity(model.snapshot()), now >= nextSpinnerRender {
-                renderComposerOnly()
-                nextSpinnerRender = now.addingTimeInterval(1.0 / 12.0)
+            let timeSinceLastRender = now.timeIntervalSince(lastRenderTime)
+
+            // Only render if enough time has passed (throttling to prevent flicker)
+            if timeSinceLastRender >= minRenderInterval {
+                if renderSignal.consume() {
+                    renderTranscriptAndComposer()
+                    lastRenderTime = now
+                    nextSpinnerRender = now.addingTimeInterval(spinnerInterval)
+                } else if shouldSpinActivity(model.snapshot()), now >= nextSpinnerRender {
+                    renderComposerOnly()
+                    lastRenderTime = now
+                    nextSpinnerRender = now.addingTimeInterval(spinnerInterval)
+                }
             }
 
-            usleep(23_800)
+            // Sleep for frame interval (60fps = ~16ms)
+            usleep(16_000)
         }
     }
 
@@ -654,11 +668,12 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
     }
 
     private func renderComposerOnly() {
-        clearComposer()
+        // Move cursor to composer start and redraw (overwrites old content)
+        moveCursorToComposerStart()
         drawComposer(snapshot: model.snapshot())
     }
 
-    private func clearComposer() {
+    private func moveCursorToComposerStart() {
         guard composerLineCount > 0 else {
             return
         }
@@ -667,6 +682,14 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         } else {
             terminal.write("\r")
         }
+    }
+
+    private func clearComposer() {
+        guard composerLineCount > 0 else {
+            return
+        }
+        moveCursorToComposerStart()
+        // Clear from cursor to end of screen
         terminal.write("\u{1B}[J")
         composerLineCount = 0
     }
@@ -3280,14 +3303,51 @@ private func resolvedAgentModelMetadata(backend: AgentBackend, options: BackendR
     case .codex:
         return resolvedCodexModelMetadata(modelOverride: options.model)
     case .pi:
-        let model = nonEmpty(options.model) ?? "pi"
-        if let thinking = nonEmpty(options.thinking) {
-            return CodexModelMetadata(displayName: "\(model) (\(thinking))", contextWindowTokens: nil)
-        }
-        return CodexModelMetadata(displayName: model, contextWindowTokens: nil)
+        return resolvedPiModelMetadata(modelOverride: options.model, thinkingOverride: options.thinking)
     case .claude:
         return CodexModelMetadata(displayName: nonEmpty(options.model) ?? "claude", contextWindowTokens: nil)
     }
+}
+
+private func resolvedPiModelMetadata(modelOverride: String? = nil, thinkingOverride: String? = nil) -> CodexModelMetadata {
+    let settings = piSettings()
+    let model = nonEmpty(modelOverride)
+        ?? nonEmpty(settings["defaultModel"])
+        ?? "pi"
+    let thinking = nonEmpty(thinkingOverride)
+        ?? nonEmpty(settings["defaultThinkingLevel"])
+
+    let displayName: String
+    if let thinking, thinking != "off" {
+        displayName = "\(model) (\(thinking))"
+    } else {
+        displayName = model
+    }
+
+    return CodexModelMetadata(displayName: displayName, contextWindowTokens: nil)
+}
+
+private func piSettings() -> [String: String] {
+    let environment = ProcessInfo.processInfo.environment
+    let piDir = nonEmpty(environment["PI_CODING_AGENT_DIR"])
+        ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".pi/agent").path
+    let settingsURL = URL(fileURLWithPath: piDir).appendingPathComponent("settings.json")
+
+    guard let data = try? Data(contentsOf: settingsURL) else {
+        return [:]
+    }
+
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return [:]
+    }
+
+    var values: [String: String] = [:]
+    for (key, value) in object {
+        if let stringValue = value as? String {
+            values[key] = stringValue
+        }
+    }
+    return values
 }
 
 private func resolvedCodexModelMetadata(modelOverride: String? = nil) -> CodexModelMetadata {
