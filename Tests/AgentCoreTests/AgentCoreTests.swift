@@ -321,6 +321,39 @@ func codexExecArgumentsUseResumeShapeWithoutUnsupportedFlags() {
 }
 
 @Test
+func codexExecArgumentsAttachImagesWhenResuming() {
+    let backend = CodexExecBackend()
+    let args = backend.makeArguments(
+        prompt: "continue with image",
+        cwd: URL(fileURLWithPath: "/tmp/repo"),
+        resumeThreadID: "thread-123",
+        options: CodexExecOptions(
+            fullAuto: true,
+            sandbox: "workspace-write",
+            model: "gpt-test",
+            profile: "default",
+            imagePaths: ["/tmp/a.png", "/tmp/b.jpg"]
+        )
+    )
+
+    #expect(args == [
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "--full-auto",
+        "--model",
+        "gpt-test",
+        "-i",
+        "/tmp/a.png",
+        "-i",
+        "/tmp/b.jpg",
+        "thread-123",
+        "continue with image"
+    ])
+}
+
+@Test
 func piRPCArgumentsUseSessionAndModelOptions() {
     let backend = PiRPCBackend()
     let args = backend.makeArguments(
@@ -516,6 +549,54 @@ func agentSessionControllerPersistsStreamingCodexTurn() async throws {
         }
         return false
     })
+}
+
+@Test
+func agentSessionControllerPassesImagesToResumedCodexTurn() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("agentctl-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let store: any AgentTaskStore = LocalTaskStore(root: root)
+    let task = TaskRecord(title: "Streaming Images", slug: "streaming-images")
+    try await store.saveTask(task)
+    try await store.saveSession(SessionRecord(
+        taskID: task.id,
+        backend: .codex,
+        backendSessionID: "thread-123",
+        cwd: root.path
+    ))
+
+    let invocations = StreamingInvocationRecorder()
+    let backend = CodexStreamingBackend(runner: FakeStreamingProcessRunner(events: [
+        .stdoutLine(#"{"type":"thread.started","thread_id":"thread-123"}"#),
+        .stdoutLine(#"{"type":"item.completed","item":{"type":"agent_message","text":"looked"}}"#),
+        .exited(0)
+    ], invocations: invocations), executable: "/fake/env")
+    let controller = AgentSessionController(store: store, codexBackend: backend)
+
+    _ = try await controller.runCodexTurn(
+        task: task,
+        prompt: "describe image",
+        repoURL: root,
+        snapshot: RepositorySnapshot(isGitRepository: false),
+        images: [
+            PiRPCImage(data: Data("image-data".utf8).base64EncodedString(), mimeType: "image/png")
+        ]
+    )
+
+    let arguments = invocations.argumentsList().first ?? []
+    let imageFlagIndex = try #require(arguments.firstIndex(of: "-i"))
+    let imagePathIndex = arguments.index(after: imageFlagIndex)
+    try #require(imagePathIndex < arguments.endIndex)
+    #expect(Array(arguments.prefix(6)) == ["codex", "exec", "resume", "--json", "-i", arguments[imagePathIndex]])
+    #expect(Array(arguments.suffix(2)) == ["thread-123", "describe image"])
+    #expect(arguments[imagePathIndex].hasSuffix(".png"))
+    #expect(!FileManager.default.fileExists(atPath: arguments[imagePathIndex]))
+
+    let events = try await store.events(for: task.id)
+    let userMessage = try #require(events.first { $0.kind == .userMessage })
+    #expect(userMessage.payload["images"]?.arrayValue?.count == 1)
 }
 
 @Test
@@ -863,6 +944,23 @@ private final class SentDataRecorder: @unchecked Sendable {
     }
 }
 
+private final class StreamingInvocationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var invocations: [(arguments: [String], workingDirectory: URL?)] = []
+
+    func append(arguments: [String], workingDirectory: URL?) {
+        lock.withLock {
+            invocations.append((arguments: arguments, workingDirectory: workingDirectory))
+        }
+    }
+
+    func argumentsList() -> [[String]] {
+        lock.withLock {
+            invocations.map(\.arguments)
+        }
+    }
+}
+
 private struct FakeInteractiveProcessRunner: ProcessInteracting {
     let events: [ProcessStreamEvent]
     let sentLines: SentLineRecorder
@@ -901,6 +999,7 @@ private final class FakeInteractiveProcess: InteractiveProcess, @unchecked Senda
 
 private struct FakeStreamingProcessRunner: ProcessStreaming {
     let events: [ProcessStreamEvent]
+    var invocations: StreamingInvocationRecorder?
     var control: ProcessStreamControl?
 
     func stream(
@@ -908,7 +1007,8 @@ private struct FakeStreamingProcessRunner: ProcessStreaming {
         arguments: [String],
         workingDirectory: URL?
     ) -> AsyncThrowingStream<ProcessStreamEvent, Error> {
-        AsyncThrowingStream { continuation in
+        invocations?.append(arguments: arguments, workingDirectory: workingDirectory)
+        return AsyncThrowingStream { continuation in
             for event in events {
                 continuation.yield(event)
             }

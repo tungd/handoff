@@ -609,7 +609,7 @@ private extension NSLock {
 }
 
 private enum AgentTUIQueuedInput: Sendable {
-    case prompt(String)
+    case prompt(String, [AgentTUIDroppedFile])
     case command(String)
 }
 
@@ -723,14 +723,16 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
     private func renderTranscriptAndComposer(forceTranscript: Bool = false) {
         let snapshot = model.snapshot()
         let width = max(40, terminalSize().columns)
-        // Hide cursor during redraw to prevent flicker
-        terminal.write("\u{1B}[?25l")
+        let entriesToRender = snapshot.entries.filter { entry in
+            forceTranscript || !printedEntryKeys.contains(transcriptRenderKey(entry))
+        }
 
-        for entry in snapshot.entries {
+        if !entriesToRender.isEmpty {
+            clearComposer()
+        }
+
+        for entry in entriesToRender {
             let key = transcriptRenderKey(entry)
-            guard forceTranscript || !printedEntryKeys.contains(key) else {
-                continue
-            }
             printedEntryKeys.insert(key)
 
             if hasPrintedTranscript {
@@ -745,14 +747,10 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
 
         // Cursor is now at start of line below transcript - that's where composer starts
         drawComposer(snapshot: snapshot)
-        terminal.write("\u{1B}[?25h")
     }
 
     private func renderComposerOnly() {
-        // Hide cursor during redraw, drawComposer uses absolute positioning
-        terminal.write("\u{1B}[?25l")
         drawComposer(snapshot: model.snapshot())
-        terminal.write("\u{1B}[?25h")
     }
 
     private func moveCursorToComposerStart() {
@@ -770,8 +768,9 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         guard composerLineCount > 0 else {
             return
         }
-        moveCursorToComposerStart()
-        // Clear from cursor to end of screen
+        let size = terminalSize()
+        let composerStartRow = max(1, size.rows - composerLineCount + 1)
+        terminal.write("\u{1B}[\(composerStartRow);1H")
         terminal.write("\u{1B}[J")
         composerLineCount = 0
     }
@@ -785,7 +784,16 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         let lines = nativeComposerLines(snapshot: snapshot, rows: rows, width: width, palette: palette)
 
         // Position cursor at bottom of terminal where composer should start
-        let composerStartRow = size.rows - lines.count + 1  // +1 because terminal rows are 1-indexed
+        let composerStartRow = max(1, size.rows - lines.count + 1)  // +1 because terminal rows are 1-indexed
+        let clearStartRow: Int
+        if composerLineCount > 0 {
+            let oldComposerStartRow = max(1, size.rows - composerLineCount + 1)
+            clearStartRow = min(oldComposerStartRow, composerStartRow)
+        } else {
+            clearStartRow = composerStartRow
+        }
+        terminal.write("\u{1B}[\(clearStartRow);1H")
+        terminal.write("\u{1B}[J")
         terminal.write("\u{1B}[\(composerStartRow);1H")  // Move to absolute row, column 1
 
         // Draw each line: newline between lines, padded content erases old trailing content
@@ -943,7 +951,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             handle(command)
         case let .backendPrompt(prompt):
             guard !model.snapshot().isRunning else {
-                enqueue(.prompt(prompt))
+                enqueue(.prompt(prompt, images))
                 return
             }
             startPromptTurn(prompt, images: images)
@@ -952,7 +960,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
 
     private func startPromptTurn(_ text: String, images: [AgentTUIDroppedFile] = []) {
         guard let turn = model.startTurn(prompt: text) else {
-            enqueue(.prompt(text), atFront: true, announce: false)
+            enqueue(.prompt(text, images), atFront: true, announce: false)
             return
         }
         appendPromptHistory(text)
@@ -1029,8 +1037,13 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         }
 
         switch queuedInput {
-        case .prompt:
-            model.append(.system, "Queued prompt (\(pending) pending).")
+        case let .prompt(_, images):
+            if images.isEmpty {
+                model.append(.system, "Queued prompt (\(pending) pending).")
+            } else {
+                let imageText = images.count == 1 ? "1 image" : "\(images.count) images"
+                model.append(.system, "Queued prompt with \(imageText) (\(pending) pending).")
+            }
         case let .command(text):
             model.append(.system, "Queued \(queuedCommandLabel(text)) (\(pending) pending).")
         }
@@ -1045,8 +1058,8 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         }
 
         switch queuedInput {
-        case let .prompt(text):
-            startPromptTurn(text)
+        case let .prompt(text, images):
+            startPromptTurn(text, images: images)
         case let .command(text):
             switch agentTUISubmission(for: text, backend: model.snapshot().task.backendPreference) {
             case let .agentctlCommand(command):

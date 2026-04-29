@@ -92,6 +92,11 @@ public struct AgentSessionController: Sendable {
 
         // Save images to temp files for Codex CLI (-i option requires file paths)
         var imageTempFiles: [URL] = []
+        defer {
+            for tempFile in imageTempFiles {
+                try? FileManager.default.removeItem(at: tempFile)
+            }
+        }
         var codexOptions = options
         if !images.isEmpty {
             let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("agentctl-images")
@@ -179,11 +184,6 @@ public struct AgentSessionController: Sendable {
 
         try await store.saveSession(session)
         try await onUpdate(.session(session))
-
-        // Clean up temp image files
-        for tempFile in imageTempFiles {
-            try? FileManager.default.removeItem(at: tempFile)
-        }
 
         if result.exitCode != 0 {
             throw AgentSessionControllerError.backendFailed(exitCode: result.exitCode, stderr: result.stderr)

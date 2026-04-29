@@ -113,8 +113,9 @@ public struct CodexExecBackend: Sendable {
             arguments += ["--profile", profile]
         }
 
-        // Add image attachments (-i is repeatable for multiple images)
-        if resumeThreadID == nil, let imagePaths = options.imagePaths {
+        // Add image attachments (-i is repeatable for multiple images). `codex exec`
+        // and `codex exec resume` both accept images before their positional args.
+        if let imagePaths = options.imagePaths {
             for imagePath in imagePaths {
                 arguments += ["-i", imagePath]
             }
