@@ -1,3 +1,4 @@
+import AgentCore
 import Foundation
 
 final class AgentTUIANSICache: @unchecked Sendable {
@@ -103,6 +104,7 @@ struct AgentTUISuggestion: Equatable, Sendable {
     enum SuggestionKind: Equatable, Sendable {
         case slashCommand
         case filePath
+        case taskResume
     }
 }
 
@@ -117,6 +119,7 @@ final class AgentTUISuggestionPicker: @unchecked Sendable {
     enum SuggestionTriggerKind: Equatable, Sendable {
         case slashCommand
         case filePath
+        case taskResume
     }
 
     static let shared = AgentTUISuggestionPicker()
@@ -163,6 +166,25 @@ final class AgentTUISuggestionPicker: @unchecked Sendable {
         }
     }
 
+    func showTasks(tasks: [TaskRecord], prefix: String, offset: Int) {
+        lock.withLock {
+            let taskSuggestions = tasks.compactMap { task -> AgentTUISuggestion? in
+                guard task.slug.hasPrefix(prefix) || task.id.uuidString.hasPrefix(prefix) else { return nil }
+                let stateIcon = task.state == .open ? "○" : task.state == .completed ? "●" : "◐"
+                return AgentTUISuggestion(
+                    text: task.slug,
+                    display: "\(stateIcon) \(task.slug)  \(task.title)",
+                    kind: .taskResume
+                )
+            }
+            suggestions = taskSuggestions
+            selectedIndex = 0
+            isVisible = !taskSuggestions.isEmpty
+            triggerOffset = offset
+            triggerKind = .taskResume
+        }
+    }
+
     func hide() {
         lock.withLock {
             suggestions = []
@@ -203,6 +225,9 @@ final class AgentTUISuggestionPicker: @unchecked Sendable {
                 suggestions = slashCommandSuggestions.filter { $0.text.hasPrefix(prefix) }
             case .filePath:
                 suggestions = fileSuggestions(repoRoot: nil, prefix: prefix)
+            case .taskResume:
+                // Task filter is handled externally via showTasks refresh
+                break
             }
             selectedIndex = 0
             isVisible = !suggestions.isEmpty

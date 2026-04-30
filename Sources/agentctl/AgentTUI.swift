@@ -875,6 +875,13 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         var lines: [String] = []
         lines.append("")
         lines.append(activityLine(snapshot, width: width, palette: palette))
+
+        // Picker overlay - right after activity, before divider
+        let pickerSnap = AgentTUISuggestionPicker.shared.snapshot
+        if pickerSnap.isVisible {
+            lines.append(contentsOf: pickerOverlayLines(pickerSnap, width: width, palette: palette))
+        }
+
         lines.append("")
         lines.append(agentTUIANSIStyled(
             agentTUIHorizontalDivider(label: modelDisplayName, width: width),
@@ -884,6 +891,7 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             isUnderlined: false,
             palette: palette
         ))
+
         // Show pending images indicator
         if !pendingImages.isEmpty {
             let imageNames = pendingImages.map { $0.name }.joined(separator: ", ")
@@ -897,14 +905,9 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
                 palette: palette
             ))
         }
+
         for row in rows {
             lines.append(inputRow(row, palette: palette))
-        }
-
-        // Picker overlay
-        let pickerSnap = AgentTUISuggestionPicker.shared.snapshot
-        if pickerSnap.isVisible {
-            lines.append(contentsOf: pickerOverlayLines(pickerSnap, width: width, palette: palette))
         }
 
         lines.append(agentTUIANSIStyled(
@@ -1615,6 +1618,25 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         }
 
         let prefixString = String(input.prefix(inputCursor))
+
+        // Check for /resume <task> pattern
+        let resumePattern = try! Regex(#"/resume\s+[a-zA-Z0-9\-]*$"#)
+        let resumeMatches = prefixString.matches(of: resumePattern)
+        if let match = resumeMatches.last {
+            let offset = input.distance(from: input.startIndex, to: match.range.lowerBound)
+            let resumeText = String(input[match.range.lowerBound...])
+            let taskPrefix = resumeText.dropFirst(8).trimmingCharacters(in: .whitespaces)  // "/resume " is 8 chars
+            loadTasksForResumePicker(prefix: taskPrefix, triggerOffset: offset)
+            return
+        }
+
+        // Check for /resume with space (empty prefix, show all tasks)
+        if prefixString.hasSuffix("/resume ") {
+            let offset = input.count - 8
+            loadTasksForResumePicker(prefix: "", triggerOffset: offset)
+            return
+        }
+
         let slashPattern = try! Regex(#"/[a-zA-Z]*$"#)
         let slashMatches = prefixString.matches(of: slashPattern)
         if let match = slashMatches.last {
@@ -1646,6 +1668,27 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         AgentTUISuggestionPicker.shared.hide()
     }
 
+    private func loadTasksForResumePicker(prefix: String, triggerOffset: Int) {
+        guard let runtime = AgentTUIRuntimeBox.current else {
+            AgentTUISuggestionPicker.shared.hide()
+            return
+        }
+
+        _Concurrency.Task.detached {
+            do {
+                let tasks = try await runtime.store.listTasks()
+                AgentTUISuggestionPicker.shared.showTasks(
+                    tasks: tasks,
+                    prefix: prefix,
+                    offset: triggerOffset
+                )
+                self.requestRender()
+            } catch {
+                AgentTUISuggestionPicker.shared.hide()
+            }
+        }
+    }
+
     private func acceptPickerSuggestion(_ suggestion: AgentTUISuggestion, triggerOffset: Int) {
         let replaceStartIndex = input.index(input.startIndex, offsetBy: triggerOffset)
         let replaceEndIndex = input.index(input.startIndex, offsetBy: inputCursor)
@@ -1657,6 +1700,8 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             insertText = "/" + suggestion.text + " "
         case .filePath:
             insertText = suggestion.text
+        case .taskResume:
+            insertText = "/resume " + suggestion.text
         }
 
         let newCursorOffset = triggerOffset + insertText.count
