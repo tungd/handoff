@@ -46,33 +46,35 @@ func agentTUIPlainText(_ spans: [AgentTUIStyledTextSpan]) -> String {
 }
 
 func agentTUIMarkdownStyledLines(_ markdown: String, width: Int) -> [[AgentTUIStyledTextSpan]] {
-    let width = max(1, width)
-    let rawLines = markdown
-        .replacingOccurrences(of: "\r\n", with: "\n")
-        .replacingOccurrences(of: "\r", with: "\n")
-        .split(separator: "\n", omittingEmptySubsequences: false)
-        .map(String.init)
+    AgentTUIMarkdownCache.shared.get(text: markdown, width: width) {
+        let width = max(1, width)
+        let rawLines = markdown
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
 
-    guard !rawLines.isEmpty else {
-        return [[AgentTUIStyledTextSpan("")]]
-    }
-
-    var result: [[AgentTUIStyledTextSpan]] = []
-    var index = 0
-
-    while index < rawLines.count {
-        if let table = parseMarkdownTable(lines: rawLines, startIndex: index, width: width) {
-            result.append(contentsOf: table.lines)
-            index = table.nextIndex
-            continue
+        guard !rawLines.isEmpty else {
+            return [[AgentTUIStyledTextSpan("")]]
         }
 
-        let spans = parseMarkdownLine(rawLines[index])
-        result.append(contentsOf: wrapStyledSpans(spans, width: width))
-        index += 1
-    }
+        var result: [[AgentTUIStyledTextSpan]] = []
+        var index = 0
 
-    return result.isEmpty ? [[AgentTUIStyledTextSpan("")]] : result
+        while index < rawLines.count {
+            if let table = parseMarkdownTable(lines: rawLines, startIndex: index, width: width) {
+                result.append(contentsOf: table.lines)
+                index = table.nextIndex
+                continue
+            }
+
+            let spans = parseMarkdownLine(rawLines[index])
+            result.append(contentsOf: wrapStyledSpans(spans, width: width))
+            index += 1
+        }
+
+        return result.isEmpty ? [[AgentTUIStyledTextSpan("")]] : result
+    }
 }
 
 func agentTUIQuoteStyledLines(_ markdown: String, width: Int) -> [[AgentTUIStyledTextSpan]] {
