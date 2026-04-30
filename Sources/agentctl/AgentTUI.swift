@@ -631,7 +631,10 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
     private var composerLineCount = 0
     private let exitLock = NSLock()
     private var shouldExitStorage = false
-    private var pendingImages: [AgentTUIDroppedFile] = []  // Images waiting to be sent with prompt
+    private var pendingImages: [AgentTUIDroppedFile] = []
+    private var lastInputRenderTime = Date.distantPast
+    private var pendingRenderRequest = false
+    private let inputDebounceInterval = 0.05
 
     private var shouldExit: Bool {
         get {
@@ -648,6 +651,16 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
 
     func requestRender() {
         renderSignal.mark()
+    }
+
+    private func requestDebouncedComposerRender() {
+        pendingRenderRequest = true
+    }
+
+    private func flushDebouncedRender() {
+        guard pendingRenderRequest else { return }
+        pendingRenderRequest = false
+        renderComposerOnly()
     }
 
     func run() async throws {
@@ -681,11 +694,17 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             let now = Date()
             let timeSinceLastRender = now.timeIntervalSince(lastRenderTime)
 
+            // Flush debounced input renders after debounce interval
+            if now.timeIntervalSince(lastInputRenderTime) >= inputDebounceInterval {
+                flushDebouncedRender()
+            }
+
             // Only render if enough time has passed (throttling to prevent flicker)
             if timeSinceLastRender >= minRenderInterval {
                 if renderSignal.consume() {
                     renderTranscriptAndComposer()
                     lastRenderTime = now
+                    lastInputRenderTime = now
                     nextSpinnerRender = now.addingTimeInterval(spinnerInterval)
                 } else if shouldSpinActivity(model.snapshot()), now >= nextSpinnerRender {
                     renderComposerOnly()
@@ -694,8 +713,8 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
                 }
             }
 
-            // Sleep for frame interval (60fps = ~16ms)
-            usleep(16_000)
+            // Yield to Swift concurrency runtime (allows cancellation, better CPU efficiency)
+            try await _Concurrency.Task.sleep(nanoseconds: 16_000_000)
         }
     }
 
@@ -881,6 +900,13 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         for row in rows {
             lines.append(inputRow(row, palette: palette))
         }
+
+        // Picker overlay
+        let pickerSnap = AgentTUISuggestionPicker.shared.snapshot
+        if pickerSnap.isVisible {
+            lines.append(contentsOf: pickerOverlayLines(pickerSnap, width: width, palette: palette))
+        }
+
         lines.append(agentTUIANSIStyled(
             agentTUIHorizontalDivider(label: nil, width: width),
             color: .palette.foregroundTertiary,
@@ -917,6 +943,52 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             isUnderlined: false,
             palette: palette
         )
+    }
+
+    private func pickerOverlayLines(
+        _ picker: AgentTUISuggestionPicker.Snapshot,
+        width: Int,
+        palette: any Palette
+    ) -> [String] {
+        guard picker.isVisible else { return [] }
+
+        var lines: [String] = []
+        let maxVisible = min(6, picker.suggestions.count)
+        let startIdx = max(0, picker.selectedIndex - maxVisible + 1)
+        let endIdx = min(picker.suggestions.count, startIdx + maxVisible)
+
+        for idx in startIdx..<endIdx {
+            let suggestion = picker.suggestions[idx]
+            let isSelected = idx == picker.selectedIndex
+
+            let prefix = isSelected ? "▶ " : "  "
+            let displayText = suggestion.display
+            let truncated = displayText.count > width - 3 ? String(displayText.prefix(width - 3)) + "…" : displayText
+
+            let color: Color = isSelected ? .palette.accent : .palette.foregroundSecondary
+            lines.append(agentTUIANSIStyled(
+                prefix + truncated,
+                color: color,
+                isBold: isSelected,
+                isItalic: false,
+                isUnderlined: false,
+                palette: palette
+            ))
+        }
+
+        if picker.suggestions.count > maxVisible {
+            let remaining = picker.suggestions.count - maxVisible
+            lines.append(agentTUIANSIStyled(
+                "  … \(remaining) more",
+                color: .palette.foregroundTertiary,
+                isBold: false,
+                isItalic: false,
+                isUnderlined: false,
+                palette: palette
+            ))
+        }
+
+        return lines
     }
 
     private func spinnerFrame() -> String {
@@ -1381,10 +1453,48 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         // Check for file drop (OSC 1337)
         let inputEvent = AgentTUIInputEvent.from(keyEvent: event)
         if let file = inputEvent.droppedFile {
-            // Add to pending images
             pendingImages.append(file)
             requestRender()
             return true
+        }
+
+        let pickerSnap = AgentTUISuggestionPicker.shared.snapshot
+
+        // Picker navigation when visible
+        if pickerSnap.isVisible {
+            switch event.key {
+            case .tab, .enter:
+                if let suggestion = AgentTUISuggestionPicker.shared.accept() {
+                    acceptPickerSuggestion(suggestion, triggerOffset: pickerSnap.triggerOffset)
+                }
+                return true
+            case .escape:
+                AgentTUISuggestionPicker.shared.hide()
+                renderComposerOnly()
+                return true
+            case .up:
+                if AgentTUISuggestionPicker.shared.moveUp() {
+                    renderComposerOnly()
+                }
+                return true
+            case .down:
+                if AgentTUISuggestionPicker.shared.moveDown() {
+                    renderComposerOnly()
+                }
+                return true
+            case .character("p") where event.ctrl:
+                if AgentTUISuggestionPicker.shared.moveUp() {
+                    renderComposerOnly()
+                }
+                return true
+            case .character("n") where event.ctrl:
+                if AgentTUISuggestionPicker.shared.moveDown() {
+                    renderComposerOnly()
+                }
+                return true
+            default:
+                break
+            }
         }
 
         switch event.key {
@@ -1395,7 +1505,6 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             submitInput()
             return true
         case .escape:
-            // Clear pending images on escape
             if !pendingImages.isEmpty {
                 pendingImages = []
                 requestRender()
@@ -1447,10 +1556,12 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
             return true
         case .left:
             inputCursor = max(0, inputCursor - 1)
+            AgentTUISuggestionPicker.shared.hide()
             renderComposerOnly()
             return true
         case .right:
             inputCursor = min(input.count, inputCursor + 1)
+            AgentTUISuggestionPicker.shared.hide()
             renderComposerOnly()
             return true
         case .up:
@@ -1493,7 +1604,69 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         input.insert(contentsOf: safeText, at: index)
         inputCursor = cursor + safeText.count
         resetPromptHistorySelectionForEdit()
-        renderComposerOnly()  // Only redraw composer, not full transcript
+        updatePickerFromInput()
+        requestDebouncedComposerRender()
+    }
+
+    private func updatePickerFromInput() {
+        guard inputCursor > 0 else {
+            AgentTUISuggestionPicker.shared.hide()
+            return
+        }
+
+        let prefixString = String(input.prefix(inputCursor))
+        let slashPattern = try! Regex(#"/[a-zA-Z]*$"#)
+        let slashMatches = prefixString.matches(of: slashPattern)
+        if let match = slashMatches.last {
+            let offset = input.distance(from: input.startIndex, to: match.range.lowerBound)
+            let slashText = String(input[match.range.lowerBound...])
+            let commandPrefix = slashText.dropFirst()
+            AgentTUISuggestionPicker.shared.showSlashCommands(
+                prefix: String(commandPrefix),
+                offset: offset
+            )
+            return
+        }
+
+        let filePattern = try! Regex(#"@[a-zA-Z0-9_\-./]*$"#)
+        let fileMatches = prefixString.matches(of: filePattern)
+        if let match = fileMatches.last {
+            let offset = input.distance(from: input.startIndex, to: match.range.lowerBound)
+            let fileText = String(input[match.range.lowerBound...])
+            let filePrefix = fileText.dropFirst()
+            guard let runtime = AgentTUIRuntimeBox.current else { return }
+            AgentTUISuggestionPicker.shared.showFiles(
+                prefix: String(filePrefix),
+                offset: offset,
+                repoRoot: runtime.snapshot.rootPath
+            )
+            return
+        }
+
+        AgentTUISuggestionPicker.shared.hide()
+    }
+
+    private func acceptPickerSuggestion(_ suggestion: AgentTUISuggestion, triggerOffset: Int) {
+        let replaceStartIndex = input.index(input.startIndex, offsetBy: triggerOffset)
+        let replaceEndIndex = input.index(input.startIndex, offsetBy: inputCursor)
+        input.removeSubrange(replaceStartIndex..<replaceEndIndex)
+
+        let insertText: String
+        switch suggestion.kind {
+        case .slashCommand:
+            insertText = "/" + suggestion.text + " "
+        case .filePath:
+            insertText = suggestion.text
+        }
+
+        let newCursorOffset = triggerOffset + insertText.count
+        let insertIndex = input.index(input.startIndex, offsetBy: triggerOffset)
+        input.insert(contentsOf: insertText, at: insertIndex)
+        inputCursor = newCursorOffset
+
+        AgentTUISuggestionPicker.shared.hide()
+        resetPromptHistorySelectionForEdit()
+        renderComposerOnly()
     }
 
     private func deleteInputBackward() {
@@ -1505,7 +1678,8 @@ private final class AgentTUINativeLoop: @unchecked Sendable {
         input.remove(at: index)
         inputCursor = cursor - 1
         resetPromptHistorySelectionForEdit()
-        renderComposerOnly()
+        updatePickerFromInput()
+        requestDebouncedComposerRender()
     }
 
     private func deleteInputForward() {
@@ -2932,25 +3106,52 @@ private func agentTUIANSIStyled(
     isReversed: Bool = false,
     palette: any Palette
 ) -> String {
-    var codes: [String] = []
-    if isBold {
-        codes.append("1")
-    }
-    if isItalic {
-        codes.append("3")
-    }
-    if isUnderlined {
-        codes.append("4")
-    }
-    if isReversed {
-        codes.append("7")
-    }
-    codes.append(contentsOf: agentTUIForegroundCodes(for: color.resolve(with: palette)))
+    let resolvedColor = color.resolve(with: palette)
+    let colorValue = agentTUIColorValue(resolvedColor)
 
-    guard !codes.isEmpty else {
-        return text
+    return AgentTUIANSICache.shared.get(
+        text: text,
+        colorValue: colorValue,
+        isBold: isBold,
+        isItalic: isItalic,
+        isUnderlined: isUnderlined,
+        isReversed: isReversed
+    ) {
+        var codes: [String] = []
+        if isBold {
+            codes.append("1")
+        }
+        if isItalic {
+            codes.append("3")
+        }
+        if isUnderlined {
+            codes.append("4")
+        }
+        if isReversed {
+            codes.append("7")
+        }
+        codes.append(contentsOf: agentTUIForegroundCodes(for: resolvedColor))
+
+        guard !codes.isEmpty else {
+            return text
+        }
+        return "\u{1B}[\(codes.joined(separator: ";"))m\(text)\u{1B}[0m"
     }
-    return "\u{1B}[\(codes.joined(separator: ";"))m\(text)\u{1B}[0m"
+}
+
+private func agentTUIColorValue(_ color: Color) -> Int {
+    switch color.value {
+    case let .standard(ansi):
+        return Int(ansi.rawValue) * 10 + 0
+    case let .bright(ansi):
+        return Int(ansi.rawValue) * 10 + 1
+    case let .palette256(index):
+        return Int(index) + 1000
+    case let .rgb(red, green, blue):
+        return (Int(red) << 16) | (Int(green) << 8) | Int(blue) + 2000
+    case .semantic:
+        return 0
+    }
 }
 
 private func agentTUIForegroundCodes(for color: Color) -> [String] {
