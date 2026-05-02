@@ -66,9 +66,17 @@
 - Add SSE event stream.
 - Build browser session view.
 
+## Phase 7: ACP Backend
+
+- Swift ACP SDK integration via `swift-acp`.
+- ACP agent delegate implementation.
+- `agentctl acp` subcommand for stdio JSON-RPC.
+- Session mapping between ACP sessions and agentctl tasks.
+- Real-time streaming updates for tool calls and message chunks.
+- Session management: list, load, close, resume.
+
 ## Deferred
 
 - Claude backend.
-- ACP compatibility backend.
 - Semantic search with embeddings.
 - Remote unattended runner mode.
