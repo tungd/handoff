@@ -16,10 +16,20 @@ agentctl task id
 ## v1 Non-Goals
 
 - No PTY passthrough.
-- No ACP dependency.
 - No Telegram/RayClaw adapter.
 - No remote unattended runner.
 - No embeddings-only memory.
+
+## ACP Backend
+
+The `agentctl acp` subcommand implements the Agent Client Protocol (ACP) for
+integration with ACP-compatible editors:
+
+- Communicates via JSON-RPC 2.0 over stdio.
+- Maps ACP sessions to agentctl tasks.
+- Streams tool call updates and message chunks.
+- Supports session list, load, close, and resume operations.
+- Uses the `swift-acp` SDK for protocol implementation.
 
 ## Event Model
 

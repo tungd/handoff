@@ -1,4 +1,5 @@
 import AgentCore
+import ACPServer
 import ArgumentParser
 import Darwin
 import Foundation
@@ -49,7 +50,8 @@ struct Agentctl: AsyncParsableCommand {
             Task.self,
             Memory.self,
             DB.self,
-            Backend.self
+            Backend.self,
+            ACP.self
         ],
         defaultSubcommand: Interactive.self
     )
@@ -748,6 +750,30 @@ struct Backend: ParsableCommand {
                 print("  capabilities: \(descriptor.capabilities.map(\.rawValue).joined(separator: ", "))")
                 print("  notes: \(descriptor.notes)")
             }
+        }
+    }
+}
+
+struct ACP: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "acp",
+        abstract: "Start agentctl as an ACP-compatible agent server.",
+        discussion: "Communicates via JSON-RPC over stdio. Use this to integrate with ACP-compatible editors like Zed, JetBrains IDEs, or Neovim plugins."
+    )
+
+    @Option(name: .shortAndLong, help: "Directory to use as the current workspace.")
+    var cwd: String = "."
+
+    @OptionGroup
+    var storeOptions: StoreOptions
+
+    mutating func run() async throws {
+        let repoURL = URL(fileURLWithPath: cwd)
+        let snapshot = try RepositoryInspector().inspect(path: repoURL)
+
+        try await withTaskStore(options: storeOptions, repoURL: repoURL, snapshot: snapshot) { store in
+            let server = await ACPServer(store: store)
+            await server.start()
         }
     }
 }

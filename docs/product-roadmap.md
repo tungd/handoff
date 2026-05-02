@@ -27,6 +27,8 @@ Implemented and usable:
 - Handoff artifacts:
   checkpoint metadata, changed/generated files, command/test output snippets,
   transcript exports, and portable continuation prompts for other agents.
+- ACP backend: `agentctl acp` for stdio JSON-RPC integration with ACP-compatible
+  editors like Zed, JetBrains IDEs, and Neovim plugins.
 
 ## Next Slice: Memory V1
 

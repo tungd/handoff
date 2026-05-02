@@ -20,16 +20,17 @@ agentctl
   -> Pi --mode rpc backend for lighter model turns
   -> Codex app-server / exec-server backend later
   -> Claude stream-json backend later
+  -> ACP stdio backend for editor integration
   -> optional Hummingbird PWA/API mode later
 ```
 
 Core rules:
 
 - No PTY compatibility layer in v1.
-- No ACP foundation in v1.
 - Resume is keyed by `agentctl` task IDs, not native backend session IDs.
 - Memory/context live in Postgres. Generated files are compatibility artifacts only.
 - GitHub credentials stay local per machine through `git`, `gh`, and Keychain.
+- ACP backend provides editor integration via stdio JSON-RPC.
 
 ## First Milestone
 
