@@ -14,7 +14,8 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.29.0"),
-        .package(url: "https://github.com/phranck/TUIkit.git", from: "0.6.0")
+        .package(url: "https://github.com/phranck/TUIkit.git", from: "0.6.0"),
+        .package(url: "https://github.com/wiedymi/swift-acp.git", branch: "main")
     ],
     targets: [
         .target(
@@ -26,12 +27,23 @@ let package = Package(
                 .process("Resources")
             ]
         ),
+        .target(
+            name: "ACPServer",
+            dependencies: [
+                "AgentCore",
+                .product(name: "ACP", package: "swift-acp"),
+                .product(name: "ACPModel", package: "swift-acp")
+            ]
+        ),
         .executableTarget(
             name: "agentctl",
             dependencies: [
                 "AgentCore",
+                "ACPServer",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
-                .product(name: "TUIkit", package: "TUIkit")
+                .product(name: "TUIkit", package: "TUIkit"),
+                .product(name: "ACP", package: "swift-acp"),
+                .product(name: "ACPModel", package: "swift-acp")
             ]
         ),
         .testTarget(
